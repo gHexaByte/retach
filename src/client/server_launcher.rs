@@ -16,7 +16,7 @@ pub async fn ensure_server_running() -> anyhow::Result<()> {
 
     use std::os::unix::process::CommandExt;
     unsafe {
-        std::process::Command::new(exe)
+        let mut child = std::process::Command::new(exe)
             .arg("server")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -24,10 +24,14 @@ pub async fn ensure_server_running() -> anyhow::Result<()> {
             .pre_exec(|| {
                 // Create new session: detach from controlling terminal
                 // and process group so SIGHUP from SSH disconnect won't kill us
-                nix::libc::setsid();
+                if nix::libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             })
             .spawn()?;
+        // Reap the child in a background thread to avoid zombie processes
+        std::thread::spawn(move || { let _ = child.wait(); });
     }
 
     for _ in 0..50 {

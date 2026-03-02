@@ -4,7 +4,7 @@ use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
 use super::cell::Cell;
-use super::grid::{Grid, TerminalModes};
+use super::grid::{ActiveCharset, Charset, CursorShape, Grid, TerminalModes};
 use super::ScreenState;
 use super::style::Style;
 
@@ -22,7 +22,7 @@ impl<'a> ScreenPerformer<'a> {
     fn blank_cell(&self) -> Cell {
         Cell {
             c: ' ',
-            style: Style { bg: self.state.current_style.bg.clone(), ..Style::default() },
+            style: Style { bg: self.state.current_style.bg, ..Style::default() },
             width: 1,
         }
     }
@@ -45,22 +45,92 @@ impl<'a> ScreenPerformer<'a> {
 
     /// Map a character through the active DEC charset (line drawing)
     fn map_charset(&self, c: char) -> char {
-        let charset = if self.grid.modes.active_charset == 0 {
-            self.grid.modes.g0_charset
-        } else {
-            self.grid.modes.g1_charset
+        let charset = match self.grid.modes.active_charset {
+            ActiveCharset::G0 => self.grid.modes.g0_charset,
+            ActiveCharset::G1 => self.grid.modes.g1_charset,
         };
-        if charset == 1 {
-            // DEC Special Graphics (line drawing)
-            match c {
+        match charset {
+            Charset::LineDrawing => match c {
                 'j' => '┘', 'k' => '┐', 'l' => '┌', 'm' => '└', 'n' => '┼',
                 'q' => '─', 't' => '├', 'u' => '┤', 'v' => '┴', 'w' => '┬',
                 'x' => '│', 'a' => '▒', '`' => '◆',
                 _ => c,
-            }
-        } else {
-            c
+            },
+            Charset::Ascii => c,
         }
+    }
+
+    /// Save full cursor state: position, style, charsets, autowrap mode.
+    /// Used by CSI s, ESC 7, and mode 1048h.
+    fn save_cursor(&mut self) {
+        self.state.saved_cursor_state = Some(super::SavedCursor {
+            x: self.grid.cursor_x,
+            y: self.grid.cursor_y,
+            style: self.state.current_style,
+            g0_charset: self.grid.modes.g0_charset,
+            g1_charset: self.grid.modes.g1_charset,
+            active_charset: self.grid.modes.active_charset,
+            autowrap_mode: self.grid.modes.autowrap_mode,
+        });
+    }
+
+    /// Restore full cursor state saved by [`save_cursor`].
+    /// Used by CSI u, ESC 8, and mode 1048l.
+    fn restore_cursor(&mut self) {
+        if let Some(ref saved) = self.state.saved_cursor_state {
+            self.grid.wrap_pending = false;
+            self.grid.cursor_x = saved.x.min(self.grid.cols - 1);
+            self.grid.cursor_y = saved.y.min(self.grid.rows - 1);
+            self.state.current_style = saved.style;
+            self.grid.modes.g0_charset = saved.g0_charset;
+            self.grid.modes.g1_charset = saved.g1_charset;
+            self.grid.modes.active_charset = saved.active_charset;
+            self.grid.modes.autowrap_mode = saved.autowrap_mode;
+        }
+    }
+
+    /// Enter alt screen: save grid/modes, clear screen, reset cursor and scroll region.
+    /// If `save_cursor` is true, also save cursor state (mode 1049).
+    fn enter_alt_screen(&mut self, save_cursor: bool) {
+        if save_cursor {
+            self.save_cursor();
+        }
+        self.state.saved_grid = Some(self.grid.cells.clone());
+        self.state.saved_modes = Some(self.grid.modes.clone());
+        self.state.in_alt_screen = true;
+        let blank = Cell::default();
+        for row in self.grid.cells.iter_mut() {
+            for cell in row.iter_mut() { *cell = blank; }
+        }
+        self.grid.cursor_x = 0;
+        self.grid.cursor_y = 0;
+        self.grid.scroll_top = 0;
+        self.grid.scroll_bottom = self.grid.rows - 1;
+        self.grid.wrap_pending = false;
+    }
+
+    /// Exit alt screen: restore grid/modes, reset scroll region.
+    /// If `restore_cursor` is true, also restore cursor state (mode 1049).
+    fn exit_alt_screen(&mut self, do_restore_cursor: bool) {
+        self.state.in_alt_screen = false;
+        if let Some(saved) = self.state.saved_grid.take() {
+            self.grid.cells = saved;
+            self.grid.cells.resize(
+                self.grid.rows as usize,
+                vec![Cell::default(); self.grid.cols as usize],
+            );
+            for row in &mut self.grid.cells {
+                row.resize(self.grid.cols as usize, Cell::default());
+            }
+        }
+        if let Some(modes) = self.state.saved_modes.take() {
+            self.grid.modes = modes;
+        }
+        if do_restore_cursor {
+            self.restore_cursor();
+        }
+        self.grid.scroll_top = 0;
+        self.grid.scroll_bottom = self.grid.rows - 1;
     }
 
     /// Erase half of a wide character: if a cell is part of a wide char pair,
@@ -79,6 +149,286 @@ impl<'a> ScreenPerformer<'a> {
         } else if cell_width == 0 && x > 0 {
             // This is the continuation half; blank the first half too
             self.grid.cells[y][x - 1] = self.blank_cell();
+        }
+    }
+
+    // --- CSI command methods ---
+
+    fn csi_cursor_up(&mut self, n: u16) {
+        self.grid.wrap_pending = false;
+        let top = if self.grid.cursor_y >= self.grid.scroll_top {
+            self.grid.scroll_top
+        } else {
+            0
+        };
+        self.grid.cursor_y = self.grid.cursor_y.saturating_sub(n).max(top);
+    }
+
+    fn csi_cursor_down(&mut self, n: u16) {
+        self.grid.wrap_pending = false;
+        let bottom = if self.grid.cursor_y <= self.grid.scroll_bottom {
+            self.grid.scroll_bottom
+        } else {
+            self.grid.rows - 1
+        };
+        self.grid.cursor_y = self.grid.cursor_y.saturating_add(n).min(bottom);
+    }
+
+    fn csi_cursor_forward(&mut self, n: u16) {
+        self.grid.wrap_pending = false;
+        self.grid.cursor_x = self.grid.cursor_x.saturating_add(n).min(self.grid.cols - 1);
+    }
+
+    fn csi_cursor_back(&mut self, n: u16) {
+        self.grid.wrap_pending = false;
+        self.grid.cursor_x = self.grid.cursor_x.saturating_sub(n);
+    }
+
+    fn csi_cursor_next_line(&mut self, n: u16) {
+        self.grid.wrap_pending = false;
+        self.grid.cursor_x = 0;
+        let bottom = if self.grid.cursor_y <= self.grid.scroll_bottom {
+            self.grid.scroll_bottom
+        } else {
+            self.grid.rows - 1
+        };
+        self.grid.cursor_y = self.grid.cursor_y.saturating_add(n).min(bottom);
+    }
+
+    fn csi_cursor_prev_line(&mut self, n: u16) {
+        self.grid.wrap_pending = false;
+        self.grid.cursor_x = 0;
+        let top = if self.grid.cursor_y >= self.grid.scroll_top {
+            self.grid.scroll_top
+        } else {
+            0
+        };
+        self.grid.cursor_y = self.grid.cursor_y.saturating_sub(n).max(top);
+    }
+
+    fn csi_cursor_horizontal_absolute(&mut self, col: u16) {
+        self.grid.wrap_pending = false;
+        self.grid.cursor_x = col.saturating_sub(1).min(self.grid.cols - 1);
+    }
+
+    fn csi_cursor_position(&mut self, row: u16, col: u16) {
+        self.grid.wrap_pending = false;
+        self.grid.cursor_y = row.saturating_sub(1).min(self.grid.rows - 1);
+        self.grid.cursor_x = col.saturating_sub(1).min(self.grid.cols - 1);
+    }
+
+    fn csi_line_position_absolute(&mut self, row: u16) {
+        self.grid.wrap_pending = false;
+        self.grid.cursor_y = row.saturating_sub(1).min(self.grid.rows - 1);
+    }
+
+    fn csi_erase_display(&mut self, mode: u16) {
+        let blank = self.blank_cell();
+        match mode {
+            0 => {
+                let y = self.grid.cursor_y as usize;
+                let x = self.grid.cursor_x as usize;
+                self.fixup_wide_char(x, y);
+                for i in x..self.grid.cols as usize { self.grid.cells[y][i] = blank; }
+                for row in self.grid.cells.iter_mut().skip(y + 1) {
+                    for cell in row.iter_mut() { *cell = blank; }
+                }
+            }
+            1 => {
+                let y = self.grid.cursor_y as usize;
+                let x = self.grid.cursor_x as usize;
+                for row in self.grid.cells.iter_mut().take(y) {
+                    for cell in row.iter_mut() { *cell = blank; }
+                }
+                let end = x.min(self.grid.cols as usize - 1);
+                self.fixup_wide_char(end, y);
+                for i in 0..=end { self.grid.cells[y][i] = blank; }
+            }
+            2 => {
+                for row in self.grid.cells.iter_mut() {
+                    for cell in row.iter_mut() { *cell = blank; }
+                }
+            }
+            3 => {
+                for row in self.grid.cells.iter_mut() {
+                    for cell in row.iter_mut() { *cell = blank; }
+                }
+                self.scrollback.clear();
+                self.pending_scrollback.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn csi_erase_line(&mut self, mode: u16) {
+        let blank = self.blank_cell();
+        let y = self.grid.cursor_y as usize;
+        let x = self.grid.cursor_x as usize;
+        match mode {
+            0 => {
+                self.fixup_wide_char(x, y);
+                for i in x..self.grid.cols as usize { self.grid.cells[y][i] = blank; }
+            }
+            1 => {
+                let end = x.min(self.grid.cols as usize - 1);
+                self.fixup_wide_char(end, y);
+                for i in 0..=end { self.grid.cells[y][i] = blank; }
+            }
+            2 => { for cell in self.grid.cells[y].iter_mut() { *cell = blank; } }
+            _ => {}
+        }
+    }
+
+    fn csi_erase_character(&mut self, n: u16) {
+        let blank = self.blank_cell();
+        let n = n as usize;
+        let y = self.grid.cursor_y as usize;
+        let x = self.grid.cursor_x as usize;
+        if y < self.grid.rows as usize {
+            self.fixup_wide_char(x, y);
+            let end = (x + n).min(self.grid.cols as usize);
+            if end < self.grid.cols as usize {
+                self.fixup_wide_char(end, y);
+            }
+            for i in x..end {
+                self.grid.cells[y][i] = blank;
+            }
+        }
+    }
+
+    fn csi_delete_character(&mut self, n: u16) {
+        let blank = self.blank_cell();
+        let n = n as usize;
+        let y = self.grid.cursor_y as usize;
+        let x = self.grid.cursor_x as usize;
+        let cols = self.grid.cols as usize;
+        if y < self.grid.rows as usize {
+            self.fixup_wide_char(x, y);
+            for _ in 0..n.min(cols.saturating_sub(x)) {
+                self.grid.cells[y].remove(x);
+                self.grid.cells[y].push(blank);
+            }
+            if x < cols && self.grid.cells[y][x].width == 0 {
+                self.grid.cells[y][x] = blank;
+            }
+        }
+    }
+
+    fn csi_insert_character(&mut self, n: u16) {
+        let blank = self.blank_cell();
+        let n = n as usize;
+        let y = self.grid.cursor_y as usize;
+        let x = self.grid.cursor_x as usize;
+        let cols = self.grid.cols as usize;
+        if y < self.grid.rows as usize {
+            self.fixup_wide_char(x, y);
+            for _ in 0..n.min(cols.saturating_sub(x)) {
+                self.grid.cells[y].pop();
+                self.grid.cells[y].insert(x, blank);
+            }
+            let last = cols - 1;
+            if self.grid.cells[y][last].width == 2 {
+                self.grid.cells[y][last] = blank;
+            }
+        }
+    }
+
+    fn csi_scroll_up_n(&mut self, n: u16) {
+        let n = n.min(self.grid.rows);
+        for _ in 0..n { self.scroll_up(); }
+    }
+
+    fn csi_scroll_down_n(&mut self, n: u16) {
+        let n = n.min(self.grid.rows);
+        for _ in 0..n { self.scroll_down(); }
+    }
+
+    fn csi_delete_lines(&mut self, n: u16) {
+        let blank = self.blank_cell();
+        let n = n as usize;
+        let y = self.grid.cursor_y as usize;
+        let top = self.grid.scroll_top as usize;
+        let bottom = self.grid.scroll_bottom as usize;
+        if y >= top && y <= bottom {
+            self.grid.cursor_x = 0;
+            self.grid.wrap_pending = false;
+            let n = n.min(bottom - y + 1);
+            for _ in 0..n {
+                if y <= bottom && bottom < self.grid.cells.len() {
+                    self.grid.cells.remove(y);
+                    self.grid.cells.insert(bottom, vec![blank; self.grid.cols as usize]);
+                }
+            }
+        }
+    }
+
+    fn csi_insert_lines(&mut self, n: u16) {
+        let blank = self.blank_cell();
+        let n = n as usize;
+        let y = self.grid.cursor_y as usize;
+        let top = self.grid.scroll_top as usize;
+        let bottom = self.grid.scroll_bottom as usize;
+        if y >= top && y <= bottom {
+            self.grid.cursor_x = 0;
+            self.grid.wrap_pending = false;
+            let n = n.min(bottom - y + 1);
+            for _ in 0..n {
+                if y <= bottom && bottom < self.grid.cells.len() {
+                    self.grid.cells.remove(bottom);
+                    self.grid.cells.insert(y, vec![blank; self.grid.cols as usize]);
+                }
+            }
+        }
+    }
+
+    fn csi_set_scrolling_region(&mut self, top: u16, bottom: u16) {
+        let top = top.saturating_sub(1);
+        let bottom = bottom.saturating_sub(1).min(self.grid.rows - 1);
+        if top < bottom {
+            self.grid.scroll_top = top;
+            self.grid.scroll_bottom = bottom;
+        }
+        self.grid.cursor_x = 0;
+        self.grid.cursor_y = 0;
+        self.grid.wrap_pending = false;
+    }
+
+    fn csi_set_dec_private_mode(&mut self, ps: &[Vec<u16>], enable: bool) {
+        for param in ps {
+            match param.first().copied() {
+                Some(1) => self.grid.modes.cursor_key_mode = enable,
+                Some(7) => self.grid.modes.autowrap_mode = enable,
+                Some(12) => {} // Cursor blink — cosmetic, ignore
+                Some(25) => self.grid.cursor_visible = enable,
+                Some(1000 | 1002 | 1003) => {
+                    if enable {
+                        self.grid.modes.mouse_mode = param[0];
+                    } else {
+                        self.grid.modes.mouse_mode = 0;
+                    }
+                }
+                Some(1005 | 1006) => {
+                    if enable {
+                        self.grid.modes.mouse_encoding = param[0];
+                    } else {
+                        self.grid.modes.mouse_encoding = 0;
+                    }
+                }
+                Some(1004) => self.grid.modes.focus_reporting = enable,
+                Some(1048) => {
+                    if enable { self.save_cursor(); } else { self.restore_cursor(); }
+                }
+                Some(2004) => self.grid.modes.bracketed_paste = enable,
+                Some(1049) => {
+                    if enable { self.enter_alt_screen(true); }
+                    else { self.exit_alt_screen(true); }
+                }
+                Some(1047 | 47) => {
+                    if enable { self.enter_alt_screen(false); }
+                    else { self.exit_alt_screen(false); }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -137,7 +487,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
 
             self.grid.cells[y][x] = Cell {
                 c,
-                style: self.state.current_style.clone(),
+                style: self.state.current_style,
                 width: char_width as u8,
             };
 
@@ -149,7 +499,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                     self.fixup_wide_char(next, y);
                     self.grid.cells[y][next] = Cell {
                         c: '\0',
-                        style: self.state.current_style.clone(),
+                        style: self.state.current_style,
                         width: 0,
                     };
                 }
@@ -188,10 +538,10 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 if self.grid.cursor_x >= self.grid.cols { self.grid.cursor_x = self.grid.cols - 1; }
             }
             0x0E => { // SO — Shift Out (activate G1)
-                self.grid.modes.active_charset = 1;
+                self.grid.modes.active_charset = ActiveCharset::G1;
             }
             0x0F => { // SI — Shift In (activate G0)
-                self.grid.modes.active_charset = 0;
+                self.grid.modes.active_charset = ActiveCharset::G0;
             }
             0x07 => {} // Bell
             _ => {}
@@ -205,343 +555,51 @@ impl<'a> Perform for ScreenPerformer<'a> {
         };
 
         match action {
-            'A' => { // CUU — Cursor Up (clamped to scroll region if inside it)
-                self.grid.wrap_pending = false;
-                let top = if self.grid.cursor_y >= self.grid.scroll_top {
-                    self.grid.scroll_top
-                } else {
-                    0
-                };
-                self.grid.cursor_y = self.grid.cursor_y.saturating_sub(p(0, 1)).max(top);
-            }
-            'B' => { // CUD — Cursor Down (clamped to scroll region if inside it)
-                self.grid.wrap_pending = false;
-                let bottom = if self.grid.cursor_y <= self.grid.scroll_bottom {
-                    self.grid.scroll_bottom
-                } else {
-                    self.grid.rows - 1
-                };
-                self.grid.cursor_y = (self.grid.cursor_y + p(0, 1)).min(bottom);
-            }
-            'C' => { self.grid.wrap_pending = false; self.grid.cursor_x = (self.grid.cursor_x + p(0, 1)).min(self.grid.cols - 1); }
-            'D' => { self.grid.wrap_pending = false; self.grid.cursor_x = self.grid.cursor_x.saturating_sub(p(0, 1)); }
-            'E' => { // CNL — Cursor Next Line
-                self.grid.wrap_pending = false;
-                self.grid.cursor_x = 0;
-                self.grid.cursor_y = (self.grid.cursor_y + p(0, 1)).min(self.grid.rows - 1);
-            }
-            'F' => { // CPL — Cursor Previous Line
-                self.grid.wrap_pending = false;
-                self.grid.cursor_x = 0;
-                self.grid.cursor_y = self.grid.cursor_y.saturating_sub(p(0, 1));
-            }
-            'G' => { // CHA — Cursor Horizontal Absolute
-                self.grid.wrap_pending = false;
-                self.grid.cursor_x = p(0, 1).saturating_sub(1).min(self.grid.cols - 1);
-            }
-            'H' | 'f' => {
-                self.grid.wrap_pending = false;
-                self.grid.cursor_y = p(0, 1).saturating_sub(1).min(self.grid.rows - 1);
-                self.grid.cursor_x = p(1, 1).saturating_sub(1).min(self.grid.cols - 1);
-            }
-            'd' => { // VPA — Line Position Absolute
-                self.grid.wrap_pending = false;
-                self.grid.cursor_y = p(0, 1).saturating_sub(1).min(self.grid.rows - 1);
-            }
-            'J' => {
-                let blank = self.blank_cell();
-                let mode = p(0, 0);
-                match mode {
-                    0 => {
-                        let y = self.grid.cursor_y as usize;
-                        let x = self.grid.cursor_x as usize;
-                        for i in x..self.grid.cols as usize { self.grid.cells[y][i] = blank.clone(); }
-                        for row in self.grid.cells.iter_mut().skip(y + 1) {
-                            for cell in row.iter_mut() { *cell = blank.clone(); }
-                        }
-                    }
-                    1 => {
-                        let y = self.grid.cursor_y as usize;
-                        let x = self.grid.cursor_x as usize;
-                        for row in self.grid.cells.iter_mut().take(y) {
-                            for cell in row.iter_mut() { *cell = blank.clone(); }
-                        }
-                        for i in 0..=x.min(self.grid.cols as usize - 1) { self.grid.cells[y][i] = blank.clone(); }
-                    }
-                    2 => {
-                        for row in self.grid.cells.iter_mut() {
-                            for cell in row.iter_mut() { *cell = blank.clone(); }
-                        }
-                    }
-                    3 => {
-                        for row in self.grid.cells.iter_mut() {
-                            for cell in row.iter_mut() { *cell = blank.clone(); }
-                        }
-                        self.scrollback.clear();
-                        self.pending_scrollback.clear();
-                    }
-                    _ => {}
+            'A' => self.csi_cursor_up(p(0, 1)),
+            'B' => self.csi_cursor_down(p(0, 1)),
+            'C' => self.csi_cursor_forward(p(0, 1)),
+            'D' => self.csi_cursor_back(p(0, 1)),
+            'E' => self.csi_cursor_next_line(p(0, 1)),
+            'F' => self.csi_cursor_prev_line(p(0, 1)),
+            'G' => self.csi_cursor_horizontal_absolute(p(0, 1)),
+            'H' | 'f' => self.csi_cursor_position(p(0, 1), p(1, 1)),
+            'd' => self.csi_line_position_absolute(p(0, 1)),
+            'J' => self.csi_erase_display(p(0, 0)),
+            'K' => self.csi_erase_line(p(0, 0)),
+            'X' => self.csi_erase_character(p(0, 1)),
+            'P' => self.csi_delete_character(p(0, 1)),
+            '@' => self.csi_insert_character(p(0, 1)),
+            'b' => { let c = self.state.last_printed_char; for _ in 0..p(0, 1) { self.print(c); } }
+            'm' => self.state.current_style.apply_sgr(&ps),
+            'n' if intermediates.is_empty() => {
+                if p(0, 0) == 6 {
+                    use super::style::write_u16;
+                    let mut r = Vec::with_capacity(16);
+                    r.extend_from_slice(b"\x1b[");
+                    write_u16(&mut r, self.grid.cursor_y + 1);
+                    r.push(b';');
+                    write_u16(&mut r, self.grid.cursor_x + 1);
+                    r.push(b'R');
+                    self.state.pending_responses.push(r);
                 }
             }
-            'K' => {
-                let blank = self.blank_cell();
-                let mode = p(0, 0);
-                let y = self.grid.cursor_y as usize;
-                let x = self.grid.cursor_x as usize;
-                match mode {
-                    0 => { for i in x..self.grid.cols as usize { self.grid.cells[y][i] = blank.clone(); } }
-                    1 => { for i in 0..=x.min(self.grid.cols as usize - 1) { self.grid.cells[y][i] = blank.clone(); } }
-                    2 => { for cell in self.grid.cells[y].iter_mut() { *cell = blank.clone(); } }
-                    _ => {}
-                }
-            }
-            'X' => { // ECH — Erase Character (without moving cursor)
-                let blank = self.blank_cell();
-                let n = p(0, 1) as usize;
-                let y = self.grid.cursor_y as usize;
-                let x = self.grid.cursor_x as usize;
-                if y < self.grid.rows as usize {
-                    // Fix up wide char boundaries at erase start
-                    self.fixup_wide_char(x, y);
-                    let end = (x + n).min(self.grid.cols as usize);
-                    // Fix up wide char boundary at erase end
-                    if end < self.grid.cols as usize {
-                        self.fixup_wide_char(end, y);
-                    }
-                    for i in x..end {
-                        self.grid.cells[y][i] = blank.clone();
-                    }
-                }
-            }
-            'P' => { // DCH — Delete Character (shift left, blank fills right)
-                let blank = self.blank_cell();
-                let n = p(0, 1) as usize;
-                let y = self.grid.cursor_y as usize;
-                let x = self.grid.cursor_x as usize;
-                let cols = self.grid.cols as usize;
-                if y < self.grid.rows as usize {
-                    self.fixup_wide_char(x, y);
-                    for _ in 0..n.min(cols.saturating_sub(x)) {
-                        self.grid.cells[y].remove(x);
-                        self.grid.cells[y].push(blank.clone());
-                    }
-                }
-            }
-            '@' => { // ICH — Insert Character (shift right, blank at cursor)
-                let blank = self.blank_cell();
-                let n = p(0, 1) as usize;
-                let y = self.grid.cursor_y as usize;
-                let x = self.grid.cursor_x as usize;
-                let cols = self.grid.cols as usize;
-                if y < self.grid.rows as usize {
-                    self.fixup_wide_char(x, y);
-                    for _ in 0..n.min(cols.saturating_sub(x)) {
-                        self.grid.cells[y].pop();
-                        self.grid.cells[y].insert(x, blank.clone());
-                    }
-                }
-            }
-            'b' => { // REP — Repeat preceding graphic character
-                let n = p(0, 1);
-                let c = self.state.last_printed_char;
-                for _ in 0..n {
-                    self.print(c);
-                }
-            }
-            'm' => {
-                self.state.current_style.apply_sgr(&ps);
-            }
-            'n' if intermediates.is_empty() => { // DSR — Device Status Report
-                let mode = p(0, 0);
-                if mode == 6 {
-                    // CPR — Cursor Position Report
-                    let response = format!(
-                        "\x1b[{};{}R",
-                        self.grid.cursor_y + 1,
-                        self.grid.cursor_x + 1
-                    );
-                    self.state.pending_responses.push(response.into_bytes());
-                }
-            }
-            'c' => { // DA — Device Attributes
+            'c' => {
                 if intermediates.is_empty() {
-                    // DA1: Primary Device Attributes
-                    if p(0, 0) == 0 {
-                        self.state.pending_responses.push(b"\x1b[?62;c".to_vec());
-                    }
-                } else if intermediates == b">" {
-                    // DA2: Secondary Device Attributes
-                    if p(0, 0) == 0 {
-                        self.state.pending_responses.push(b"\x1b[>0;10;1c".to_vec());
-                    }
+                    if p(0, 0) == 0 { self.state.pending_responses.push(b"\x1b[?62;c".to_vec()); }
+                } else if intermediates == b">" && p(0, 0) == 0 {
+                    self.state.pending_responses.push(b"\x1b[>0;10;1c".to_vec());
                 }
             }
-            'q' if intermediates == b" " => { // DECSCUSR — Set Cursor Style
-                self.grid.modes.cursor_shape = p(0, 0) as u8;
-            }
-            'S' => { let n = p(0, 1); for _ in 0..n { self.scroll_up(); } }
-            'T' => { // SD — Scroll Down
-                if ps.len() <= 1 {
-                    let n = p(0, 1);
-                    for _ in 0..n { self.scroll_down(); }
-                }
-            }
-            'M' => { // DL — Delete Lines (within scroll region)
-                let blank = self.blank_cell();
-                let n = p(0, 1) as usize;
-                let y = self.grid.cursor_y as usize;
-                let top = self.grid.scroll_top as usize;
-                let bottom = self.grid.scroll_bottom as usize;
-                if y >= top {
-                    for _ in 0..n {
-                        if y <= bottom && bottom < self.grid.cells.len() {
-                            self.grid.cells.remove(y);
-                            self.grid.cells.insert(bottom, vec![blank.clone(); self.grid.cols as usize]);
-                        }
-                    }
-                }
-            }
-            'L' => { // IL — Insert Lines (within scroll region)
-                let blank = self.blank_cell();
-                let n = p(0, 1) as usize;
-                let y = self.grid.cursor_y as usize;
-                let top = self.grid.scroll_top as usize;
-                let bottom = self.grid.scroll_bottom as usize;
-                if y >= top {
-                    for _ in 0..n {
-                        if y <= bottom && bottom < self.grid.cells.len() {
-                            self.grid.cells.remove(bottom);
-                            self.grid.cells.insert(y, vec![blank.clone(); self.grid.cols as usize]);
-                        }
-                    }
-                }
-            }
-            'r' if intermediates.is_empty() => { // DECSTBM — Set Scrolling Region
-                let top = p(0, 1).saturating_sub(1);
-                let bottom = p(1, self.grid.rows).saturating_sub(1).min(self.grid.rows - 1);
-                if top < bottom {
-                    self.grid.scroll_top = top;
-                    self.grid.scroll_bottom = bottom;
-                }
-                self.grid.cursor_x = 0;
-                self.grid.cursor_y = 0;
-                self.grid.wrap_pending = false;
-            }
-            's' if intermediates.is_empty() => { // SCP — Save Cursor Position
-                self.state.saved_cursor_state = Some(super::SavedCursor {
-                    x: self.grid.cursor_x,
-                    y: self.grid.cursor_y,
-                    style: self.state.current_style.clone(),
-                    g0_charset: self.grid.modes.g0_charset,
-                    g1_charset: self.grid.modes.g1_charset,
-                    active_charset: self.grid.modes.active_charset,
-                    autowrap_mode: self.grid.modes.autowrap_mode,
-                });
-            }
-            'u' if intermediates.is_empty() => { // RCP — Restore Cursor Position
-                if let Some(ref saved) = self.state.saved_cursor_state {
-                    self.grid.wrap_pending = false;
-                    self.grid.cursor_x = saved.x.min(self.grid.cols - 1);
-                    self.grid.cursor_y = saved.y.min(self.grid.rows - 1);
-                    self.state.current_style = saved.style.clone();
-                    self.grid.modes.g0_charset = saved.g0_charset;
-                    self.grid.modes.g1_charset = saved.g1_charset;
-                    self.grid.modes.active_charset = saved.active_charset;
-                    self.grid.modes.autowrap_mode = saved.autowrap_mode;
-                }
-            }
-            't' => {} // Window ops — ignore
-            'h' | 'l' => {
-                if intermediates == b"?" {
-                    let enable = action == 'h';
-                    for param in &ps {
-                        match param.first().copied() {
-                            Some(1) => self.grid.modes.cursor_key_mode = enable,
-                            Some(7) => self.grid.modes.autowrap_mode = enable,
-                            Some(12) => {} // Cursor blink — cosmetic, ignore
-                            Some(25) => self.grid.cursor_visible = enable,
-                            Some(1000 | 1002 | 1003) => {
-                                if enable {
-                                    self.grid.modes.mouse_mode = param[0];
-                                } else {
-                                    self.grid.modes.mouse_mode = 0;
-                                }
-                            }
-                            Some(1005 | 1006) => {
-                                if enable {
-                                    self.grid.modes.mouse_encoding = param[0];
-                                } else {
-                                    self.grid.modes.mouse_encoding = 0;
-                                }
-                            }
-                            Some(1004) => self.grid.modes.focus_reporting = enable,
-                            Some(1048) => {
-                                if enable {
-                                    self.state.saved_cursor_state = Some(super::SavedCursor {
-                                        x: self.grid.cursor_x,
-                                        y: self.grid.cursor_y,
-                                        style: self.state.current_style.clone(),
-                                        g0_charset: self.grid.modes.g0_charset,
-                                        g1_charset: self.grid.modes.g1_charset,
-                                        active_charset: self.grid.modes.active_charset,
-                                        autowrap_mode: self.grid.modes.autowrap_mode,
-                                    });
-                                } else if let Some(ref saved) = self.state.saved_cursor_state {
-                                    self.grid.wrap_pending = false;
-                                    self.grid.cursor_x = saved.x.min(self.grid.cols - 1);
-                                    self.grid.cursor_y = saved.y.min(self.grid.rows - 1);
-                                    self.state.current_style = saved.style.clone();
-                                    self.grid.modes.g0_charset = saved.g0_charset;
-                                    self.grid.modes.g1_charset = saved.g1_charset;
-                                    self.grid.modes.active_charset = saved.active_charset;
-                                    self.grid.modes.autowrap_mode = saved.autowrap_mode;
-                                }
-                            }
-                            Some(2004) => self.grid.modes.bracketed_paste = enable,
-                            Some(1049 | 1047 | 47) => {
-                                if enable {
-                                    // Save main screen buffer, cursor, and terminal modes
-                                    self.state.saved_grid = Some(self.grid.cells.clone());
-                                    self.state.saved_cursor = Some((self.grid.cursor_x, self.grid.cursor_y));
-                                    self.state.saved_modes = Some(self.grid.modes.clone());
-                                    self.state.in_alt_screen = true;
-                                    let blank = Cell::default();
-                                    for row in self.grid.cells.iter_mut() {
-                                        for cell in row.iter_mut() { *cell = blank.clone(); }
-                                    }
-                                    self.grid.cursor_x = 0;
-                                    self.grid.cursor_y = 0;
-                                    self.grid.scroll_top = 0;
-                                    self.grid.scroll_bottom = self.grid.rows - 1;
-                                } else {
-                                    // Restore main screen buffer and terminal modes
-                                    self.state.in_alt_screen = false;
-                                    if let Some(saved) = self.state.saved_grid.take() {
-                                        self.grid.cells = saved;
-                                        self.grid.cells.resize(
-                                            self.grid.rows as usize,
-                                            vec![Cell::default(); self.grid.cols as usize],
-                                        );
-                                        for row in &mut self.grid.cells {
-                                            row.resize(self.grid.cols as usize, Cell::default());
-                                        }
-                                    }
-                                    if let Some((cx, cy)) = self.state.saved_cursor.take() {
-                                        self.grid.cursor_x = cx.min(self.grid.cols - 1);
-                                        self.grid.cursor_y = cy.min(self.grid.rows - 1);
-                                    }
-                                    if let Some(modes) = self.state.saved_modes.take() {
-                                        self.grid.modes = modes;
-                                    }
-                                    self.grid.scroll_top = 0;
-                                    self.grid.scroll_bottom = self.grid.rows - 1;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
+            'q' if intermediates == b" " => self.grid.modes.cursor_shape = CursorShape::from_sgr(p(0, 0) as u8),
+            'S' => self.csi_scroll_up_n(p(0, 1)),
+            'T' if ps.len() <= 1 => self.csi_scroll_down_n(p(0, 1)),
+            'M' => self.csi_delete_lines(p(0, 1)),
+            'L' => self.csi_insert_lines(p(0, 1)),
+            'r' if intermediates.is_empty() => self.csi_set_scrolling_region(p(0, 1), p(1, self.grid.rows)),
+            's' if intermediates.is_empty() => self.save_cursor(),
+            'u' if intermediates.is_empty() => self.restore_cursor(),
+            't' => {}
+            'h' | 'l' if intermediates == b"?" => self.csi_set_dec_private_mode(&ps, action == 'h'),
             _ => {}
         }
     }
@@ -555,29 +613,8 @@ impl<'a> Perform for ScreenPerformer<'a> {
                     self.grid.cursor_y -= 1;
                 }
             }
-            ([], b'7') => { // DECSC — Save Cursor (position + style + charsets + autowrap)
-                self.state.saved_cursor_state = Some(super::SavedCursor {
-                    x: self.grid.cursor_x,
-                    y: self.grid.cursor_y,
-                    style: self.state.current_style.clone(),
-                    g0_charset: self.grid.modes.g0_charset,
-                    g1_charset: self.grid.modes.g1_charset,
-                    active_charset: self.grid.modes.active_charset,
-                    autowrap_mode: self.grid.modes.autowrap_mode,
-                });
-            }
-            ([], b'8') => { // DECRC — Restore Cursor (position + style + charsets + autowrap)
-                if let Some(ref saved) = self.state.saved_cursor_state {
-                    self.grid.wrap_pending = false;
-                    self.grid.cursor_x = saved.x.min(self.grid.cols - 1);
-                    self.grid.cursor_y = saved.y.min(self.grid.rows - 1);
-                    self.state.current_style = saved.style.clone();
-                    self.grid.modes.g0_charset = saved.g0_charset;
-                    self.grid.modes.g1_charset = saved.g1_charset;
-                    self.grid.modes.active_charset = saved.active_charset;
-                    self.grid.modes.autowrap_mode = saved.autowrap_mode;
-                }
-            }
+            ([], b'7') => self.save_cursor(),   // DECSC — Save Cursor
+            ([], b'8') => self.restore_cursor(), // DECRC — Restore Cursor
             ([], b'c') => { // RIS — Full Reset
                 self.grid.cursor_x = 0;
                 self.grid.cursor_y = 0;
@@ -589,13 +626,12 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 self.state.current_style = Style::default();
                 self.state.in_alt_screen = false;
                 self.state.saved_grid = None;
-                self.state.saved_cursor = None;
                 self.state.saved_cursor_state = None;
                 self.state.title.clear();
                 self.state.last_printed_char = ' ';
                 let blank = Cell::default();
                 for row in self.grid.cells.iter_mut() {
-                    for cell in row.iter_mut() { *cell = blank.clone(); }
+                    for cell in row.iter_mut() { *cell = blank; }
                 }
             }
             ([], b'=') => { // DECKPAM — Keypad Application Mode
@@ -604,10 +640,10 @@ impl<'a> Perform for ScreenPerformer<'a> {
             ([], b'>') => { // DECKPNM — Keypad Numeric Mode
                 self.grid.modes.keypad_app_mode = false;
             }
-            ([b'('], b'B') => { self.grid.modes.g0_charset = 0; } // G0 → ASCII
-            ([b'('], b'0') => { self.grid.modes.g0_charset = 1; } // G0 → Line Drawing
-            ([b')'], b'B') => { self.grid.modes.g1_charset = 0; } // G1 → ASCII
-            ([b')'], b'0') => { self.grid.modes.g1_charset = 1; } // G1 → Line Drawing
+            ([b'('], b'B') => { self.grid.modes.g0_charset = Charset::Ascii; }
+            ([b'('], b'0') => { self.grid.modes.g0_charset = Charset::LineDrawing; }
+            ([b')'], b'B') => { self.grid.modes.g1_charset = Charset::Ascii; }
+            ([b')'], b'0') => { self.grid.modes.g1_charset = Charset::LineDrawing; }
             _ => {}
         }
     }

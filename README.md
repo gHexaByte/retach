@@ -33,13 +33,13 @@ Requires Rust 1.70+. macOS or Linux.
 # Create or attach to a session (recommended)
 retach open work
 
-# Create a new session with explicit name
+# Create a new session (fails if "work" already exists)
 retach new work
 
 # Create with auto-generated name
 retach new
 
-# Attach to existing session
+# Attach to existing session (fails if not found)
 retach attach work
 
 # List sessions
@@ -73,7 +73,7 @@ Client (retach)            Daemon                     Shell
 (native terminal)         (in memory)
 ```
 
-**Daemon + client over Unix socket** at `/tmp/retach-<uid>/retach.sock`.
+**Daemon + client over Unix socket** at `$XDG_RUNTIME_DIR/retach/retach.sock` (fallback: `/tmp/retach-<uid>/retach.sock`).
 
 The daemon spawns a PTY per session and parses all output through a VTE state machine. It maintains a virtual grid (the visible screen area) and a scrollback buffer. When a line scrolls off the top of the grid, it's sent to the client as a `ScrollbackLine` message — the client writes it to stdout followed by `\r\n`, letting the native terminal handle it. Periodically (60 FPS cap), the daemon sends a `ScreenUpdate` with the current grid rendered as ANSI escape sequences.
 
@@ -87,7 +87,7 @@ On reattach, the daemon sends the stored scrollback history followed by the curr
 |--------|---------|
 | `client/` | Connects to daemon, raw terminal mode, stdin/stdout I/O, SIGWINCH handling |
 | `server/` | Unix socket listener, per-client handler, PTY↔client bridge |
-| `protocol/` | Binary message encoding (bincode, length-prefixed), message types |
+| `protocol/` | Binary message encoding (bincode with size limits, length-prefixed), message types |
 | `screen/` | VTE parser, virtual grid, cell/style representation, ANSI rendering |
 | `session.rs` | Session (PTY + screen + metadata), session manager |
 | `pty.rs` | PTY allocation and process spawning via `portable-pty` |
@@ -101,7 +101,7 @@ RUST_LOG=retach=debug retach open work
 RUST_LOG=retach=trace retach open work
 ```
 
-Server logs go to `/tmp/retach-<uid>/retach.log`.
+Server logs go to `$XDG_RUNTIME_DIR/retach/retach.log` (fallback: `/tmp/retach-<uid>/retach.log`).
 
 ## Supported terminal features
 

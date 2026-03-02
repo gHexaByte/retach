@@ -1,4 +1,4 @@
-use crate::protocol::{self, ClientMsg, ServerMsg};
+use crate::protocol::{self, ClientMsg, ServerMsg, READ_BUF_SIZE};
 use crate::session::SessionManager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -15,7 +15,7 @@ pub async fn handle_client(
     mut stream: tokio::net::UnixStream,
     manager: Arc<Mutex<SessionManager>>,
 ) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; READ_BUF_SIZE];
     let mut read_buf = Vec::new();
 
     let deadline = tokio::time::Instant::now() + INITIAL_MSG_TIMEOUT;
@@ -34,12 +34,12 @@ pub async fn handle_client(
         read_buf.extend_from_slice(&buf[..n]);
 
         if let Some((data, consumed)) = protocol::decode_frame(&read_buf)? {
-            let msg: ClientMsg = bincode::deserialize(data)?;
+            let msg: ClientMsg = crate::protocol::decode(data)?;
             read_buf.drain(..consumed);
 
             match msg {
-                ClientMsg::Connect { name, history, cols, rows } => {
-                    match handle_session(stream, manager, name, history, cols, rows, read_buf).await {
+                ClientMsg::Connect { name, history, cols, rows, mode } => {
+                    match handle_session(stream, manager, name, history, cols, rows, read_buf, mode).await {
                         Ok(()) => return Ok(()),
                         Err(e) => {
                             // stream was moved into handle_session; error is logged by caller
@@ -54,8 +54,13 @@ pub async fn handle_client(
                     return Ok(());
                 }
                 ClientMsg::KillSession { name } => {
-                    let mut mgr = manager.lock().await;
-                    if mgr.remove(&name).is_some() {
+                    let removed = {
+                        let mut mgr = manager.lock().await;
+                        mgr.remove(&name)
+                    };
+                    // Session dropped outside the async Mutex via spawn_blocking
+                    if let Some(session) = removed {
+                        tokio::task::spawn_blocking(move || drop(session));
                         info!(session = %name, "session killed");
                         let resp = protocol::encode(&ServerMsg::SessionKilled { name })?;
                         stream.write_all(&resp).await?;
@@ -77,5 +82,126 @@ pub async fn handle_client(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{self, ClientMsg, ServerMsg};
+    use crate::session::SessionManager;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex;
+
+    /// Helper: read a full response from a UnixStream and deserialize it as a ServerMsg.
+    async fn read_response(stream: &mut tokio::net::UnixStream) -> ServerMsg {
+        let mut buf = vec![0u8; READ_BUF_SIZE];
+        let mut read_buf = Vec::new();
+        loop {
+            let n = stream.read(&mut buf).await.expect("read failed");
+            if n == 0 {
+                panic!("connection closed before a full response was received");
+            }
+            read_buf.extend_from_slice(&buf[..n]);
+            if let Some((data, _consumed)) = protocol::decode_frame(&read_buf).expect("decode error") {
+                return crate::protocol::decode(data).expect("deserialize error");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_sessions_empty() {
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let manager = Arc::new(Mutex::new(SessionManager::new()));
+
+        // Send ListSessions from client side
+        let msg = protocol::encode(&ClientMsg::ListSessions).unwrap();
+        let mut client_stream = client_stream;
+        client_stream.write_all(&msg).await.unwrap();
+
+        // Spawn handle_client on the server side
+        let handle = tokio::spawn(handle_client(server_stream, manager));
+
+        // Read response on the client side
+        let response = read_response(&mut client_stream).await;
+        match response {
+            ServerMsg::SessionList(list) => {
+                assert!(list.is_empty(), "expected empty session list, got {:?}", list);
+            }
+            other => panic!("expected SessionList, got {:?}", other),
+        }
+
+        // handle_client should complete successfully
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn kill_nonexistent_session() {
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let manager = Arc::new(Mutex::new(SessionManager::new()));
+
+        let msg = protocol::encode(&ClientMsg::KillSession {
+            name: "no-such-session".into(),
+        })
+        .unwrap();
+        let mut client_stream = client_stream;
+        client_stream.write_all(&msg).await.unwrap();
+
+        let handle = tokio::spawn(handle_client(server_stream, manager));
+
+        let response = read_response(&mut client_stream).await;
+        match response {
+            ServerMsg::Error(err_msg) => {
+                assert!(
+                    err_msg.contains("no-such-session"),
+                    "error message should mention session name, got: {}",
+                    err_msg
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unexpected_message_returns_error() {
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let manager = Arc::new(Mutex::new(SessionManager::new()));
+
+        // Send an Input message, which is not a valid initial message
+        let msg = protocol::encode(&ClientMsg::Input(b"hello".to_vec())).unwrap();
+        let mut client_stream = client_stream;
+        client_stream.write_all(&msg).await.unwrap();
+
+        let handle = tokio::spawn(handle_client(server_stream, manager));
+
+        let response = read_response(&mut client_stream).await;
+        match response {
+            ServerMsg::Error(err_msg) => {
+                assert!(
+                    err_msg.contains("expected Connect, ListSessions, or KillSession"),
+                    "unexpected error message: {}",
+                    err_msg
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_before_message() {
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let manager = Arc::new(Mutex::new(SessionManager::new()));
+
+        // Drop the client side immediately to simulate a disconnect
+        drop(client_stream);
+
+        // handle_client should return Ok(()) when the client disconnects before sending anything
+        let result = handle_client(server_stream, manager).await;
+        assert!(result.is_ok(), "expected Ok(()), got {:?}", result);
     }
 }

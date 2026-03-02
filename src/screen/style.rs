@@ -1,10 +1,49 @@
+/// Underline style variant.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Hash)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+impl UnderlineStyle {
+    /// Convert from a raw SGR subparameter value.
+    pub fn from_sgr(n: u8) -> Self {
+        match n {
+            0 => Self::None,
+            1 => Self::Single,
+            2 => Self::Double,
+            3 => Self::Curly,
+            4 => Self::Dotted,
+            5 => Self::Dashed,
+            _ => Self::Single, // unknown → single
+        }
+    }
+
+    /// SGR subparameter value for this underline style.
+    pub fn sgr_param(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Single => 1,
+            Self::Double => 2,
+            Self::Curly => 3,
+            Self::Dotted => 4,
+            Self::Dashed => 5,
+        }
+    }
+}
+
 /// SGR text attributes and foreground/background colors for a cell.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Hash)]
 pub struct Style {
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
-    pub underline: u8, // 0=none, 1=single, 2=double, 3=curly, 4=dotted, 5=dashed
+    pub underline: UnderlineStyle,
     pub blink: bool,
     pub inverse: bool,
     pub strikethrough: bool,
@@ -14,7 +53,7 @@ pub struct Style {
 }
 
 /// Terminal color, either a 256-color palette index or direct RGB.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Hash)]
 pub enum Color {
     /// 256-color palette index (0-255).
     Indexed(u8),
@@ -22,50 +61,119 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// Write a u8 value as decimal ASCII digits into `out`.
+fn write_u8(out: &mut Vec<u8>, n: u8) {
+    if n >= 100 { out.push(b'0' + n / 100); }
+    if n >= 10 { out.push(b'0' + (n / 10) % 10); }
+    out.push(b'0' + n % 10);
+}
+
+/// Write a u16 value as decimal ASCII digits into `out`.
+pub fn write_u16(out: &mut Vec<u8>, n: u16) {
+    if n >= 10000 { out.push(b'0' + (n / 10000) as u8); }
+    if n >= 1000 { out.push(b'0' + ((n / 1000) % 10) as u8); }
+    if n >= 100 { out.push(b'0' + ((n / 100) % 10) as u8); }
+    if n >= 10 { out.push(b'0' + ((n / 10) % 10) as u8); }
+    out.push(b'0' + (n % 10) as u8);
+}
+
 impl Style {
     /// Return true if all attributes are at their default (reset) values.
-    pub fn is_default(&self) -> bool {
-        *self == Style::default()
+    pub fn is_default(self) -> bool {
+        self == Style::default()
     }
 
-    /// Render this style as an SGR escape sequence
-    pub fn to_sgr(&self) -> Vec<u8> {
+    /// Write SGR attribute parameters directly as bytes into `out`.
+    /// Uses `;` separator. Caller is responsible for the `\x1b[` prefix and `m` suffix.
+    fn write_sgr_to(self, out: &mut Vec<u8>, need_sep: &mut bool) {
+        macro_rules! sep {
+            ($out:expr, $need:expr) => {
+                if *$need { $out.push(b';'); }
+                *$need = true;
+            };
+        }
+        if self.bold { sep!(out, need_sep); out.push(b'1'); }
+        if self.dim { sep!(out, need_sep); out.push(b'2'); }
+        if self.italic { sep!(out, need_sep); out.push(b'3'); }
+        match self.underline {
+            UnderlineStyle::None => {}
+            UnderlineStyle::Single => { sep!(out, need_sep); out.push(b'4'); }
+            other => {
+                sep!(out, need_sep);
+                out.push(b'4');
+                out.push(b':');
+                out.push(b'0' + other.sgr_param());
+            }
+        }
+        if self.blink { sep!(out, need_sep); out.push(b'5'); }
+        if self.inverse { sep!(out, need_sep); out.push(b'7'); }
+        if self.hidden { sep!(out, need_sep); out.push(b'8'); }
+        if self.strikethrough { sep!(out, need_sep); out.push(b'9'); }
+        Self::write_color_to(out, self.fg, 30, 90, b"38", need_sep);
+        Self::write_color_to(out, self.bg, 40, 100, b"48", need_sep);
+    }
+
+    /// Write SGR color parameters directly as bytes.
+    fn write_color_to(out: &mut Vec<u8>, color: Option<Color>, base: u8, bright_base: u8, extended: &[u8], need_sep: &mut bool) {
+        match color {
+            Some(Color::Indexed(c)) if c < 8 => {
+                if *need_sep { out.push(b';'); }
+                *need_sep = true;
+                write_u8(out, base + c);
+            }
+            Some(Color::Indexed(c)) if c < 16 => {
+                if *need_sep { out.push(b';'); }
+                *need_sep = true;
+                write_u8(out, bright_base + c - 8);
+            }
+            Some(Color::Indexed(c)) => {
+                if *need_sep { out.push(b';'); }
+                *need_sep = true;
+                out.extend_from_slice(extended);
+                out.extend_from_slice(b";5;");
+                write_u8(out, c);
+            }
+            Some(Color::Rgb(r, g, b)) => {
+                if *need_sep { out.push(b';'); }
+                *need_sep = true;
+                out.extend_from_slice(extended);
+                out.extend_from_slice(b";2;");
+                write_u8(out, r);
+                out.push(b';');
+                write_u8(out, g);
+                out.push(b';');
+                write_u8(out, b);
+            }
+            None => {}
+        }
+    }
+
+    /// Render this style as an SGR sequence (no reset prefix).
+    /// Returns empty Vec for default style.
+    #[cfg(test)]
+    pub fn to_sgr(self) -> Vec<u8> {
         if self.is_default() {
             return Vec::new();
         }
-        let mut params: Vec<String> = Vec::new();
-        if self.bold { params.push("1".into()); }
-        if self.dim { params.push("2".into()); }
-        if self.italic { params.push("3".into()); }
-        match self.underline {
-            0 => {}
-            1 => params.push("4".into()),
-            n => params.push(format!("4:{}", n)),
-        }
-        if self.blink { params.push("5".into()); }
-        if self.inverse { params.push("7".into()); }
-        if self.strikethrough { params.push("9".into()); }
-        if self.hidden { params.push("8".into()); }
-        match &self.fg {
-            Some(Color::Indexed(c)) if *c < 8 => params.push(format!("{}", 30 + c)),
-            Some(Color::Indexed(c)) if *c < 16 => params.push(format!("{}", 90 + c - 8)),
-            Some(Color::Indexed(c)) => { params.push("38".into()); params.push("5".into()); params.push(c.to_string()); }
-            Some(Color::Rgb(r, g, b)) => { params.push("38".into()); params.push("2".into()); params.push(r.to_string()); params.push(g.to_string()); params.push(b.to_string()); }
-            None => {}
-        }
-        match &self.bg {
-            Some(Color::Indexed(c)) if *c < 8 => params.push(format!("{}", 40 + c)),
-            Some(Color::Indexed(c)) if *c < 16 => params.push(format!("{}", 100 + c - 8)),
-            Some(Color::Indexed(c)) => { params.push("48".into()); params.push("5".into()); params.push(c.to_string()); }
-            Some(Color::Rgb(r, g, b)) => { params.push("48".into()); params.push("2".into()); params.push(r.to_string()); params.push(g.to_string()); params.push(b.to_string()); }
-            None => {}
-        }
-        if params.is_empty() {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(24);
         out.extend_from_slice(b"\x1b[");
-        out.extend_from_slice(params.join(";").as_bytes());
+        let mut need_sep = false;
+        self.write_sgr_to(&mut out, &mut need_sep);
+        out.push(b'm');
+        out
+    }
+
+    /// Render this style as a combined reset+set SGR: `\x1b[0;1;31m` instead of
+    /// separate `\x1b[0m` + `\x1b[31m`. Always includes reset (param 0).
+    /// For default style returns just `\x1b[0m`.
+    pub fn to_sgr_with_reset(self) -> Vec<u8> {
+        if self.is_default() {
+            return b"\x1b[0m".to_vec();
+        }
+        let mut out = Vec::with_capacity(24);
+        out.extend_from_slice(b"\x1b[0");
+        let mut need_sep = true;
+        self.write_sgr_to(&mut out, &mut need_sep);
         out.push(b'm');
         out
     }
@@ -87,19 +195,19 @@ impl Style {
                 4 => {
                     // Check for subparams: 4:0 (none), 4:1 (single), 4:2 (double), 4:3 (curly), etc.
                     if params[i].len() > 1 {
-                        self.underline = params[i][1] as u8;
+                        self.underline = UnderlineStyle::from_sgr(params[i][1] as u8);
                     } else {
-                        self.underline = 1;
+                        self.underline = UnderlineStyle::Single;
                     }
                 }
                 5 | 6 => self.blink = true,
                 7 => self.inverse = true,
                 8 => self.hidden = true,
                 9 => self.strikethrough = true,
-                21 => self.underline = 2, // double underline
+                21 => self.underline = UnderlineStyle::Double, // double underline
                 22 => { self.bold = false; self.dim = false; }
                 23 => self.italic = false,
-                24 => self.underline = 0,
+                24 => self.underline = UnderlineStyle::None,
                 25 => self.blink = false,
                 27 => self.inverse = false,
                 28 => self.hidden = false,
@@ -238,5 +346,122 @@ mod tests {
         // 38:5:200 as colon-separated subparams
         style.apply_sgr(&[vec![38, 5, 200]]);
         assert_eq!(style.fg, Some(Color::Indexed(200)));
+    }
+
+    // --- New tests ---
+
+    #[test]
+    fn sgr_underline_variants() {
+        // double underline
+        let mut s = Style::default();
+        s.underline = UnderlineStyle::Double;
+        let sgr = s.to_sgr();
+        assert_eq!(sgr, b"\x1b[4:2m", "double underline should use 4:2");
+
+        // curly underline
+        s.underline = UnderlineStyle::Curly;
+        let sgr = s.to_sgr();
+        assert_eq!(sgr, b"\x1b[4:3m", "curly underline should use 4:3");
+
+        // dotted underline
+        s.underline = UnderlineStyle::Dotted;
+        let sgr = s.to_sgr();
+        assert_eq!(sgr, b"\x1b[4:4m", "dotted underline should use 4:4");
+
+        // dashed underline
+        s.underline = UnderlineStyle::Dashed;
+        let sgr = s.to_sgr();
+        assert_eq!(sgr, b"\x1b[4:5m", "dashed underline should use 4:5");
+    }
+
+    #[test]
+    fn sgr_bright_colors() {
+        // Bright fg: indices 8-15 → codes 90-97
+        let mut s = Style::default();
+        s.fg = Some(Color::Indexed(8));
+        assert_eq!(s.to_sgr(), b"\x1b[90m");
+
+        s.fg = Some(Color::Indexed(15));
+        assert_eq!(s.to_sgr(), b"\x1b[97m");
+
+        // Bright bg: indices 8-15 → codes 100-107
+        s.fg = None;
+        s.bg = Some(Color::Indexed(8));
+        assert_eq!(s.to_sgr(), b"\x1b[100m");
+
+        s.bg = Some(Color::Indexed(15));
+        assert_eq!(s.to_sgr(), b"\x1b[107m");
+    }
+
+    #[test]
+    fn sgr_all_attributes_combined() {
+        let s = Style {
+            bold: true,
+            dim: true,
+            italic: true,
+            underline: UnderlineStyle::Single,
+            blink: true,
+            inverse: true,
+            strikethrough: true,
+            hidden: true,
+            fg: Some(Color::Indexed(1)),
+            bg: Some(Color::Indexed(4)),
+        };
+        let sgr = s.to_sgr();
+        let text = String::from_utf8_lossy(&sgr);
+        // All attribute codes should be present
+        assert!(text.contains("1;"), "bold");
+        assert!(text.contains("2;"), "dim");
+        assert!(text.contains("3;"), "italic");
+        assert!(text.contains(";4;"), "underline");
+        assert!(text.contains(";5;"), "blink");
+        assert!(text.contains(";7;"), "inverse");
+        assert!(text.contains(";9;"), "strikethrough");
+        assert!(text.contains(";8;"), "hidden");
+        assert!(text.contains("31"), "red fg");
+        assert!(text.contains("44"), "blue bg");
+    }
+
+    #[test]
+    fn sgr_dim_attribute() {
+        let mut s = Style::default();
+        s.dim = true;
+        assert_eq!(s.to_sgr(), b"\x1b[2m");
+    }
+
+    #[test]
+    fn sgr_inverse_attribute() {
+        let mut s = Style::default();
+        s.inverse = true;
+        assert_eq!(s.to_sgr(), b"\x1b[7m");
+    }
+
+    #[test]
+    fn sgr_blink_attribute() {
+        let mut s = Style::default();
+        s.blink = true;
+        assert_eq!(s.to_sgr(), b"\x1b[5m");
+    }
+
+    #[test]
+    fn sgr_strikethrough_attribute() {
+        let mut s = Style::default();
+        s.strikethrough = true;
+        assert_eq!(s.to_sgr(), b"\x1b[9m");
+    }
+
+    #[test]
+    fn sgr_with_reset_default() {
+        let s = Style::default();
+        assert_eq!(s.to_sgr_with_reset(), b"\x1b[0m");
+    }
+
+    #[test]
+    fn sgr_with_reset_styled() {
+        let mut s = Style::default();
+        s.bold = true;
+        s.fg = Some(Color::Indexed(1)); // red
+        let sgr = s.to_sgr_with_reset();
+        assert_eq!(sgr, b"\x1b[0;1;31m", "reset+bold+red");
     }
 }

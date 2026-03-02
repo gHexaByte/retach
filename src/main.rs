@@ -30,31 +30,38 @@ fn main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
 
-    match cli.command {
+    let result = match cli.command {
         Command::Open { name, history } => {
-            rt.block_on(client::connect(&name, history))?;
+            rt.block_on(client::connect(&name, history, protocol::ConnectMode::CreateOrAttach))
         }
         Command::New { name, history } => {
             let name = name.unwrap_or_else(generate_name);
-            rt.block_on(client::connect(&name, history))?;
+            rt.block_on(client::connect(&name, history, protocol::ConnectMode::CreateOnly))
         }
         Command::Attach { name, history } => {
-            rt.block_on(client::connect(&name, history))?;
+            rt.block_on(client::connect(&name, history, protocol::ConnectMode::AttachOnly))
         }
         Command::List => {
-            rt.block_on(client::list_sessions())?;
+            rt.block_on(client::list_sessions())
         }
         Command::Kill { name } => {
-            rt.block_on(client::kill_session(&name))?;
+            rt.block_on(client::kill_session(&name))
         }
         Command::Server => {
-            rt.block_on(server::run_server())?;
+            rt.block_on(server::run_server())
         }
-    }
+    };
 
-    Ok(())
+    // Shut down runtime with timeout to avoid hanging on blocked stdin thread
+    rt.shutdown_timeout(std::time::Duration::from_millis(100));
+
+    result
 }
 
 fn generate_name() -> String {
-    format!("s{}", std::process::id())
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("s{}", ts % 1_000_000_000)
 }

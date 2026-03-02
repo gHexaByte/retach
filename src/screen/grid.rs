@@ -3,8 +3,65 @@ use std::collections::VecDeque;
 use super::cell::Cell;
 use super::render::render_line;
 
+/// DEC character set designator.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Hash)]
+pub enum Charset {
+    #[default]
+    Ascii,
+    LineDrawing,
+}
+
+/// Which character set slot (G0/G1) is active.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Hash)]
+pub enum ActiveCharset {
+    #[default]
+    G0,
+    G1,
+}
+
+/// DECSCUSR cursor shape.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Hash)]
+pub enum CursorShape {
+    #[default]
+    Default,
+    BlinkBlock,
+    SteadyBlock,
+    BlinkUnderline,
+    SteadyUnderline,
+    BlinkBar,
+    SteadyBar,
+}
+
+impl CursorShape {
+    /// Convert from raw DECSCUSR parameter.
+    pub fn from_sgr(n: u8) -> Self {
+        match n {
+            1 => Self::BlinkBlock,
+            2 => Self::SteadyBlock,
+            3 => Self::BlinkUnderline,
+            4 => Self::SteadyUnderline,
+            5 => Self::BlinkBar,
+            6 => Self::SteadyBar,
+            _ => Self::Default,
+        }
+    }
+
+    /// Raw DECSCUSR parameter value.
+    pub fn to_param(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::BlinkBlock => 1,
+            Self::SteadyBlock => 2,
+            Self::BlinkUnderline => 3,
+            Self::SteadyUnderline => 4,
+            Self::BlinkBar => 5,
+            Self::SteadyBar => 6,
+        }
+    }
+}
+
 /// Terminal mode flags and character set state, separated from cell storage.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TerminalModes {
     pub cursor_key_mode: bool,    // ?1 DECCKM
     pub bracketed_paste: bool,    // ?2004
@@ -13,11 +70,11 @@ pub struct TerminalModes {
     pub mouse_mode: u16,          // 0=off, 1000/1002/1003
     pub mouse_encoding: u16,      // 0=X10, 1006=SGR
     pub keypad_app_mode: bool,    // ESC = / ESC >
-    pub cursor_shape: u8,         // 0-6 DECSCUSR
+    pub cursor_shape: CursorShape,
     // DEC character sets
-    pub g0_charset: u8,           // 0=ASCII, 1=LineDrawing
-    pub g1_charset: u8,
-    pub active_charset: u8,       // 0=G0, 1=G1
+    pub g0_charset: Charset,
+    pub g1_charset: Charset,
+    pub active_charset: ActiveCharset,
 }
 
 impl Default for TerminalModes {
@@ -30,10 +87,10 @@ impl Default for TerminalModes {
             mouse_mode: 0,
             mouse_encoding: 0,
             keypad_app_mode: false,
-            cursor_shape: 0,
-            g0_charset: 0,
-            g1_charset: 0,
-            active_charset: 0,
+            cursor_shape: CursorShape::Default,
+            g0_charset: Charset::Ascii,
+            g1_charset: Charset::Ascii,
+            active_charset: ActiveCharset::G0,
         }
     }
 }
@@ -87,13 +144,16 @@ impl Grid {
         let top = self.scroll_top as usize;
         let bottom = self.scroll_bottom as usize;
 
-        // Only capture scrollback for full-screen scrolling in main screen
-        if !in_alt_screen && top == 0 && self.scroll_bottom == self.rows - 1 {
+        // Capture scrollback whenever a line scrolls off the top of the screen
+        if !in_alt_screen && top == 0 {
             let line = render_line(&self.cells[0]);
             if scrollback.len() >= scrollback_limit {
                 scrollback.pop_front();
             }
             scrollback.push_back(line.clone());
+            if pending_scrollback.len() >= scrollback_limit {
+                pending_scrollback.remove(0);
+            }
             pending_scrollback.push(line);
         }
 
@@ -125,6 +185,7 @@ impl Grid {
         }
         if self.cursor_x >= cols { self.cursor_x = cols - 1; }
         if self.cursor_y >= rows { self.cursor_y = rows - 1; }
+        self.wrap_pending = false;
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
     }
@@ -220,12 +281,23 @@ mod tests {
     }
 
     #[test]
+    fn pending_scrollback_respects_limit() {
+        let mut grid = Grid::new(10, 3);
+        let mut scrollback = VecDeque::new();
+        let mut pending = Vec::new();
+        for _ in 0..20 {
+            grid.scroll_up(false, &mut scrollback, 5, &mut pending, Cell::default());
+        }
+        assert!(pending.len() <= 5, "pending_scrollback should be bounded, got {}", pending.len());
+    }
+
+    #[test]
     fn terminal_modes_default() {
         let modes = TerminalModes::default();
         assert!(modes.autowrap_mode);
         assert!(!modes.cursor_key_mode);
         assert!(!modes.bracketed_paste);
         assert_eq!(modes.mouse_mode, 0);
-        assert_eq!(modes.cursor_shape, 0);
+        assert_eq!(modes.cursor_shape, CursorShape::Default);
     }
 }

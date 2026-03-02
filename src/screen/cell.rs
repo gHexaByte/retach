@@ -1,7 +1,7 @@
 use super::style::Style;
 
 /// Single character cell in the terminal grid, with style and display width.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug, Hash)]
 pub struct Cell {
     pub c: char,
     pub style: Style,

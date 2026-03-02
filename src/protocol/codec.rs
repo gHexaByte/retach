@@ -1,3 +1,4 @@
+use bincode::Options;
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
@@ -13,23 +14,46 @@ pub enum ProtocolError {
     #[error("message too large to encode: {size} bytes exceeds u32 max")]
     EncodeTooLarge { size: usize },
 
-    /// Bincode deserialization or I/O error.
+    /// Bincode deserialization error.
     #[error("deserialization failed: {0}")]
     Deserialize(#[from] bincode::Error),
+
+    /// I/O error during read/write.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Maximum frame size: 16 MiB (fix C2 — prevents OOM from malicious/corrupt frames)
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// Default read buffer size used across client, server, and codec.
+pub const READ_BUF_SIZE: usize = 65536;
+
+/// Bincode configuration with size limit matching MAX_FRAME_SIZE.
+/// Prevents OOM from malicious frames where a Vec length prefix claims huge allocations.
+/// NOTE: uses `DefaultOptions` fixint encoding — NOT compatible with top-level
+/// `bincode::serialize/deserialize` (which use varint for collection lengths).
+/// All encode/decode paths must use this config consistently.
+pub fn bincode_config() -> impl Options + Copy {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_FRAME_SIZE as u64)
+}
+
 /// Length-prefixed message encoding.
 /// Uses u32::try_from to prevent silent truncation (fix C4).
 pub fn encode(msg: &impl Serialize) -> Result<Vec<u8>, ProtocolError> {
-    let data = bincode::serialize(msg)?;
+    let data = bincode_config().serialize(msg)?;
     let len = u32::try_from(data.len()).map_err(|_| ProtocolError::EncodeTooLarge { size: data.len() })?;
     let mut buf = Vec::with_capacity(4 + data.len());
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(&data);
     Ok(buf)
+}
+
+/// Deserialize a bincode-encoded message from raw bytes.
+pub fn decode<T: DeserializeOwned>(data: &[u8]) -> Result<T, ProtocolError> {
+    Ok(bincode_config().deserialize(data)?)
 }
 
 /// Decode a length-prefixed frame from a buffer.
@@ -51,25 +75,26 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(&[u8], usize)>, ProtocolError>
 
 /// Read exactly one message from an async reader, handling buffering.
 /// Eliminates duplicated read-loop code in list/kill operations.
+///
+/// **Note:** Any bytes received after the first complete frame are discarded.
+/// This is safe for request-response patterns (list/kill) where only one
+/// response is expected, but must not be used when multiple messages may arrive.
 pub async fn read_one_message<T: DeserializeOwned>(
     reader: &mut (impl AsyncReadExt + Unpin),
 ) -> Result<T, ProtocolError> {
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; READ_BUF_SIZE];
     let mut read_buf = Vec::new();
     loop {
-        let n = reader.read(&mut buf).await.map_err(|e| {
-            ProtocolError::Deserialize(bincode::Error::from(
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e),
-            ))
-        })?;
+        let n = reader.read(&mut buf).await?;
         if n == 0 {
-            return Err(ProtocolError::Deserialize(bincode::Error::from(
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed"),
-            )));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed",
+            ).into());
         }
         read_buf.extend_from_slice(&buf[..n]);
         if let Some((data, _)) = decode_frame(&read_buf)? {
-            return Ok(bincode::deserialize(data)?);
+            return decode(data);
         }
     }
 }
@@ -77,7 +102,7 @@ pub async fn read_one_message<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::messages::{ClientMsg, ServerMsg, SessionInfo};
+    use crate::protocol::messages::{ClientMsg, ConnectMode, ServerMsg, SessionInfo};
 
     #[test]
     fn encode_decode_round_trip() {
@@ -86,13 +111,14 @@ mod tests {
             history: 1000,
             cols: 80,
             rows: 24,
+            mode: ConnectMode::CreateOrAttach,
         };
         let encoded = encode(&msg).unwrap();
         let (data, consumed) = decode_frame(&encoded).unwrap().unwrap();
         assert_eq!(consumed, encoded.len());
-        let decoded: ClientMsg = bincode::deserialize(data).unwrap();
+        let decoded: ClientMsg = decode(data).unwrap();
         match decoded {
-            ClientMsg::Connect { name, history, cols, rows } => {
+            ClientMsg::Connect { name, history, cols, rows, .. } => {
                 assert_eq!(name, "test");
                 assert_eq!(history, 1000);
                 assert_eq!(cols, 80);
@@ -109,7 +135,7 @@ mod tests {
         ]);
         let encoded = encode(&msg).unwrap();
         let (data, _) = decode_frame(&encoded).unwrap().unwrap();
-        let decoded: ServerMsg = bincode::deserialize(data).unwrap();
+        let decoded: ServerMsg = decode(data).unwrap();
         match decoded {
             ServerMsg::SessionList(list) => {
                 assert_eq!(list.len(), 1);
@@ -169,8 +195,59 @@ mod tests {
         buf.extend_from_slice(&encode(&msg2).unwrap());
 
         let (data1, consumed1) = decode_frame(&buf).unwrap().unwrap();
-        let _: ClientMsg = bincode::deserialize(data1).unwrap();
+        let _: ClientMsg = decode(data1).unwrap();
         let (data2, _) = decode_frame(&buf[consumed1..]).unwrap().unwrap();
-        let _: ClientMsg = bincode::deserialize(data2).unwrap();
+        let _: ClientMsg = decode(data2).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_one_message_success() {
+        let msg = ClientMsg::Detach;
+        let encoded = encode(&msg).unwrap();
+        let (mut write_half, mut read_half) = tokio::io::duplex(65536);
+        use tokio::io::AsyncWriteExt;
+        write_half.write_all(&encoded).await.unwrap();
+        drop(write_half); // close writer so reader sees EOF after data
+        let result: ClientMsg = read_one_message(&mut read_half).await.unwrap();
+        match result {
+            ClientMsg::Detach => {} // expected
+            other => panic!("expected Detach, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_one_message_connection_closed() {
+        // An empty duplex stream (writer dropped immediately) should return an error.
+        let (write_half, mut read_half) = tokio::io::duplex(65536);
+        drop(write_half);
+        let result: Result<ClientMsg, _> = read_one_message(&mut read_half).await;
+        assert!(result.is_err(), "expected error on empty stream");
+        match result.unwrap_err() {
+            ProtocolError::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+            }
+            other => panic!("expected Io error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_one_message_server_msg() {
+        let msg = ServerMsg::Connected {
+            name: "my-session".into(),
+            new_session: true,
+        };
+        let encoded = encode(&msg).unwrap();
+        let (mut write_half, mut read_half) = tokio::io::duplex(65536);
+        use tokio::io::AsyncWriteExt;
+        write_half.write_all(&encoded).await.unwrap();
+        drop(write_half);
+        let result: ServerMsg = read_one_message(&mut read_half).await.unwrap();
+        match result {
+            ServerMsg::Connected { name, new_session } => {
+                assert_eq!(name, "my-session");
+                assert!(new_session);
+            }
+            other => panic!("expected Connected, got {:?}", other),
+        }
     }
 }

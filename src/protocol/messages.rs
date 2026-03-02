@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+/// Connection mode for Connect message.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ConnectMode {
+    /// Create or attach (Open subcommand)
+    CreateOrAttach,
+    /// Create only, fail if exists (New subcommand)
+    CreateOnly,
+    /// Attach only, fail if doesn't exist (Attach subcommand)
+    AttachOnly,
+}
+
 /// Message sent from a client to the server.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientMsg {
@@ -12,9 +23,11 @@ pub enum ClientMsg {
     /// Request session list
     ListSessions,
     /// Create or attach to session
-    Connect { name: String, history: usize, cols: u16, rows: u16 },
+    Connect { name: String, history: usize, cols: u16, rows: u16, mode: ConnectMode },
     /// Kill a session
     KillSession { name: String },
+    /// Request a full screen refresh (e.g. on focus-in)
+    RefreshScreen,
 }
 
 /// Message sent from the server to a client.

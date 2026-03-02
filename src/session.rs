@@ -8,8 +8,13 @@ pub struct Session {
     pub name: String,
     pub pty: Pty,
     pub screen: Arc<Mutex<Screen>>,
-    pub cols: u16,
-    pub rows: u16,
+    pub dims: Arc<Mutex<(u16, u16)>>,
+    /// When a client is attached, holds the sender side of a watch channel.
+    /// Sending `false` evicts the active client. Replaced on each new attach.
+    pub evict_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Signaled when the previous connection's PTY reader thread exits.
+    /// Used to prevent two reader threads from racing for PTY data on reconnect.
+    pub reader_exited: Arc<tokio::sync::Notify>,
 }
 
 impl Session {
@@ -17,7 +22,11 @@ impl Session {
     pub fn new(name: String, cols: u16, rows: u16, history: usize) -> anyhow::Result<Self> {
         let pty = Pty::spawn(cols, rows)?;
         let screen = Arc::new(Mutex::new(Screen::new(cols, rows, history)));
-        Ok(Self { name, pty, screen, cols, rows })
+        let dims = Arc::new(Mutex::new((cols, rows)));
+        let reader_exited = Arc::new(tokio::sync::Notify::new());
+        // Pre-signal so the first connection doesn't wait for a non-existent reader.
+        reader_exited.notify_one();
+        Ok(Self { name, pty, screen, dims, evict_tx: None, reader_exited })
     }
 
     /// Check if the session's child process is still alive
@@ -31,6 +40,21 @@ impl Session {
     /// Get the child process PID (if available)
     pub fn child_pid(&self) -> Option<u32> {
         self.pty.child_arc().lock().ok().and_then(|c| c.process_id())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Use lock() (blocking) — callers must ensure Session is dropped on
+        // spawn_blocking or outside the Tokio runtime to avoid blocking workers.
+        if let Ok(mut child) = self.pty.child_arc().lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Evict any connected client
+        if let Some(tx) = self.evict_tx.take() {
+            let _ = tx.send(false);
+        }
     }
 }
 
@@ -73,6 +97,11 @@ impl SessionManager {
         Ok((self.sessions.get_mut(name).unwrap(), is_new))
     }
 
+    /// Get an existing session by name.
+    pub fn get(&mut self, name: &str) -> Option<&mut Session> {
+        self.sessions.get_mut(name)
+    }
+
     /// Remove and return a session by name, or `None` if not found.
     pub fn remove(&mut self, name: &str) -> Option<Session> {
         self.sessions.remove(name)
@@ -80,20 +109,22 @@ impl SessionManager {
 
     /// Return metadata for all active sessions.
     pub fn list(&self) -> Vec<crate::protocol::SessionInfo> {
-        self.sessions.values().map(|s| crate::protocol::SessionInfo {
-            name: s.name.clone(),
-            pid: s.child_pid().unwrap_or(0),
-            cols: s.cols,
-            rows: s.rows,
+        self.sessions.values().map(|s| {
+            let (cols, rows) = s.dims.lock().map(|d| *d).unwrap_or((80, 24));
+            crate::protocol::SessionInfo {
+                name: s.name.clone(),
+                pid: s.child_pid().unwrap_or(0),
+                cols,
+                rows,
+            }
         }).collect()
     }
 
-    /// Remove sessions whose child process has exited (fix I2)
-    pub fn cleanup_dead_sessions(&mut self) {
+    /// Remove dead sessions and return them for cleanup outside the lock.
+    pub fn take_dead_sessions(&mut self) -> Vec<Session> {
         let dead: Vec<String> = self.sessions.iter()
             .filter(|(_, s)| !s.is_alive())
             .map(|(name, s)| {
-                // Log exit status for debugging
                 let status = s.pty.child_arc().lock().ok()
                     .and_then(|mut c| c.try_wait().ok().flatten());
                 tracing::info!(
@@ -104,9 +135,7 @@ impl SessionManager {
                 name.clone()
             })
             .collect();
-        for name in &dead {
-            self.sessions.remove(name);
-        }
+        dead.into_iter().filter_map(|name| self.sessions.remove(&name)).collect()
     }
 }
 
@@ -157,8 +186,9 @@ mod tests {
         let mut mgr = SessionManager::new();
         let (session, is_new) = mgr.get_or_create("test", 0, 0, 1000).unwrap();
         // Should clamp to 80x24 defaults
-        assert_eq!(session.cols, 80);
-        assert_eq!(session.rows, 24);
+        let (cols, rows) = *session.dims.lock().unwrap();
+        assert_eq!(cols, 80);
+        assert_eq!(rows, 24);
         assert!(is_new);
     }
 }
