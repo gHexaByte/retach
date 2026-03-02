@@ -1,0 +1,20 @@
+[package]
+name = "retach"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+vte = "0.13"
+portable-pty = "0.8"
+nix = { version = "0.29", features = ["term", "signal", "user"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+term_size = "0.3"
+unicode-width = "0.2"

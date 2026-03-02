@@ -1,0 +1,131 @@
+```
+               __             __
+   ________  _/ /_____ ______/ /
+  / ___/ _ \/ __/ __ `/ ___/ __ \
+ / /  /  __/ /_/ /_/ / /__/ / / /
+/_/   \___/\__/\__,_/\___/_/ /_/
+
+```
+
+# retach
+
+Persistent terminal sessions with native scrollback.
+
+## Problem
+
+Traditional terminal multiplexers (tmux, screen, zellij) intercept your terminal's scrollback buffer. To scroll through output you have to enter a special "copy mode" with different keybindings. This is annoying on a regular desktop and completely unusable on mobile.
+
+## Solution
+
+retach passes completed scrollback lines directly to your terminal's stdout as plain text. Your terminal app handles scrolling natively: touchscreen swipe, trackpad gesture, scroll wheel — whatever works on your device. The daemon keeps a virtual screen (VTE-parsed grid) and a scrollback buffer. On reattach, it replays stored history so you see the full context.
+
+## Install
+
+```
+cargo install --path .
+```
+
+Requires Rust 1.70+. macOS or Linux.
+
+## Usage
+
+```bash
+# Create or attach to a session (recommended)
+retach open work
+
+# Create a new session with explicit name
+retach new work
+
+# Create with auto-generated name
+retach new
+
+# Attach to existing session
+retach attach work
+
+# List sessions
+retach list
+
+# Kill a session
+retach kill work
+```
+
+**Detach:** press `Ctrl+\` inside any session.
+
+**Custom scrollback size** (default 10,000 lines):
+
+```bash
+retach open work --history 50000
+```
+
+The server daemon starts automatically on the first `retach open` or `retach new` command.
+
+## How it works
+
+```
+Client (retach)            Daemon                     Shell
+    |                        |                          |
+    |--- Input(keys) ------>|--- write to PTY -------->|
+    |                        |                          |
+    |<-- ScrollbackLine ----|<-- PTY output ----------|
+    |<-- ScreenUpdate ------|    (VTE parsed)          |
+    |                        |                          |
+  stdout                  Grid + Scrollback          bash/zsh
+(native terminal)         (in memory)
+```
+
+**Daemon + client over Unix socket** at `/tmp/retach-<uid>/retach.sock`.
+
+The daemon spawns a PTY per session and parses all output through a VTE state machine. It maintains a virtual grid (the visible screen area) and a scrollback buffer. When a line scrolls off the top of the grid, it's sent to the client as a `ScrollbackLine` message — the client writes it to stdout followed by `\r\n`, letting the native terminal handle it. Periodically (60 FPS cap), the daemon sends a `ScreenUpdate` with the current grid rendered as ANSI escape sequences.
+
+On reattach, the daemon sends the stored scrollback history followed by the current screen snapshot. The client terminal gets the full context without any copy mode.
+
+**Alt screen** (vim, less, htop, etc.) is handled separately: scrollback passthrough is paused while the child process uses the alternate screen buffer. When the child exits alt screen, the main grid is restored.
+
+### Modules
+
+| Module | Purpose |
+|--------|---------|
+| `client/` | Connects to daemon, raw terminal mode, stdin/stdout I/O, SIGWINCH handling |
+| `server/` | Unix socket listener, per-client handler, PTY↔client bridge |
+| `protocol/` | Binary message encoding (bincode, length-prefixed), message types |
+| `screen/` | VTE parser, virtual grid, cell/style representation, ANSI rendering |
+| `session.rs` | Session (PTY + screen + metadata), session manager |
+| `pty.rs` | PTY allocation and process spawning via `portable-pty` |
+
+## Logging
+
+retach uses `tracing` with the `RUST_LOG` env variable:
+
+```bash
+RUST_LOG=retach=debug retach open work
+RUST_LOG=retach=trace retach open work
+```
+
+Server logs go to `/tmp/retach-<uid>/retach.log`.
+
+## Supported terminal features
+
+- Unicode and wide characters (CJK)
+- 256-color and RGB color
+- Bold, dim, italic, underline (single/double/curly/dotted/dashed), blink, inverse, strikethrough, hidden
+- DEC line drawing charset
+- Alternate screen buffer (save/restore)
+- Scroll regions (DECSTBM)
+- Cursor shapes (DECSCUSR)
+- Bracketed paste mode
+- Mouse reporting (1000/1002/1003, SGR encoding)
+- Focus reporting
+- Synchronized output (mode 2026)
+- Window title passthrough (OSC 0/2)
+- Device status reports (DSR, DA1, DA2)
+
+## Limitations
+
+- No panes or splits
+- No status bar
+- No configuration file
+- Single-user (Unix socket permissions, not multi-tenant)
+
+## License
+
+BSD-2-Clause
