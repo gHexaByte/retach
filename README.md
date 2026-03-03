@@ -64,18 +64,21 @@ The server daemon starts automatically on the first `retach open` or `retach new
 ```
 Client (retach)            Daemon                     Shell
     |                        |                          |
-    |--- Input(keys) ------>|--- write to PTY -------->|
+    |--- Input(keys) ------->|--- write to PTY -------->|
     |                        |                          |
-    |<-- ScrollbackLine ----|<-- PTY output ----------|
-    |<-- ScreenUpdate ------|    (VTE parsed)          |
+    |<-- ScrollbackLine -----|    Persistent PTY Reader |
+    |<-- ScreenUpdate -------|<-- PTY output -----------|
+    |                        |    (VTE parsed, always)  |
     |                        |                          |
   stdout                  Grid + Scrollback          bash/zsh
-(native terminal)         (in memory)
+(native terminal)         (in memory, always live)
 ```
 
 **Daemon + client over Unix socket** at `$XDG_RUNTIME_DIR/retach/retach.sock` (fallback: `/tmp/retach-<uid>/retach.sock`).
 
-The daemon spawns a PTY per session and parses all output through a VTE state machine. It maintains a virtual grid (the visible screen area) and a scrollback buffer. When a line scrolls off the top of the grid, it is included in the next `ScreenUpdate` as an atomic operation: the cursor is positioned at the bottom of the screen, the scrollback line is written with `\r\n` (triggering a real terminal scroll), and the grid is redrawn — all within a single synchronized-output block to prevent flicker. Periodically (60 FPS cap), the daemon sends incremental `ScreenUpdate` messages with only the changed rows.
+The daemon spawns a PTY per session with a **persistent reader thread** that runs for the entire session lifetime. This thread continuously reads PTY output and processes it through a VTE state machine, keeping the virtual grid and scrollback buffer up-to-date even when no client is connected. When a client attaches, it receives a fully current screen state immediately.
+
+When a line scrolls off the top of the grid, it is included in the next `ScreenUpdate` as an atomic operation: the cursor is positioned at the bottom of the screen, the scrollback line is written with `\r\n` (triggering a real terminal scroll), and the grid is redrawn — all within a single synchronized-output block to prevent flicker. Periodically (60 FPS cap), the daemon sends incremental `ScreenUpdate` messages with only the changed rows.
 
 On reattach, the daemon sends the stored scrollback history as `History` messages (the client writes each line to stdout with `\r\n`, letting the native terminal scroll them into its scrollback buffer), then sends a full `ScreenUpdate` to redraw the visible area.
 
@@ -86,10 +89,10 @@ On reattach, the daemon sends the stored scrollback history as `History` message
 | Module | Purpose |
 |--------|---------|
 | `client/` | Connects to daemon, raw terminal mode, stdin/stdout I/O, SIGWINCH handling |
-| `server/` | Unix socket listener, per-client handler, PTY↔client bridge |
+| `server/` | Unix socket listener, per-client handler, screen↔client bridge |
 | `protocol/` | Binary message encoding (bincode with size limits, length-prefixed), message types |
 | `screen/` | VTE parser, virtual grid, cell/style representation, ANSI rendering |
-| `session.rs` | Session (PTY + screen + metadata), session manager |
+| `session.rs` | Session (PTY + screen + metadata), session manager, persistent PTY reader |
 | `pty.rs` | PTY allocation and process spawning via `portable-pty` |
 
 ## Logging
