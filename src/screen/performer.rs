@@ -12,9 +12,9 @@ use super::style::Style;
 pub struct ScreenPerformer<'a> {
     pub grid: &'a mut Grid,
     pub state: &'a mut ScreenState,
-    pub scrollback: &'a mut VecDeque<Vec<u8>>,
+    pub scrollback: &'a mut VecDeque<Vec<Cell>>,
     pub scrollback_limit: usize,
-    pub pending_scrollback: &'a mut VecDeque<Vec<u8>>,
+    pub pending_scrollback: &'a mut VecDeque<Vec<Cell>>,
 }
 
 impl<'a> ScreenPerformer<'a> {
@@ -22,7 +22,7 @@ impl<'a> ScreenPerformer<'a> {
     fn blank_cell(&self) -> Cell {
         Cell {
             c: ' ',
-            combining: None,
+            combining: Vec::new(),
             style: Style { bg: self.state.current_style.bg, ..Style::default() },
             width: 1,
         }
@@ -101,7 +101,7 @@ impl<'a> ScreenPerformer<'a> {
         self.state.in_alt_screen = true;
         let blank = Cell::default();
         for row in self.grid.cells.iter_mut() {
-            for cell in row.iter_mut() { *cell = blank; }
+            for cell in row.iter_mut() { *cell = blank.clone(); }
         }
         self.grid.cursor_x = 0;
         self.grid.cursor_y = 0;
@@ -116,10 +116,13 @@ impl<'a> ScreenPerformer<'a> {
         self.state.in_alt_screen = false;
         if let Some(saved) = self.state.saved_grid.take() {
             self.grid.cells = saved;
-            self.grid.cells.resize(
-                self.grid.rows as usize,
-                vec![Cell::default(); self.grid.cols as usize],
-            );
+            let rows_usize = self.grid.rows as usize;
+            while self.grid.cells.len() > rows_usize {
+                self.grid.cells.pop_back();
+            }
+            while self.grid.cells.len() < rows_usize {
+                self.grid.cells.push_back(vec![Cell::default(); self.grid.cols as usize]);
+            }
             for row in &mut self.grid.cells {
                 row.resize(self.grid.cols as usize, Cell::default());
             }
@@ -230,29 +233,29 @@ impl<'a> ScreenPerformer<'a> {
                 let y = self.grid.cursor_y as usize;
                 let x = self.grid.cursor_x as usize;
                 self.fixup_wide_char(x, y);
-                for i in x..self.grid.cols as usize { self.grid.cells[y][i] = blank; }
+                for i in x..self.grid.cols as usize { self.grid.cells[y][i] = blank.clone(); }
                 for row in self.grid.cells.iter_mut().skip(y + 1) {
-                    for cell in row.iter_mut() { *cell = blank; }
+                    for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
             }
             1 => {
                 let y = self.grid.cursor_y as usize;
                 let x = self.grid.cursor_x as usize;
                 for row in self.grid.cells.iter_mut().take(y) {
-                    for cell in row.iter_mut() { *cell = blank; }
+                    for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
                 let end = x.min(self.grid.cols as usize - 1);
                 self.fixup_wide_char(end, y);
-                for i in 0..=end { self.grid.cells[y][i] = blank; }
+                for i in 0..=end { self.grid.cells[y][i] = blank.clone(); }
             }
             2 => {
                 for row in self.grid.cells.iter_mut() {
-                    for cell in row.iter_mut() { *cell = blank; }
+                    for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
             }
             3 => {
                 for row in self.grid.cells.iter_mut() {
-                    for cell in row.iter_mut() { *cell = blank; }
+                    for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
                 self.scrollback.clear();
                 self.pending_scrollback.clear();
@@ -268,14 +271,14 @@ impl<'a> ScreenPerformer<'a> {
         match mode {
             0 => {
                 self.fixup_wide_char(x, y);
-                for i in x..self.grid.cols as usize { self.grid.cells[y][i] = blank; }
+                for i in x..self.grid.cols as usize { self.grid.cells[y][i] = blank.clone(); }
             }
             1 => {
                 let end = x.min(self.grid.cols as usize - 1);
                 self.fixup_wide_char(end, y);
-                for i in 0..=end { self.grid.cells[y][i] = blank; }
+                for i in 0..=end { self.grid.cells[y][i] = blank.clone(); }
             }
-            2 => { for cell in self.grid.cells[y].iter_mut() { *cell = blank; } }
+            2 => { for cell in self.grid.cells[y].iter_mut() { *cell = blank.clone(); } }
             _ => {}
         }
     }
@@ -292,7 +295,7 @@ impl<'a> ScreenPerformer<'a> {
                 self.fixup_wide_char(end, y);
             }
             for i in x..end {
-                self.grid.cells[y][i] = blank;
+                self.grid.cells[y][i] = blank.clone();
             }
         }
     }
@@ -307,10 +310,10 @@ impl<'a> ScreenPerformer<'a> {
             self.fixup_wide_char(x, y);
             for _ in 0..n.min(cols.saturating_sub(x)) {
                 self.grid.cells[y].remove(x);
-                self.grid.cells[y].push(blank);
+                self.grid.cells[y].push(blank.clone());
             }
             if x < cols && self.grid.cells[y][x].width == 0 {
-                self.grid.cells[y][x] = blank;
+                self.grid.cells[y][x] = blank.clone();
             }
         }
     }
@@ -325,11 +328,11 @@ impl<'a> ScreenPerformer<'a> {
             self.fixup_wide_char(x, y);
             for _ in 0..n.min(cols.saturating_sub(x)) {
                 self.grid.cells[y].pop();
-                self.grid.cells[y].insert(x, blank);
+                self.grid.cells[y].insert(x, blank.clone());
             }
             let last = cols - 1;
             if self.grid.cells[y][last].width == 2 {
-                self.grid.cells[y][last] = blank;
+                self.grid.cells[y][last] = blank.clone();
             }
         }
     }
@@ -351,13 +354,12 @@ impl<'a> ScreenPerformer<'a> {
         let top = self.grid.scroll_top as usize;
         let bottom = self.grid.scroll_bottom as usize;
         if y >= top && y <= bottom {
-            self.grid.cursor_x = 0;
             self.grid.wrap_pending = false;
             let n = n.min(bottom - y + 1);
             for _ in 0..n {
                 if y <= bottom && bottom < self.grid.cells.len() {
                     self.grid.cells.remove(y);
-                    self.grid.cells.insert(bottom, vec![blank; self.grid.cols as usize]);
+                    self.grid.cells.insert(bottom, vec![blank.clone(); self.grid.cols as usize]);
                 }
             }
         }
@@ -370,13 +372,12 @@ impl<'a> ScreenPerformer<'a> {
         let top = self.grid.scroll_top as usize;
         let bottom = self.grid.scroll_bottom as usize;
         if y >= top && y <= bottom {
-            self.grid.cursor_x = 0;
             self.grid.wrap_pending = false;
             let n = n.min(bottom - y + 1);
             for _ in 0..n {
                 if y <= bottom && bottom < self.grid.cells.len() {
                     self.grid.cells.remove(bottom);
-                    self.grid.cells.insert(y, vec![blank; self.grid.cols as usize]);
+                    self.grid.cells.insert(y, vec![blank.clone(); self.grid.cols as usize]);
                 }
             }
         }
@@ -464,7 +465,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                     } else {
                         tx
                     };
-                    self.grid.cells[cy][tx].combining = Some(c);
+                    self.grid.cells[cy][tx].combining.push(c);
                 }
             }
             return;
@@ -511,7 +512,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
 
             self.grid.cells[y][x] = Cell {
                 c,
-                combining: None,
+                combining: Vec::new(),
                 style: self.state.current_style,
                 width: char_width as u8,
             };
@@ -524,7 +525,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                     self.fixup_wide_char(next, y);
                     self.grid.cells[y][next] = Cell {
                         c: '\0',
-                        combining: None,
+                        combining: Vec::new(),
                         style: self.state.current_style,
                         width: 0,
                     };
@@ -560,8 +561,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
             }
             0x09 => { // Tab
                 self.grid.wrap_pending = false;
-                self.grid.cursor_x = (self.grid.cursor_x + 8) & !7;
-                if self.grid.cursor_x >= self.grid.cols { self.grid.cursor_x = self.grid.cols - 1; }
+                self.grid.cursor_x = self.grid.next_tab_stop(self.grid.cursor_x);
             }
             0x0E => { // SO — Shift Out (activate G1)
                 self.grid.modes.active_charset = ActiveCharset::G1;
@@ -569,7 +569,9 @@ impl<'a> Perform for ScreenPerformer<'a> {
             0x0F => { // SI — Shift In (activate G0)
                 self.grid.modes.active_charset = ActiveCharset::G0;
             }
-            0x07 => {} // Bell
+            0x07 => { // Bell — forward to outer terminal
+                self.state.pending_passthrough.push(vec![0x07]);
+            }
             _ => {}
         }
     }
@@ -624,6 +626,22 @@ impl<'a> Perform for ScreenPerformer<'a> {
             'r' if intermediates.is_empty() => self.csi_set_scrolling_region(p(0, 1), p(1, self.grid.rows)),
             's' if intermediates.is_empty() => self.save_cursor(),
             'u' if intermediates.is_empty() => self.restore_cursor(),
+            'g' if intermediates.is_empty() => { // TBC — Tab Clear
+                match p(0, 0) {
+                    0 => { // Clear tab stop at cursor
+                        let x = self.grid.cursor_x as usize;
+                        if x < self.grid.tab_stops.len() {
+                            self.grid.tab_stops[x] = false;
+                        }
+                    }
+                    3 => { // Clear all tab stops
+                        for stop in self.grid.tab_stops.iter_mut() {
+                            *stop = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             't' => {}
             'h' | 'l' if intermediates == b"?" => self.csi_set_dec_private_mode(&ps, action == 'h'),
             _ => {}
@@ -632,6 +650,12 @@ impl<'a> Perform for ScreenPerformer<'a> {
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         match (intermediates, byte) {
+            ([], b'H') => { // HTS — Horizontal Tab Set
+                let x = self.grid.cursor_x as usize;
+                if x < self.grid.tab_stops.len() {
+                    self.grid.tab_stops[x] = true;
+                }
+            }
             ([], b'M') => { // RI — Reverse Index (scroll down at top margin)
                 if self.grid.cursor_y == self.grid.scroll_top {
                     self.scroll_down();
@@ -655,9 +679,10 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 self.state.saved_cursor_state = None;
                 self.state.title.clear();
                 self.state.last_printed_char = ' ';
+                self.grid.tab_stops = super::grid::default_tab_stops(self.grid.cols);
                 let blank = Cell::default();
                 for row in self.grid.cells.iter_mut() {
-                    for cell in row.iter_mut() { *cell = blank; }
+                    for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
             }
             ([], b'=') => { // DECKPAM — Keypad Application Mode
@@ -707,7 +732,9 @@ impl<'a> Perform for ScreenPerformer<'a> {
         self.state.pending_passthrough.push(buf);
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+        tracing::debug!(action = %action, "dropping DCS sequence (not supported)");
+    }
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
 }

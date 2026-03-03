@@ -1,6 +1,6 @@
 [package]
 name = "retach"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "BSD-2-Clause"
 
@@ -11,7 +11,7 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 vte = "0.13"
 portable-pty = "0.8"
-nix = { version = "0.29", features = ["term", "signal", "user"] }
+nix = { version = "0.29", features = ["term", "signal", "user", "fs"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"

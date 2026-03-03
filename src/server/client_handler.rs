@@ -1,6 +1,6 @@
-use crate::protocol::{self, ClientMsg, ServerMsg, READ_BUF_SIZE};
+use crate::protocol::{self, ClientMsg, ServerMsg, FrameReader};
 use crate::session::SessionManager;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use tracing::info;
@@ -15,37 +15,24 @@ pub async fn handle_client(
     mut stream: tokio::net::UnixStream,
     manager: Arc<Mutex<SessionManager>>,
 ) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; READ_BUF_SIZE];
-    let mut read_buf = Vec::new();
-
+    let mut frames = FrameReader::new();
     let deadline = tokio::time::Instant::now() + INITIAL_MSG_TIMEOUT;
 
     loop {
-        let n = match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
-            Ok(result) => result?,
+        match tokio::time::timeout_at(deadline, frames.fill_from(&mut stream)).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return Ok(()),
+            Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
                 tracing::debug!("client timed out waiting for initial message");
                 return Ok(());
             }
-        };
-        if n == 0 {
-            return Ok(());
         }
-        read_buf.extend_from_slice(&buf[..n]);
 
-        if let Some((data, consumed)) = protocol::decode_frame(&read_buf)? {
-            let msg: ClientMsg = crate::protocol::decode(data)?;
-            read_buf.drain(..consumed);
-
+        if let Some(msg) = frames.decode_next::<ClientMsg>()? {
             match msg {
                 ClientMsg::Connect { name, history, cols, rows, mode } => {
-                    match handle_session(stream, manager, name, history, cols, rows, read_buf, mode).await {
-                        Ok(()) => return Ok(()),
-                        Err(e) => {
-                            // stream was moved into handle_session; error is logged by caller
-                            return Err(e);
-                        }
-                    }
+                    return handle_session(stream, manager, name, history, cols, rows, frames.into_leftover(), mode).await;
                 }
                 ClientMsg::ListSessions => {
                     let list = manager.lock().await.list();
@@ -88,24 +75,20 @@ pub async fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{self, ClientMsg, ServerMsg};
+    use crate::protocol::{self, ClientMsg, ServerMsg, FrameReader};
     use crate::session::SessionManager;
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::Mutex;
 
     /// Helper: read a full response from a UnixStream and deserialize it as a ServerMsg.
     async fn read_response(stream: &mut tokio::net::UnixStream) -> ServerMsg {
-        let mut buf = vec![0u8; READ_BUF_SIZE];
-        let mut read_buf = Vec::new();
+        let mut reader = FrameReader::new();
         loop {
-            let n = stream.read(&mut buf).await.expect("read failed");
-            if n == 0 {
-                panic!("connection closed before a full response was received");
-            }
-            read_buf.extend_from_slice(&buf[..n]);
-            if let Some((data, _consumed)) = protocol::decode_frame(&read_buf).expect("decode error") {
-                return crate::protocol::decode(data).expect("deserialize error");
+            assert!(reader.fill_from(stream).await.expect("read failed"),
+                "connection closed before a full response was received");
+            if let Some(msg) = reader.decode_next::<ServerMsg>().expect("decode error") {
+                return msg;
             }
         }
     }

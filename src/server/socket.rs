@@ -3,7 +3,7 @@ use std::os::unix::fs::DirBuilderExt;
 /// Socket directory with proper permissions (0o700, created atomically).
 /// Prefers `$XDG_RUNTIME_DIR/retach` (per-user, mode 0700, managed by systemd)
 /// and falls back to `/tmp/retach-{uid}`.
-pub fn socket_dir() -> std::path::PathBuf {
+pub fn socket_dir() -> anyhow::Result<std::path::PathBuf> {
     let uid = nix::unistd::getuid();
     let dir = if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         std::path::PathBuf::from(xdg).join("retach")
@@ -15,18 +15,17 @@ pub fn socket_dir() -> std::path::PathBuf {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Use symlink_metadata (lstat) to detect symlinks — metadata() follows them
-            let meta = std::fs::symlink_metadata(&dir).unwrap_or_else(|e| {
-                panic!("cannot stat socket directory {dir:?}: {e}");
-            });
+            let meta = std::fs::symlink_metadata(&dir)
+                .map_err(|e| anyhow::anyhow!("cannot stat socket directory {dir:?}: {e}"))?;
             if meta.file_type().is_symlink() {
-                panic!(
+                anyhow::bail!(
                     "socket directory {dir:?} is a symlink — possible symlink attack, refusing to start"
                 );
             }
             use std::os::unix::fs::MetadataExt;
             if meta.uid() != uid.as_raw() {
-                panic!(
-                    "socket directory {dir:?} owned by uid {} (expected {}) — possible symlink attack, refusing to start",
+                anyhow::bail!(
+                    "socket directory {dir:?} owned by uid {} (expected {}) — possible attack",
                     meta.uid(),
                     uid.as_raw(),
                 );
@@ -43,15 +42,20 @@ pub fn socket_dir() -> std::path::PathBuf {
             }
         }
         Err(e) => {
-            panic!("failed to create socket directory {dir:?}: {e}");
+            return Err(anyhow::anyhow!("failed to create socket directory {dir:?}: {e}"));
         }
     }
-    dir
+    Ok(dir)
 }
 
 /// Return the full path to the server's Unix domain socket.
-pub fn socket_path() -> std::path::PathBuf {
-    socket_dir().join("retach.sock")
+pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(socket_dir()?.join("retach.sock"))
+}
+
+/// Return the full path to the server startup lockfile.
+pub fn lock_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(socket_dir()?.join("retach.lock"))
 }
 
 #[cfg(test)]
@@ -61,7 +65,7 @@ mod tests {
     #[test]
     fn socket_dir_returns_correct_format() {
         let uid = nix::unistd::getuid();
-        let dir = socket_dir();
+        let dir = socket_dir().unwrap();
         if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
             let expected = std::path::PathBuf::from(xdg).join("retach");
             assert_eq!(dir, expected);
@@ -73,7 +77,7 @@ mod tests {
 
     #[test]
     fn socket_path_ends_with_sock() {
-        let path = socket_path();
+        let path = socket_path().unwrap();
         assert!(
             path.ends_with("retach.sock"),
             "socket_path should end with 'retach.sock', got: {:?}",
@@ -83,7 +87,7 @@ mod tests {
 
     #[test]
     fn socket_dir_creates_directory() {
-        let dir = socket_dir();
+        let dir = socket_dir().unwrap();
         assert!(
             dir.exists(),
             "socket_dir() should create the directory at {:?}",
@@ -99,7 +103,7 @@ mod tests {
     fn socket_dir_has_correct_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = socket_dir();
+        let dir = socket_dir().unwrap();
         let meta = std::fs::metadata(&dir).expect("should be able to stat socket directory");
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(
@@ -111,8 +115,8 @@ mod tests {
 
     #[test]
     fn socket_dir_idempotent() {
-        let first = socket_dir();
-        let second = socket_dir();
+        let first = socket_dir().unwrap();
+        let second = socket_dir().unwrap();
         assert_eq!(
             first, second,
             "calling socket_dir() twice should return the same path"

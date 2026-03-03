@@ -3,6 +3,19 @@ use crate::screen::Screen;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Check if a PTY child process is still alive.
+/// Uses `try_lock()` to avoid blocking Tokio workers when called from async tasks.
+pub fn is_child_alive(child: &Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>) -> bool {
+    match child.try_lock() {
+        Ok(mut c) => c.try_wait().ok().flatten().is_none(),
+        Err(std::sync::TryLockError::WouldBlock) => true, // assume alive if contended
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            tracing::warn!(error = %e, "child mutex poisoned in is_alive");
+            false
+        }
+    }
+}
+
 /// A single terminal session backed by a PTY and a virtual screen.
 pub struct Session {
     pub name: String,
@@ -14,7 +27,8 @@ pub struct Session {
     pub evict_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Signaled when the previous connection's PTY reader thread exits.
     /// Used to prevent two reader threads from racing for PTY data on reconnect.
-    pub reader_exited: Arc<tokio::sync::Notify>,
+    /// Starts with 1 permit so the first connection doesn't wait.
+    pub reader_exited: Arc<tokio::sync::Semaphore>,
 }
 
 impl Session {
@@ -23,23 +37,22 @@ impl Session {
         let pty = Pty::spawn(cols, rows)?;
         let screen = Arc::new(Mutex::new(Screen::new(cols, rows, history)));
         let dims = Arc::new(Mutex::new((cols, rows)));
-        let reader_exited = Arc::new(tokio::sync::Notify::new());
-        // Pre-signal so the first connection doesn't wait for a non-existent reader.
-        reader_exited.notify_one();
+        // Start with 0 permits: the first connection skips the eviction block entirely
+        // (evict_tx is None), so it never waits. Each reader thread adds 1 permit on
+        // exit, ensuring subsequent connections wait for the previous reader to finish.
+        let reader_exited = Arc::new(tokio::sync::Semaphore::new(0));
         Ok(Self { name, pty, screen, dims, evict_tx: None, reader_exited })
     }
 
-    /// Check if the session's child process is still alive
+    /// Check if the session's child process is still alive.
     pub fn is_alive(&self) -> bool {
-        match self.pty.child_arc().lock() {
-            Ok(mut child) => child.try_wait().ok().flatten().is_none(),
-            Err(_) => false,
-        }
+        is_child_alive(&self.pty.child_arc())
     }
 
-    /// Get the child process PID (if available)
+    /// Get the child process PID (if available).
+    /// Uses `try_lock()` to avoid blocking; returns `None` on contention or poison.
     pub fn child_pid(&self) -> Option<u32> {
-        self.pty.child_arc().lock().ok().and_then(|c| c.process_id())
+        self.pty.child_arc().try_lock().ok().and_then(|c| c.process_id())
     }
 }
 
@@ -110,7 +123,13 @@ impl SessionManager {
     /// Return metadata for all active sessions.
     pub fn list(&self) -> Vec<crate::protocol::SessionInfo> {
         self.sessions.values().map(|s| {
-            let (cols, rows) = s.dims.lock().map(|d| *d).unwrap_or((80, 24));
+            let (cols, rows) = match s.dims.lock() {
+                Ok(d) => *d,
+                Err(e) => {
+                    tracing::warn!(session = %s.name, error = %e, "dims mutex poisoned in list");
+                    (80, 24)
+                }
+            };
             crate::protocol::SessionInfo {
                 name: s.name.clone(),
                 pid: s.child_pid().unwrap_or(0),

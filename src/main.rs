@@ -38,8 +38,8 @@ fn main() -> anyhow::Result<()> {
             let name = name.unwrap_or_else(generate_name);
             rt.block_on(client::connect(&name, history, protocol::ConnectMode::CreateOnly))
         }
-        Command::Attach { name, history } => {
-            rt.block_on(client::connect(&name, history, protocol::ConnectMode::AttachOnly))
+        Command::Attach { name } => {
+            rt.block_on(client::connect(&name, 0, protocol::ConnectMode::AttachOnly))
         }
         Command::List => {
             rt.block_on(client::list_sessions())
@@ -59,9 +59,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn generate_name() -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("s{}", ts % 1_000_000_000)
+    use std::hash::{BuildHasher, Hasher};
+    // RandomState::new() seeds from OS randomness, giving real uniqueness
+    // without adding external dependencies.
+    let hash = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!("s-{:016x}", hash)
 }

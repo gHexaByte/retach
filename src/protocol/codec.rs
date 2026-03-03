@@ -82,20 +82,82 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(&[u8], usize)>, ProtocolError>
 pub async fn read_one_message<T: DeserializeOwned>(
     reader: &mut (impl AsyncReadExt + Unpin),
 ) -> Result<T, ProtocolError> {
-    let mut buf = vec![0u8; READ_BUF_SIZE];
-    let mut read_buf = Vec::new();
+    let mut frames = FrameReader::new();
     loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
+        if !frames.fill_from(reader).await? {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "connection closed",
             ).into());
         }
-        read_buf.extend_from_slice(&buf[..n]);
-        if let Some((data, _)) = decode_frame(&read_buf)? {
-            return decode(data);
+        if let Some(msg) = frames.decode_next()? {
+            return Ok(msg);
         }
+    }
+}
+
+/// Buffered frame reader for the length-prefixed protocol.
+///
+/// Handles read buffering, overflow protection, and frame decoding.
+/// Eliminates duplicated read-decode-drain loops across client and server code.
+pub struct FrameReader {
+    read_buf: Vec<u8>,
+    tmp_buf: Vec<u8>,
+}
+
+impl FrameReader {
+    /// Create a new reader with empty buffers.
+    pub fn new() -> Self {
+        Self {
+            read_buf: Vec::new(),
+            tmp_buf: vec![0u8; READ_BUF_SIZE],
+        }
+    }
+
+    /// Create a new reader pre-loaded with leftover bytes from a previous read.
+    pub fn with_leftover(leftover: Vec<u8>) -> Self {
+        Self {
+            read_buf: leftover,
+            tmp_buf: vec![0u8; READ_BUF_SIZE],
+        }
+    }
+
+    /// Read from the async reader into internal buffer.
+    /// Returns `Ok(true)` if data was read, `Ok(false)` on EOF.
+    pub async fn fill_from<R: AsyncReadExt + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<bool, ProtocolError> {
+        let n = reader.read(&mut self.tmp_buf).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+        self.read_buf.extend_from_slice(&self.tmp_buf[..n]);
+        if self.read_buf.len() > MAX_FRAME_SIZE + 4 {
+            return Err(ProtocolError::FrameTooLarge {
+                size: self.read_buf.len(),
+                max: MAX_FRAME_SIZE,
+            });
+        }
+        Ok(true)
+    }
+
+    /// Decode and remove the next complete message from the buffer.
+    /// Returns `Ok(None)` if no complete frame is available yet.
+    pub fn decode_next<T: DeserializeOwned>(&mut self) -> Result<Option<T>, ProtocolError> {
+        match decode_frame(&self.read_buf)? {
+            Some((data, consumed)) => {
+                let msg: T = decode(data)?;
+                self.read_buf.drain(..consumed);
+                Ok(Some(msg))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Consume the reader and return any unprocessed bytes.
+    pub fn into_leftover(self) -> Vec<u8> {
+        self.read_buf
     }
 }
 
@@ -249,5 +311,24 @@ mod tests {
             }
             other => panic!("expected Connected, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn read_one_message_rejects_buffer_overflow() {
+        // Send a valid header claiming MAX_FRAME_SIZE bytes, then flood with junk.
+        // read_one_message should reject when read_buf exceeds MAX_FRAME_SIZE + 4.
+        let (mut write_half, mut read_half) = tokio::io::duplex(65536);
+        use tokio::io::AsyncWriteExt;
+
+        let len_bytes = (MAX_FRAME_SIZE as u32).to_be_bytes();
+        write_half.write_all(&len_bytes).await.unwrap();
+        // Write MAX_FRAME_SIZE + 1024 bytes of junk (exceeds the frame + header)
+        let junk = vec![0u8; MAX_FRAME_SIZE + 1024];
+        tokio::spawn(async move {
+            let _ = write_half.write_all(&junk).await;
+        });
+
+        let result: Result<ClientMsg, _> = read_one_message(&mut read_half).await;
+        assert!(result.is_err(), "should reject oversized buffer accumulation");
     }
 }

@@ -29,9 +29,6 @@ pub enum Command {
     Attach {
         /// Session name
         name: String,
-        /// Scrollback history size (used if session doesn't exist yet)
-        #[arg(long, default_value = "10000")]
-        history: usize,
     },
     /// List active sessions
     List,

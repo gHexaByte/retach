@@ -3,13 +3,22 @@
 pub mod raw_mode;
 pub mod server_launcher;
 
-use crate::protocol::{self, ClientMsg, ServerMsg, read_one_message, READ_BUF_SIZE};
+use crate::protocol::{self, ClientMsg, ServerMsg, FrameReader, read_one_message};
 use std::io::{self, BufWriter, Read, Write};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use raw_mode::RawMode;
 use server_launcher::ensure_server_running;
+
+/// RAII guard that removes the custom panic hook on drop.
+struct PanicHookGuard;
+
+impl Drop for PanicHookGuard {
+    fn drop(&mut self) {
+        let _ = std::panic::take_hook();
+    }
+}
 
 /// Result of dispatching a server message to stdout.
 enum DispatchResult {
@@ -29,6 +38,7 @@ fn dispatch_server_msg(msg: &ServerMsg, stdout: &mut impl Write) -> io::Result<D
         }
         ServerMsg::Passthrough(data) => {
             stdout.write_all(data)?;
+            stdout.flush()?;
         }
         ServerMsg::History(lines) => {
             for line in lines {
@@ -46,14 +56,19 @@ fn dispatch_server_msg(msg: &ServerMsg, stdout: &mut impl Write) -> io::Result<D
             eprintln!("[retach error: {}]", e);
             return Ok(DispatchResult::Done);
         }
-        _ => {}
+        other => {
+            tracing::debug!("ignoring unexpected server message: {:?}", std::mem::discriminant(other));
+        }
     }
     Ok(DispatchResult::Continue)
 }
 
 fn get_terminal_size() -> (u16, u16) {
     if let Some((w, h)) = term_size::dimensions() {
-        (w as u16, h as u16)
+        (
+            u16::try_from(w).unwrap_or(80),
+            u16::try_from(h).unwrap_or(24),
+        )
     } else {
         (80, 24)
     }
@@ -64,6 +79,10 @@ type SocketWriter = std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWri
 /// Stdin → socket relay: reads stdin, handles detach key and focus events,
 /// and forwards input to the server.
 async fn run_stdin_to_socket(sw: SocketWriter) -> anyhow::Result<()> {
+    // Carry buffer for ESC sequences split across read() boundaries.
+    // Can hold up to 2 bytes: either a lone `\x1b` or `\x1b[`.
+    let mut carry: Vec<u8> = Vec::with_capacity(2);
+
     loop {
         let result = tokio::task::spawn_blocking(|| {
             let mut buf = [0u8; 1024];
@@ -73,38 +92,76 @@ async fn run_stdin_to_socket(sw: SocketWriter) -> anyhow::Result<()> {
         .await;
 
         match result {
-            Ok(Ok((_buf, 0))) => break,
+            Ok(Ok((_buf, 0))) => {
+                // Flush any carry bytes on stdin EOF
+                if !carry.is_empty() {
+                    let msg = protocol::encode(&ClientMsg::Input(std::mem::take(&mut carry)))?;
+                    let mut w = sw.lock().await;
+                    w.write_all(&msg).await?;
+                }
+                break;
+            }
             Ok(Ok((buf, n))) => {
+                // Prepend any carry bytes from previous iteration.
+                let raw: Vec<u8> = if carry.is_empty() {
+                    buf[..n].to_vec()
+                } else {
+                    let mut combined = std::mem::take(&mut carry);
+                    combined.extend_from_slice(&buf[..n]);
+                    combined
+                };
+
                 // Check for detach key (Ctrl+\, byte 0x1c)
-                if let Some(pos) = buf[..n].iter().position(|&b| b == 0x1c) {
+                if let Some(pos) = raw.iter().position(|&b| b == 0x1c) {
+                    let mut w = sw.lock().await;
                     if pos > 0 {
-                        if let Ok(msg) = protocol::encode(&ClientMsg::Input(buf[..pos].to_vec())) {
-                            let mut w = sw.lock().await;
+                        if let Ok(msg) = protocol::encode(&ClientMsg::Input(raw[..pos].to_vec())) {
                             w.write_all(&msg).await?;
                         }
                     }
                     if let Ok(msg) = protocol::encode(&ClientMsg::Detach) {
-                        let mut w = sw.lock().await;
                         w.write_all(&msg).await?;
                     }
+                    drop(w);
                     break;
                 }
                 // Filter focus-in (ESC [ I) and focus-out (ESC [ O) sequences.
-                let mut filtered = Vec::with_capacity(n);
-                let raw = &buf[..n];
+                let mut filtered = Vec::with_capacity(raw.len());
                 let mut i = 0;
                 while i < raw.len() {
-                    if i + 2 < raw.len() && raw[i] == 0x1b && raw[i + 1] == 0x5b {
-                        if raw[i + 2] == 0x49 {
-                            if let Ok(msg) = protocol::encode(&ClientMsg::RefreshScreen) {
-                                let mut w = sw.lock().await;
-                                let _ = w.write_all(&msg).await;
+                    if raw[i] == 0x1b {
+                        if i + 1 < raw.len() {
+                            if raw[i + 1] == 0x5b {
+                                if i + 2 < raw.len() {
+                                    if raw[i + 2] == 0x49 {
+                                        // Focus-in: send refresh instead
+                                        if let Ok(msg) = protocol::encode(&ClientMsg::RefreshScreen) {
+                                            let mut w = sw.lock().await;
+                                            let _ = w.write_all(&msg).await;
+                                        }
+                                        i += 3;
+                                        continue;
+                                    } else if raw[i + 2] == 0x4f {
+                                        // Focus-out: drop silently
+                                        i += 3;
+                                        continue;
+                                    }
+                                    // ESC [ <other> — not a focus event, pass through
+                                } else {
+                                    // ESC [ at end of buffer — valid prefix, carry
+                                    carry.extend_from_slice(&raw[i..]);
+                                    break;
+                                }
+                            } else {
+                                // ESC followed by non-[, pass both through immediately
+                                filtered.push(raw[i]);
+                                i += 1;
+                                continue;
                             }
-                            i += 3;
-                            continue;
-                        } else if raw[i + 2] == 0x4f {
-                            i += 3;
-                            continue;
+                        } else {
+                            // Lone ESC at end of buffer — carry
+                            carry.push(0x1b);
+                            break;
                         }
                     }
                     filtered.push(raw[i]);
@@ -128,42 +185,26 @@ async fn run_socket_to_stdout(
     mut sock_reader: tokio::net::unix::OwnedReadHalf,
     leftover: Vec<u8>,
 ) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; READ_BUF_SIZE];
-    let mut read_buf = leftover;
+    let mut frames = FrameReader::with_leftover(leftover);
     let mut stdout = BufWriter::new(io::stdout());
 
     // Process any complete frames already in the leftover buffer
-    let mut cursor = 0;
-    while let Some((data, consumed)) = protocol::decode_frame(&read_buf[cursor..])? {
-        let msg: ServerMsg = crate::protocol::decode(data)?;
-        cursor += consumed;
+    while let Some(msg) = frames.decode_next::<ServerMsg>()? {
         if matches!(dispatch_server_msg(&msg, &mut stdout)?, DispatchResult::Done) {
             return Ok(());
         }
     }
-    if cursor > 0 {
-        read_buf.drain(..cursor);
-    }
     stdout.flush()?;
 
     loop {
-        let n = sock_reader.read(&mut buf).await?;
-        if n == 0 {
+        if !frames.fill_from(&mut sock_reader).await? {
             eprintln!("[retach: detached]");
             break;
         }
-        read_buf.extend_from_slice(&buf[..n]);
-
-        let mut cursor = 0;
-        while let Some((data, consumed)) = protocol::decode_frame(&read_buf[cursor..])? {
-            let msg: ServerMsg = crate::protocol::decode(data)?;
-            cursor += consumed;
+        while let Some(msg) = frames.decode_next::<ServerMsg>()? {
             if matches!(dispatch_server_msg(&msg, &mut stdout)?, DispatchResult::Done) {
                 return Ok(());
             }
-        }
-        if cursor > 0 {
-            read_buf.drain(..cursor);
         }
         stdout.flush()?;
     }
@@ -174,7 +215,7 @@ async fn run_socket_to_stdout(
 pub async fn connect(name: &str, history: usize, mode: crate::protocol::ConnectMode) -> anyhow::Result<()> {
     ensure_server_running().await?;
 
-    let mut stream = UnixStream::connect(crate::server::socket_path()).await?;
+    let mut stream = UnixStream::connect(crate::server::socket_path()?).await?;
 
     let (cols, rows) = get_terminal_size();
     let msg = protocol::encode(&ClientMsg::Connect {
@@ -187,18 +228,13 @@ pub async fn connect(name: &str, history: usize, mode: crate::protocol::ConnectM
     stream.write_all(&msg).await?;
 
     // Wait for Connected/Error before entering raw mode so errors display correctly.
-    let mut initial_buf = vec![0u8; READ_BUF_SIZE];
-    let mut leftover = Vec::new();
+    let mut frames = FrameReader::new();
     loop {
-        let n = stream.read(&mut initial_buf).await?;
-        if n == 0 {
+        if !frames.fill_from(&mut stream).await? {
             eprintln!("[retach: server closed connection]");
             return Ok(());
         }
-        leftover.extend_from_slice(&initial_buf[..n]);
-        if let Some((data, consumed)) = protocol::decode_frame(&leftover)? {
-            let msg: ServerMsg = crate::protocol::decode(data)?;
-            leftover.drain(..consumed);
+        if let Some(msg) = frames.decode_next::<ServerMsg>()? {
             match msg {
                 ServerMsg::Connected { name: ref session_name, new_session } => {
                     if new_session {
@@ -219,14 +255,17 @@ pub async fn connect(name: &str, history: usize, mode: crate::protocol::ConnectM
             }
         }
     }
+    let leftover = frames.into_leftover();
 
     // Install panic hook to restore terminal even if we panic while in raw mode.
+    // The guard ensures the hook is removed on all exit paths (including early returns).
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         raw_mode::emergency_restore();
         cleanup_terminal();
         prev_hook(info);
     }));
+    let _hook_guard = PanicHookGuard;
 
     let _raw = RawMode::enter()?;
 
@@ -252,7 +291,10 @@ pub async fn connect(name: &str, history: usize, mode: crate::protocol::ConnectM
             // SSH connection resumed). The server invalidates its render cache
             // and redraws all rows.
             if let Ok(msg) = protocol::encode(&ClientMsg::RefreshScreen) {
-                let _ = w.write_all(&msg).await;
+                if let Err(e) = w.write_all(&msg).await {
+                    tracing::debug!(error = %e, "failed to send refresh after resize");
+                    break;
+                }
             }
         }
     });
@@ -284,7 +326,7 @@ pub async fn connect(name: &str, history: usize, mode: crate::protocol::ConnectM
     }
 
     sigwinch_handle.abort();
-    let _ = std::panic::take_hook();
+    drop(_hook_guard);
 
     cleanup_terminal();
 
@@ -295,15 +337,28 @@ pub async fn connect(name: &str, history: usize, mode: crate::protocol::ConnectM
 /// with hidden cursor, mouse capture, bracketed paste, etc.
 fn cleanup_terminal() {
     let mut stdout = io::stdout();
-    let _ = stdout.write_all(
-        b"\x1b[?25h\x1b[?7h\x1b[?1l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?2026l\x1b>\x1b[0 q\x1b[0m",
-    );
+    let _ = stdout.write_all(concat!(
+        "\x1b[?25h",   // show cursor
+        "\x1b[?7h",    // re-enable auto-wrap
+        "\x1b[?1l",    // normal cursor keys (DECCKM reset)
+        "\x1b[?2004l", // disable bracketed paste
+        "\x1b[?1000l", // disable mouse click tracking
+        "\x1b[?1002l", // disable mouse button tracking
+        "\x1b[?1003l", // disable mouse any-event tracking
+        "\x1b[?1005l", // disable UTF-8 mouse encoding
+        "\x1b[?1006l", // disable SGR mouse encoding
+        "\x1b[?1004l", // disable focus reporting
+        "\x1b[?2026l", // disable synchronized output
+        "\x1b>",       // normal keypad mode (DECKPNM)
+        "\x1b[0 q",    // default cursor shape
+        "\x1b[0m",     // reset all SGR attributes
+    ).as_bytes());
     let _ = stdout.flush();
 }
 
 /// Query the server for active sessions and print them to stdout.
 pub async fn list_sessions() -> anyhow::Result<()> {
-    let path = crate::server::socket_path();
+    let path = crate::server::socket_path()?;
     if !path.exists() {
         println!("No active sessions");
         return Ok(());
@@ -328,7 +383,7 @@ pub async fn list_sessions() -> anyhow::Result<()> {
 
 /// Ask the server to terminate the named session.
 pub async fn kill_session(name: &str) -> anyhow::Result<()> {
-    let path = crate::server::socket_path();
+    let path = crate::server::socket_path()?;
     if !path.exists() {
         anyhow::bail!("server not running");
     }

@@ -1,9 +1,9 @@
-use crate::protocol::{self, ClientMsg, ServerMsg, READ_BUF_SIZE};
+use crate::protocol::{self, ClientMsg, ServerMsg, FrameReader};
 use crate::screen::{Screen, RenderCache};
-use crate::session::SessionManager;
+use crate::session::{SessionManager, is_child_alive};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -20,17 +20,6 @@ pub struct SessionIo {
 }
 
 impl SessionIo {
-    /// Check whether the PTY child process is still running.
-    pub fn is_alive(child: &Arc<StdMutex<Box<dyn portable_pty::Child + Send + Sync>>>) -> bool {
-        match child.lock() {
-            Ok(mut c) => c.try_wait().ok().flatten().is_none(),
-            Err(e) => {
-                warn!(error = %e, "child mutex poisoned in is_alive");
-                false
-            }
-        }
-    }
-
     /// Resize the PTY master and the virtual screen to the given dimensions.
     pub fn resize(
         master: &Arc<StdMutex<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -65,30 +54,34 @@ async fn render_and_send(
 }
 
 /// Write terminal responses (DSR, DA, etc.) back to PTY stdin.
-fn write_pty_responses(
+/// Runs on a blocking thread to avoid stalling Tokio workers when the PTY buffer is full.
+async fn write_pty_responses(
     pty_writer: &Arc<StdMutex<Box<dyn Write + Send>>>,
-    responses: &[Vec<u8>],
-    session_name: &str,
+    responses: Vec<Vec<u8>>,
+    session_name: String,
 ) {
     if responses.is_empty() {
         return;
     }
-    match pty_writer.lock() {
-        Ok(mut w) => {
-            for response in responses {
-                if let Err(e) = w.write_all(response) {
-                    warn!(session = %session_name, error = %e, "failed to write response to PTY");
-                    break;
+    let pw = pty_writer.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        match pw.lock() {
+            Ok(mut w) => {
+                for response in &responses {
+                    if let Err(e) = w.write_all(response) {
+                        warn!(session = %session_name, error = %e, "failed to write response to PTY");
+                        break;
+                    }
+                }
+                if let Err(e) = w.flush() {
+                    warn!(session = %session_name, error = %e, "failed to flush PTY response");
                 }
             }
-            if let Err(e) = w.flush() {
-                warn!(session = %session_name, error = %e, "failed to flush PTY response");
+            Err(e) => {
+                warn!(session = %session_name, error = %e, "PTY writer mutex poisoned for responses");
             }
         }
-        Err(e) => {
-            warn!(session = %session_name, error = %e, "PTY writer mutex poisoned for responses");
-        }
-    }
+    }).await;
 }
 
 /// Handles returned from `setup_session`, containing everything needed for the I/O loops.
@@ -100,11 +93,15 @@ struct SessionSetup {
     is_new_session: bool,
     evict_rx: tokio::sync::watch::Receiver<bool>,
     dims_arc: Arc<StdMutex<(u16, u16)>>,
-    reader_exited: Arc<tokio::sync::Notify>,
+    reader_exited: Arc<tokio::sync::Semaphore>,
 }
 
 /// Acquire or create the session, set up eviction, resize, and clone PTY handles.
 /// Returns all handles needed for the I/O loops, or sends an error to the client.
+///
+/// Lock strategy: the SessionManager lock is released before waiting for the
+/// old reader thread to exit (up to 2s), then re-acquired for the rest of setup.
+/// This prevents blocking all other clients during the wait.
 async fn setup_session(
     stream: &mut tokio::net::UnixStream,
     manager: &Arc<Mutex<SessionManager>>,
@@ -114,64 +111,107 @@ async fn setup_session(
     rows: u16,
     mode: crate::protocol::ConnectMode,
 ) -> anyhow::Result<SessionSetup> {
-    let mut mgr = manager.lock().await;
+    // Phase 1: Acquire lock, find/create session, start eviction (fast).
+    let (had_eviction, reader_exited_sem) = {
+        let mut mgr = manager.lock().await;
 
-    use crate::protocol::ConnectMode;
-    let (session, is_new) = match mode {
-        ConnectMode::CreateOrAttach => {
-            match mgr.get_or_create(name, cols, rows, history) {
-                Ok(s) => s,
-                Err(e) => {
+        use crate::protocol::ConnectMode;
+        let (session, _is_new) = match mode {
+            ConnectMode::CreateOrAttach => {
+                match mgr.get_or_create(name, cols, rows, history) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let resp = protocol::encode(&ServerMsg::Error(format!("{}", e)))?;
+                        stream.write_all(&resp).await?;
+                        return Err(e);
+                    }
+                }
+            }
+            ConnectMode::CreateOnly => {
+                if mgr.get(name).is_some() {
+                    let resp = protocol::encode(&ServerMsg::Error(format!("session '{}' already exists", name)))?;
+                    stream.write_all(&resp).await?;
+                    anyhow::bail!("session '{}' already exists", name);
+                }
+                if let Err(e) = mgr.create(name.to_string(), cols, rows, history) {
                     let resp = protocol::encode(&ServerMsg::Error(format!("{}", e)))?;
                     stream.write_all(&resp).await?;
                     return Err(e);
                 }
+                (mgr.get(name).unwrap(), true)
             }
-        }
-        ConnectMode::CreateOnly => {
-            if mgr.get(name).is_some() {
-                let resp = protocol::encode(&ServerMsg::Error(format!("session '{}' already exists", name)))?;
-                stream.write_all(&resp).await?;
-                anyhow::bail!("session '{}' already exists", name);
-            }
-            if let Err(e) = mgr.create(name.to_string(), cols, rows, history) {
-                let resp = protocol::encode(&ServerMsg::Error(format!("{}", e)))?;
-                stream.write_all(&resp).await?;
-                return Err(e);
-            }
-            (mgr.get(name).unwrap(), true)
-        }
-        ConnectMode::AttachOnly => {
-            match mgr.get(name) {
-                Some(s) => (s, false),
-                None => {
-                    let resp = protocol::encode(&ServerMsg::Error(format!("session '{}' not found", name)))?;
-                    stream.write_all(&resp).await?;
-                    anyhow::bail!("session '{}' not found", name);
+            ConnectMode::AttachOnly => {
+                match mgr.get(name) {
+                    Some(s) => (s, false),
+                    None => {
+                        let resp = protocol::encode(&ServerMsg::Error(format!("session '{}' not found", name)))?;
+                        stream.write_all(&resp).await?;
+                        anyhow::bail!("session '{}' not found", name);
+                    }
                 }
             }
+        };
+
+        // Send eviction signal while holding the lock (fast, non-blocking).
+        // Clone the semaphore Arc so we can wait outside the lock.
+        if let Some(old_tx) = session.evict_tx.take() {
+            debug!(session = %name, "evicting previous client");
+            let _ = old_tx.send(false);
+            (true, Some(session.reader_exited.clone()))
+        } else {
+            (false, None)
+        }
+        // mgr lock released here
+    };
+
+    // Phase 2: Wait for old reader to exit WITHOUT holding the manager lock.
+    if let Some(reader_exited) = reader_exited_sem {
+        let wait_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader_exited.acquire(),
+        ).await;
+        match wait_result {
+            Ok(Ok(permit)) => permit.forget(), // consume the permit
+            Ok(Err(_)) => {
+                let resp = protocol::encode(&ServerMsg::Error("internal error: reader semaphore closed".into()))?;
+                stream.write_all(&resp).await?;
+                anyhow::bail!("reader_exited semaphore closed for session '{}'", name);
+            }
+            Err(_) => {
+                let resp = protocol::encode(&ServerMsg::Error("previous connection still draining, try again".into()))?;
+                stream.write_all(&resp).await?;
+                anyhow::bail!("timed out waiting for previous PTY reader to exit for session '{}'", name);
+            }
+        };
+    }
+
+    // Phase 3: Re-acquire lock for resize, handle cloning, etc.
+    let mut mgr = manager.lock().await;
+
+    // Session must still exist (could have been killed while we waited).
+    let session = match mgr.get(name) {
+        Some(s) => s,
+        None => {
+            let resp = protocol::encode(&ServerMsg::Error(format!("session '{}' was removed during reconnect", name)))?;
+            stream.write_all(&resp).await?;
+            anyhow::bail!("session '{}' was removed during reconnect", name);
         }
     };
 
-    // Evict previous client if one is attached
-    if let Some(old_tx) = session.evict_tx.take() {
-        debug!(session = %name, "evicting previous client");
-        let _ = old_tx.send(false);
-        // Wait for the old connection's PTY reader thread to exit so we don't
-        // have two readers racing for PTY data from the same master fd.
-        let reader_exited = session.reader_exited.clone();
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            reader_exited.notified(),
-        ).await;
-    }
+    let is_new = !had_eviction && session.evict_tx.is_none();
 
     // Create eviction channel for this client
     let (evict_tx, evict_rx) = tokio::sync::watch::channel(true);
     session.evict_tx = Some(evict_tx);
 
     // Resize existing session to match the connecting client's terminal size
-    let (cur_cols, cur_rows) = session.dims.lock().map(|d| *d).unwrap_or((80, 24));
+    let (cur_cols, cur_rows) = match session.dims.lock() {
+        Ok(d) => *d,
+        Err(e) => {
+            warn!(session = %name, error = %e, "dims mutex poisoned during reattach");
+            (80, 24)
+        }
+    };
     if !is_new && (cur_cols != cols || cur_rows != rows) {
         debug!(
             session = %name,
@@ -183,8 +223,11 @@ async fn setup_session(
         let screen = session.screen.clone();
         if let Err(e) = SessionIo::resize(&master, &screen, cols, rows) {
             warn!(session = %name, error = %e, "failed to resize on reattach");
-        } else if let Ok(mut dims) = session.dims.lock() {
-            *dims = crate::screen::grid::sanitize_dimensions(cols, rows);
+        } else {
+            match session.dims.lock() {
+                Ok(mut dims) => *dims = crate::screen::grid::sanitize_dimensions(cols, rows),
+                Err(e) => warn!(session = %name, error = %e, "dims mutex poisoned during resize"),
+            }
         }
     }
 
@@ -243,7 +286,13 @@ async fn send_initial_state(
         // newlines to flush them into the real terminal's scrollback buffer
         // before the screen clear erases them.
         if !hist.is_empty() {
-            render_data.extend(std::iter::repeat(b'\n').take(screen.grid.rows.saturating_sub(1) as usize));
+            // Position cursor at the bottom row first so that each \n
+            // reliably triggers one scroll, regardless of initial cursor position.
+            use crate::screen::style::write_u16;
+            render_data.extend_from_slice(b"\x1b[");
+            write_u16(&mut render_data, screen.grid.rows);
+            render_data.extend_from_slice(b";1H");
+            render_data.extend(std::iter::repeat_n(b'\n', screen.grid.rows.saturating_sub(1) as usize));
         }
         render_data.extend_from_slice(&screen.render(true, &mut render_cache));
         let screen_msg = protocol::encode(&ServerMsg::ScreenUpdate(render_data))?;
@@ -256,6 +305,8 @@ async fn send_initial_state(
         let size_limit = protocol::codec::MAX_FRAME_SIZE / 2;
 
         for line in hist_chunks {
+            // Estimate per-line bincode overhead: 8 bytes for Vec length prefix +
+            // ~8 bytes for enum variant tag and alignment padding.
             let line_size = line.len() + 16;
             if chunk_size + line_size > size_limit && !chunk.is_empty() {
                 let msg = protocol::encode(&ServerMsg::History(std::mem::take(&mut chunk)))?;
@@ -294,7 +345,7 @@ async fn pty_to_client(
     mut evict_rx: tokio::sync::watch::Receiver<bool>,
     mut writer: tokio::net::unix::OwnedWriteHalf,
     session_name: String,
-    reader_exited: Arc<tokio::sync::Notify>,
+    reader_exited: Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<()> {
     use tokio::sync::mpsc;
 
@@ -310,15 +361,16 @@ async fn pty_to_client(
                 Ok(n) => {
                     // Use try_send so the thread exits promptly when the
                     // receiver is dropped (on eviction), instead of blocking.
-                    match tx.try_send(buf[..n].to_vec()) {
+                    let data = buf[..n].to_vec();
+                    match tx.try_send(data) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                             debug!("pty reader channel closed");
                             break;
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
                             // Channel full — use blocking_send as back-pressure.
-                            if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            if tx.blocking_send(data).is_err() {
                                 debug!("pty reader channel closed");
                                 break;
                             }
@@ -331,10 +383,10 @@ async fn pty_to_client(
         debug!("pty reader thread exiting");
         // Signal that this reader is done so the next connection can safely
         // clone a new reader without racing for PTY data.
-        reader_exited.notify_one();
+        reader_exited.add_permits(1);
     });
 
-    let is_alive = || SessionIo::is_alive(&child_arc);
+    let is_alive = || is_child_alive(&child_arc);
     let min_interval = std::time::Duration::from_millis(16);
     let mut last_render = std::time::Instant::now() - min_interval;
     let mut screen_dirty = false;
@@ -403,7 +455,7 @@ async fn pty_to_client(
             (scr.take_pending_scrollback(), scr.take_responses(), scr.take_passthrough())
         };
 
-        write_pty_responses(&pty_writer, &responses, &session_name);
+        write_pty_responses(&pty_writer, responses, session_name.clone()).await;
 
         for chunk in passthrough {
             let msg = protocol::encode(&ServerMsg::Passthrough(chunk))?;
@@ -431,39 +483,50 @@ async fn pty_to_client(
 
         if !is_alive() {
             debug!(session = %session_name, "child process died, draining remaining output");
-            let mut all_drain_scrollback = Vec::new();
-            while let Ok(remaining) = rx.try_recv() {
-                let (lines, passthrough) = {
-                    let mut scr = lock_mutex(&screen, "screen")?;
-                    scr.process(&remaining);
-                    (scr.take_pending_scrollback(), scr.take_passthrough())
-                };
-                all_drain_scrollback.extend(lines);
-                for chunk in passthrough {
-                    let msg = protocol::encode(&ServerMsg::Passthrough(chunk))?;
-                    writer.write_all(&msg).await?;
-                }
-            }
-            if !all_drain_scrollback.is_empty() {
-                let update = lock_mutex(&screen, "screen")?
-                    .render_with_scrollback(&all_drain_scrollback, &mut render_cache);
-                let msg = protocol::encode(&ServerMsg::ScreenUpdate(update))?;
-                writer.write_all(&msg).await?;
-            } else {
-                render_and_send(&screen, &mut render_cache, &mut writer, false).await?;
-            }
-            let msg = protocol::encode(&ServerMsg::SessionEnded)?;
-            writer.write_all(&msg).await?;
+            drain_and_close(&mut rx, &screen, &mut render_cache, &mut writer).await?;
             break;
         }
     }
     Ok(())
 }
 
+/// Drain remaining PTY output after child process death, render final state, and send SessionEnded.
+async fn drain_and_close(
+    rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    screen: &Arc<StdMutex<Screen>>,
+    render_cache: &mut RenderCache,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+) -> anyhow::Result<()> {
+    let mut all_drain_scrollback = Vec::new();
+    while let Ok(remaining) = rx.try_recv() {
+        let (lines, passthrough) = {
+            let mut scr = lock_mutex(screen, "screen")?;
+            scr.process(&remaining);
+            (scr.take_pending_scrollback(), scr.take_passthrough())
+        };
+        all_drain_scrollback.extend(lines);
+        for chunk in passthrough {
+            let msg = protocol::encode(&ServerMsg::Passthrough(chunk))?;
+            writer.write_all(&msg).await?;
+        }
+    }
+    if !all_drain_scrollback.is_empty() {
+        let update = lock_mutex(screen, "screen")?
+            .render_with_scrollback(&all_drain_scrollback, render_cache);
+        let msg = protocol::encode(&ServerMsg::ScreenUpdate(update))?;
+        writer.write_all(&msg).await?;
+    } else {
+        render_and_send(screen, render_cache, writer, false).await?;
+    }
+    let msg = protocol::encode(&ServerMsg::SessionEnded)?;
+    writer.write_all(&msg).await?;
+    Ok(())
+}
+
 /// Client → PTY relay loop: reads client messages and dispatches them.
 #[allow(clippy::too_many_arguments)]
 async fn client_to_pty(
-    mut reader: tokio::net::unix::OwnedReadHalf,
+    mut sock_reader: tokio::net::unix::OwnedReadHalf,
     pty_writer: Arc<StdMutex<Box<dyn Write + Send>>>,
     master_arc: Arc<StdMutex<Box<dyn portable_pty::MasterPty + Send>>>,
     screen: Arc<StdMutex<Screen>>,
@@ -472,32 +535,29 @@ async fn client_to_pty(
     leftover: Vec<u8>,
     name: String,
 ) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; READ_BUF_SIZE];
-    let mut read_buf = leftover;
+    let mut frames = FrameReader::with_leftover(leftover);
 
     loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
+        if !frames.fill_from(&mut sock_reader).await? {
             debug!(session = %name, "client socket closed");
             break;
         }
-        read_buf.extend_from_slice(&buf[..n]);
-
-        let mut cursor = 0;
-        while let Some((data, consumed)) = protocol::decode_frame(&read_buf[cursor..])? {
-            let msg: ClientMsg = crate::protocol::decode(data)?;
-            cursor += consumed;
-
+        while let Some(msg) = frames.decode_next::<ClientMsg>()? {
             match msg {
                 ClientMsg::Input(input) => {
-                    let mut w = lock_mutex(&pty_writer, "pty_writer")?;
-                    w.write_all(&input)?;
-                    w.flush()?;
+                    let pw = pty_writer.clone();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        let mut w = lock_mutex(&pw, "pty_writer")?;
+                        w.write_all(&input)?;
+                        w.flush()?;
+                        Ok(())
+                    }).await??;
                 }
                 ClientMsg::Resize { cols, rows } => {
                     SessionIo::resize(&master_arc, &screen, cols, rows)?;
-                    if let Ok(mut dims) = dims_arc.lock() {
-                        *dims = crate::screen::grid::sanitize_dimensions(cols, rows);
+                    match dims_arc.lock() {
+                        Ok(mut dims) => *dims = crate::screen::grid::sanitize_dimensions(cols, rows),
+                        Err(e) => warn!(session = %name, error = %e, "dims mutex poisoned during client resize"),
                     }
                 }
                 ClientMsg::RefreshScreen => {
@@ -507,11 +567,10 @@ async fn client_to_pty(
                     debug!(session = %name, "client detached");
                     return Ok(());
                 }
-                _ => {}
+                other => {
+                    debug!(session = %name, "ignoring unexpected client message: {:?}", std::mem::discriminant(&other));
+                }
             }
-        }
-        if cursor > 0 {
-            read_buf.drain(..cursor);
         }
     }
     Ok(())

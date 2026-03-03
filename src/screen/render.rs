@@ -36,7 +36,7 @@ fn hash_row(row: &[Cell]) -> u64 {
 }
 
 /// Render a single row of cells as ANSI bytes with SGR codes.
-/// Fix C1: returns a single space for fully blank lines so they're not empty.
+/// Returns empty Vec for fully blank lines.
 pub fn render_line(row: &[Cell]) -> Vec<u8> {
     let last_non_space = row.iter()
         .rposition(|c| (c.c != ' ' && c.c != '\0') || !c.style.is_default());
@@ -44,8 +44,7 @@ pub fn render_line(row: &[Cell]) -> Vec<u8> {
     let last_non_space = match last_non_space {
         Some(pos) => pos,
         None => {
-            // Entirely blank line — emit a single space so it's not empty
-            return b" ".to_vec();
+            return Vec::new();
         }
     };
 
@@ -61,7 +60,7 @@ pub fn render_line(row: &[Cell]) -> Vec<u8> {
         }
         let mut buf = [0u8; 4];
         out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
-        if let Some(mark) = cell.combining {
+        for &mark in &cell.combining {
             out.extend_from_slice(mark.encode_utf8(&mut buf).as_bytes());
         }
     }
@@ -242,7 +241,7 @@ fn render_screen_impl(
             }
             let mut buf = [0u8; 4];
             out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
-            if let Some(mark) = cell.combining {
+            for &mark in &cell.combining {
                 out.extend_from_slice(mark.encode_utf8(&mut buf).as_bytes());
             }
         }
@@ -300,7 +299,7 @@ mod tests {
     fn render_line_blank() {
         let row = vec![Cell::default(); 80];
         let result = render_line(&row);
-        assert_eq!(result, b" ");
+        assert!(result.is_empty(), "blank line should produce empty vec");
     }
 
     #[test]
@@ -349,8 +348,8 @@ mod tests {
     #[test]
     fn render_line_skips_wide_char_continuation() {
         let mut row = vec![Cell::default(); 10];
-        row[0] = Cell { c: '你', combining: None, style: Style::default(), width: 2 };
-        row[1] = Cell { c: '\0', combining: None, style: Style::default(), width: 0 };
+        row[0] = Cell { c: '你', combining: Vec::new(), style: Style::default(), width: 2 };
+        row[1] = Cell { c: '\0', combining: Vec::new(), style: Style::default(), width: 0 };
         row[2].c = 'A';
         let result = render_line(&row);
         let text = String::from_utf8_lossy(&result);
@@ -620,8 +619,8 @@ mod tests {
     fn render_line_wide_char_at_end() {
         // Wide char at last two positions renders correctly
         let mut row = vec![Cell::default(); 10];
-        row[8] = Cell { c: '\u{4e16}', combining: None, style: Style::default(), width: 2 }; // 世
-        row[9] = Cell { c: '\0', combining: None, style: Style::default(), width: 0 }; // continuation
+        row[8] = Cell { c: '\u{4e16}', combining: Vec::new(), style: Style::default(), width: 2 }; // 世
+        row[9] = Cell { c: '\0', combining: Vec::new(), style: Style::default(), width: 0 }; // continuation
         let result = render_line(&row);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains('\u{4e16}'), "wide char at end should be rendered");
@@ -790,7 +789,7 @@ mod tests {
     fn render_line_combining_mark() {
         let mut row = vec![Cell::default(); 10];
         row[0].c = 'e';
-        row[0].combining = Some('\u{0301}'); // combining acute accent → é
+        row[0].combining = vec!['\u{0301}']; // combining acute accent → é
         let result = render_line(&row);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("e\u{0301}"), "combining mark should be rendered after base char");
@@ -799,8 +798,8 @@ mod tests {
     #[test]
     fn render_line_combining_on_wide_char() {
         let mut row = vec![Cell::default(); 10];
-        row[0] = Cell { c: '\u{4e16}', combining: Some('\u{0308}'), style: Style::default(), width: 2 };
-        row[1] = Cell { c: '\0', combining: None, style: Style::default(), width: 0 };
+        row[0] = Cell { c: '\u{4e16}', combining: vec!['\u{0308}'], style: Style::default(), width: 2 };
+        row[1] = Cell { c: '\0', combining: Vec::new(), style: Style::default(), width: 0 };
         let result = render_line(&row);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("\u{4e16}\u{0308}"), "combining mark on wide char should render");
@@ -940,5 +939,71 @@ mod tests {
         // Without history, no leading newlines should be added
         assert_eq!(render[0], b'\x1b',
             "render without history must start directly with escape, not newline");
+    }
+
+    // --- BEL-in-render tests ---
+
+    /// Every BEL (0x07) in render output must be inside an OSC sequence,
+    /// never a standalone bell that would trigger an audible beep.
+    #[test]
+    fn render_no_standalone_bell() {
+        let grid = Grid::new(80, 24);
+        let mut cache = RenderCache::new();
+        let result = render_screen(&grid, "My Title", true, &mut cache);
+        // Find all BEL bytes and verify each is preceded by an OSC intro
+        for (i, &byte) in result.iter().enumerate() {
+            if byte == 0x07 {
+                // This BEL must be a terminator for an OSC sequence.
+                // Scan backward to find \x1b] (ESC ])
+                let prefix = &result[..i];
+                let osc_start = prefix.windows(2).rposition(|w| w == b"\x1b]");
+                assert!(osc_start.is_some(),
+                    "BEL at byte offset {} is standalone (not inside an OSC sequence)", i);
+            }
+        }
+    }
+
+    /// Full redraw should not produce standalone BEL even with title changes.
+    #[test]
+    fn render_full_redraw_no_standalone_bell() {
+        let grid = Grid::new(80, 24);
+        let mut cache = RenderCache::new();
+        // First render with title
+        let _ = render_screen(&grid, "Title1", false, &mut cache);
+        // Full redraw with different title
+        cache.invalidate();
+        let result = render_screen(&grid, "Title2", true, &mut cache);
+        for (i, &byte) in result.iter().enumerate() {
+            if byte == 0x07 {
+                let prefix = &result[..i];
+                let osc_start = prefix.windows(2).rposition(|w| w == b"\x1b]");
+                assert!(osc_start.is_some(),
+                    "BEL at byte offset {} is standalone after cache invalidate", i);
+            }
+        }
+    }
+
+    /// Render without title should produce zero BEL bytes.
+    #[test]
+    fn render_no_title_no_bell_bytes() {
+        let grid = Grid::new(80, 24);
+        let mut cache = RenderCache::new();
+        let result = render_screen(&grid, "", false, &mut cache);
+        let bell_count = result.iter().filter(|&&b| b == 0x07).count();
+        assert_eq!(bell_count, 0,
+            "render with empty title should produce zero BEL bytes, got {}", bell_count);
+    }
+
+    /// Repeated renders with the same title should not produce BEL on second render.
+    #[test]
+    fn render_cached_title_no_bell() {
+        let grid = Grid::new(80, 24);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "Hello", false, &mut cache);
+        // Second render with same title — should skip title OSC entirely
+        let result = render_screen(&grid, "Hello", false, &mut cache);
+        let bell_count = result.iter().filter(|&&b| b == 0x07).count();
+        assert_eq!(bell_count, 0,
+            "cached title should produce zero BEL bytes, got {}", bell_count);
     }
 }

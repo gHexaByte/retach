@@ -20,8 +20,21 @@ pub async fn run_server() -> anyhow::Result<()> {
     unsafe { signal(Signal::SIGHUP, SigHandler::SigIgn) }
         .map_err(|e| anyhow::anyhow!("failed to ignore SIGHUP: {}", e))?;
 
-    let path = socket_path();
-    let _ = std::fs::remove_file(&path);
+    let path = socket_path()?;
+    // Only remove socket if it's stale (no server is listening).
+    // This prevents a second server from yanking the socket out from under
+    // an already-running server.
+    if path.exists() {
+        match tokio::net::UnixStream::connect(&path).await {
+            Ok(_) => {
+                anyhow::bail!("another server is already running on {:?}", path);
+            }
+            Err(_) => {
+                // Stale socket — safe to remove
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
 
     let listener = UnixListener::bind(&path)?;
     info!(path = ?path, "server listening");
