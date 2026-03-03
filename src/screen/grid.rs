@@ -138,7 +138,7 @@ impl Grid {
         in_alt_screen: bool,
         scrollback: &mut VecDeque<Vec<u8>>,
         scrollback_limit: usize,
-        pending_scrollback: &mut Vec<Vec<u8>>,
+        pending_scrollback: &mut VecDeque<Vec<u8>>,
         fill: Cell,
     ) {
         let top = self.scroll_top as usize;
@@ -152,9 +152,9 @@ impl Grid {
             }
             scrollback.push_back(line.clone());
             if pending_scrollback.len() >= scrollback_limit {
-                pending_scrollback.remove(0);
+                pending_scrollback.pop_front();
             }
-            pending_scrollback.push(line);
+            pending_scrollback.push_back(line);
         }
 
         if top <= bottom && bottom < self.cells.len() {
@@ -249,7 +249,7 @@ mod tests {
         let mut grid = Grid::new(10, 3);
         grid.cells[0][0].c = 'A';
         let mut scrollback = VecDeque::new();
-        let mut pending = Vec::new();
+        let mut pending = VecDeque::new();
         grid.scroll_up(false, &mut scrollback, 100, &mut pending, Cell::default());
         assert_eq!(scrollback.len(), 1);
         assert_eq!(pending.len(), 1);
@@ -263,7 +263,7 @@ mod tests {
         let mut grid = Grid::new(10, 3);
         grid.cells[0][0].c = 'A';
         let mut scrollback = VecDeque::new();
-        let mut pending = Vec::new();
+        let mut pending = VecDeque::new();
         grid.scroll_up(true, &mut scrollback, 100, &mut pending, Cell::default());
         assert_eq!(scrollback.len(), 0);
         assert_eq!(pending.len(), 0);
@@ -273,7 +273,7 @@ mod tests {
     fn grid_scroll_up_respects_limit() {
         let mut grid = Grid::new(10, 3);
         let mut scrollback = VecDeque::new();
-        let mut pending = Vec::new();
+        let mut pending = VecDeque::new();
         for _ in 0..5 {
             grid.scroll_up(false, &mut scrollback, 3, &mut pending, Cell::default());
         }
@@ -284,7 +284,7 @@ mod tests {
     fn pending_scrollback_respects_limit() {
         let mut grid = Grid::new(10, 3);
         let mut scrollback = VecDeque::new();
-        let mut pending = Vec::new();
+        let mut pending = VecDeque::new();
         for _ in 0..20 {
             grid.scroll_up(false, &mut scrollback, 5, &mut pending, Cell::default());
         }

@@ -91,18 +91,6 @@ fn write_pty_responses(
     }
 }
 
-/// Send encoded scrollback lines to the client.
-async fn send_scrollback(
-    lines: Vec<Vec<u8>>,
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-) -> anyhow::Result<()> {
-    for line in lines {
-        let msg = protocol::encode(&ServerMsg::ScrollbackLine(line))?;
-        writer.write_all(&msg).await?;
-    }
-    Ok(())
-}
-
 /// Handles returned from `setup_session`, containing everything needed for the I/O loops.
 struct SessionSetup {
     io: SessionIo,
@@ -248,7 +236,17 @@ async fn send_initial_state(
     let (hist_chunks, screen_msg) = {
         let screen = lock_mutex(&io.screen, "screen")?;
         let hist = screen.get_history();
-        let screen_msg = protocol::encode(&ServerMsg::ScreenUpdate(screen.render(true, &mut render_cache)))?;
+        let mut render_data = Vec::new();
+        // After the client writes history lines with \r\n, up to `rows - 1`
+        // lines remain on the visible screen (the final \r\n already scrolled
+        // one line off, leaving the cursor on a blank bottom row).  Prepend
+        // newlines to flush them into the real terminal's scrollback buffer
+        // before the screen clear erases them.
+        if !hist.is_empty() {
+            render_data.extend(std::iter::repeat(b'\n').take(screen.grid.rows.saturating_sub(1) as usize));
+        }
+        render_data.extend_from_slice(&screen.render(true, &mut render_cache));
+        let screen_msg = protocol::encode(&ServerMsg::ScreenUpdate(render_data))?;
         (hist, screen_msg)
     };
 
@@ -399,44 +397,61 @@ async fn pty_to_client(
             }
         };
 
-        let (scrollback_lines, responses) = {
+        let (scrollback_lines, responses, passthrough) = {
             let mut scr = lock_mutex(&screen, "screen")?;
             scr.process(&data);
-            (scr.take_pending_scrollback(), scr.take_responses())
+            (scr.take_pending_scrollback(), scr.take_responses(), scr.take_passthrough())
         };
 
         write_pty_responses(&pty_writer, &responses, &session_name);
-        let had_scrollback = !scrollback_lines.is_empty();
-        send_scrollback(scrollback_lines, &mut writer).await?;
 
-        if had_scrollback {
-            render_cache.invalidate();
+        for chunk in passthrough {
+            let msg = protocol::encode(&ServerMsg::Passthrough(chunk))?;
+            writer.write_all(&msg).await?;
         }
 
-        screen_dirty = true;
-
-        if last_render.elapsed() >= min_interval {
-            render_and_send(&screen, &mut render_cache, &mut writer, false).await?;
+        if !scrollback_lines.is_empty() {
+            // Scrollback lines require an immediate atomic render: cursor
+            // positioning + scrollback injection + full screen redraw, all
+            // inside one synchronized-output block.
+            let update = lock_mutex(&screen, "screen")?
+                .render_with_scrollback(&scrollback_lines, &mut render_cache);
+            let msg = protocol::encode(&ServerMsg::ScreenUpdate(update))?;
+            writer.write_all(&msg).await?;
             last_render = std::time::Instant::now();
             screen_dirty = false;
+        } else {
+            screen_dirty = true;
+            if last_render.elapsed() >= min_interval {
+                render_and_send(&screen, &mut render_cache, &mut writer, false).await?;
+                last_render = std::time::Instant::now();
+                screen_dirty = false;
+            }
         }
 
         if !is_alive() {
             debug!(session = %session_name, "child process died, draining remaining output");
-            let mut had_drain_scrollback = false;
+            let mut all_drain_scrollback = Vec::new();
             while let Ok(remaining) = rx.try_recv() {
-                let lines = {
+                let (lines, passthrough) = {
                     let mut scr = lock_mutex(&screen, "screen")?;
                     scr.process(&remaining);
-                    scr.take_pending_scrollback()
+                    (scr.take_pending_scrollback(), scr.take_passthrough())
                 };
-                if !lines.is_empty() { had_drain_scrollback = true; }
-                send_scrollback(lines, &mut writer).await?;
+                all_drain_scrollback.extend(lines);
+                for chunk in passthrough {
+                    let msg = protocol::encode(&ServerMsg::Passthrough(chunk))?;
+                    writer.write_all(&msg).await?;
+                }
             }
-            if had_drain_scrollback {
-                render_cache.invalidate();
+            if !all_drain_scrollback.is_empty() {
+                let update = lock_mutex(&screen, "screen")?
+                    .render_with_scrollback(&all_drain_scrollback, &mut render_cache);
+                let msg = protocol::encode(&ServerMsg::ScreenUpdate(update))?;
+                writer.write_all(&msg).await?;
+            } else {
+                render_and_send(&screen, &mut render_cache, &mut writer, false).await?;
             }
-            render_and_send(&screen, &mut render_cache, &mut writer, false).await?;
             let msg = protocol::encode(&ServerMsg::SessionEnded)?;
             writer.write_all(&msg).await?;
             break;

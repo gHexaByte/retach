@@ -61,6 +61,9 @@ pub fn render_line(row: &[Cell]) -> Vec<u8> {
         }
         let mut buf = [0u8; 4];
         out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+        if let Some(mark) = cell.combining {
+            out.extend_from_slice(mark.encode_utf8(&mut buf).as_bytes());
+        }
     }
     if !current.is_default() {
         out.extend_from_slice(b"\x1b[0m");
@@ -148,11 +151,53 @@ fn emit_mode_delta(out: &mut Vec<u8>, modes: &TerminalModes, prev: &TerminalMode
 /// If `full` is true, clears screen first (used on initial attach).
 /// Otherwise uses dirty tracking to skip unchanged rows.
 pub fn render_screen(grid: &Grid, title: &str, full: bool, cache: &mut RenderCache) -> Vec<u8> {
+    render_screen_impl(grid, title, &[], full, cache)
+}
+
+/// Render the screen with scrollback lines injected into the real terminal's
+/// native scrollback buffer.
+///
+/// The entire output — scrollback injection and screen redraw — is wrapped in
+/// a single synchronized-output block to prevent flicker.  Scrollback lines
+/// are emitted first (cursor positioned at the bottom so `\r\n` triggers real
+/// terminal scrolling), followed by a full screen clear and redraw.
+pub fn render_screen_with_scrollback(
+    grid: &Grid,
+    title: &str,
+    scrollback: &[Vec<u8>],
+    cache: &mut RenderCache,
+) -> Vec<u8> {
+    render_screen_impl(grid, title, scrollback, true, cache)
+}
+
+fn render_screen_impl(
+    grid: &Grid,
+    title: &str,
+    scrollback: &[Vec<u8>],
+    full: bool,
+    cache: &mut RenderCache,
+) -> Vec<u8> {
     let mut out = Vec::new();
     // Synchronized output: begin
     out.extend_from_slice(b"\x1b[?2026h");
     // Hide cursor during redraw
     out.extend_from_slice(b"\x1b[?25l");
+
+    // Scrollback injection: position cursor at the bottom of the screen so
+    // that each `\r\n` triggers real terminal scrolling, pushing the top
+    // screen row into the native scrollback buffer.
+    if !scrollback.is_empty() {
+        out.extend_from_slice(b"\x1b[");
+        write_u16(&mut out, grid.rows);
+        out.extend_from_slice(b";1H");
+        for line in scrollback {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+        cache.invalidate();
+    }
+
+    let full = full || !scrollback.is_empty();
 
     if full {
         // Reset SGR before clearing to prevent leftover background color from
@@ -197,6 +242,9 @@ pub fn render_screen(grid: &Grid, title: &str, full: bool, cache: &mut RenderCac
             }
             let mut buf = [0u8; 4];
             out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+            if let Some(mark) = cell.combining {
+                out.extend_from_slice(mark.encode_utf8(&mut buf).as_bytes());
+            }
         }
 
         // Reset style + erase to end of line (clears any leftover from previous content)
@@ -301,8 +349,8 @@ mod tests {
     #[test]
     fn render_line_skips_wide_char_continuation() {
         let mut row = vec![Cell::default(); 10];
-        row[0] = Cell { c: '你', style: Style::default(), width: 2 };
-        row[1] = Cell { c: '\0', style: Style::default(), width: 0 };
+        row[0] = Cell { c: '你', combining: None, style: Style::default(), width: 2 };
+        row[1] = Cell { c: '\0', combining: None, style: Style::default(), width: 0 };
         row[2].c = 'A';
         let result = render_line(&row);
         let text = String::from_utf8_lossy(&result);
@@ -572,8 +620,8 @@ mod tests {
     fn render_line_wide_char_at_end() {
         // Wide char at last two positions renders correctly
         let mut row = vec![Cell::default(); 10];
-        row[8] = Cell { c: '\u{4e16}', style: Style::default(), width: 2 }; // 世
-        row[9] = Cell { c: '\0', style: Style::default(), width: 0 }; // continuation
+        row[8] = Cell { c: '\u{4e16}', combining: None, style: Style::default(), width: 2 }; // 世
+        row[9] = Cell { c: '\0', combining: None, style: Style::default(), width: 0 }; // continuation
         let result = render_line(&row);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains('\u{4e16}'), "wide char at end should be rendered");
@@ -736,5 +784,161 @@ mod tests {
         let result2 = render_screen(&grid, "", false, &mut cache);
         let text2 = String::from_utf8_lossy(&result2);
         assert!(text2.contains("\x1b>"), "keypad normal mode should emit ESC >");
+    }
+
+    #[test]
+    fn render_line_combining_mark() {
+        let mut row = vec![Cell::default(); 10];
+        row[0].c = 'e';
+        row[0].combining = Some('\u{0301}'); // combining acute accent → é
+        let result = render_line(&row);
+        let text = String::from_utf8_lossy(&result);
+        assert!(text.contains("e\u{0301}"), "combining mark should be rendered after base char");
+    }
+
+    #[test]
+    fn render_line_combining_on_wide_char() {
+        let mut row = vec![Cell::default(); 10];
+        row[0] = Cell { c: '\u{4e16}', combining: Some('\u{0308}'), style: Style::default(), width: 2 };
+        row[1] = Cell { c: '\0', combining: None, style: Style::default(), width: 0 };
+        let result = render_line(&row);
+        let text = String::from_utf8_lossy(&result);
+        assert!(text.contains("\u{4e16}\u{0308}"), "combining mark on wide char should render");
+    }
+
+    // --- Scrollback injection tests ---
+
+    #[test]
+    fn scrollback_positions_cursor_at_bottom() {
+        let grid = Grid::new(80, 24);
+        let mut cache = RenderCache::new();
+        let scrollback = vec![b"line one".to_vec()];
+        let result = render_screen_with_scrollback(&grid, "", &scrollback, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+        // Cursor must be positioned at the last row (24) before scrollback content
+        assert!(text.contains("\x1b[24;1H"),
+            "scrollback should position cursor at bottom row");
+    }
+
+    #[test]
+    fn scrollback_lines_appear_before_screen_clear() {
+        let grid = Grid::new(80, 24);
+        let mut cache = RenderCache::new();
+        let scrollback = vec![b"old prompt".to_vec(), b"ls output".to_vec()];
+        let result = render_screen_with_scrollback(&grid, "", &scrollback, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+
+        let pos_cursor = text.find("\x1b[24;1H").expect("cursor positioning missing");
+        let pos_line1 = text.find("old prompt").expect("scrollback line 1 missing");
+        let pos_line2 = text.find("ls output").expect("scrollback line 2 missing");
+        let pos_clear = text.find("\x1b[2J").expect("screen clear missing");
+
+        assert!(pos_cursor < pos_line1, "cursor positioning must precede scrollback");
+        assert!(pos_line1 < pos_line2, "scrollback lines must be in order");
+        assert!(pos_line2 < pos_clear, "scrollback must precede screen clear");
+    }
+
+    #[test]
+    fn scrollback_lines_have_crlf() {
+        let grid = Grid::new(80, 24);
+        let mut cache = RenderCache::new();
+        let scrollback = vec![b"AAA".to_vec(), b"BBB".to_vec()];
+        let result = render_screen_with_scrollback(&grid, "", &scrollback, &mut cache);
+        // Check raw bytes for \r\n after each scrollback line
+        let raw = &result;
+        let pos_a = raw.windows(3).position(|w| w == b"AAA").expect("AAA missing");
+        let pos_b = raw.windows(3).position(|w| w == b"BBB").expect("BBB missing");
+        assert_eq!(&raw[pos_a + 3..pos_a + 5], b"\r\n",
+            "scrollback line must end with \\r\\n");
+        assert_eq!(&raw[pos_b + 3..pos_b + 5], b"\r\n",
+            "scrollback line must end with \\r\\n");
+    }
+
+    #[test]
+    fn scrollback_wrapped_in_sync_block() {
+        let grid = Grid::new(80, 24);
+        let mut cache = RenderCache::new();
+        let scrollback = vec![b"scroll line".to_vec()];
+        let result = render_screen_with_scrollback(&grid, "", &scrollback, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+
+        let sync_begin = text.find("\x1b[?2026h").expect("sync begin missing");
+        let pos_scroll = text.find("scroll line").expect("scrollback content missing");
+        let sync_end = text.rfind("\x1b[?2026l").expect("sync end missing");
+
+        assert!(sync_begin < pos_scroll, "scrollback must be after sync begin");
+        assert!(pos_scroll < sync_end, "scrollback must be before sync end");
+    }
+
+    #[test]
+    fn scrollback_forces_full_redraw() {
+        let mut grid = Grid::new(10, 3);
+        let mut cache = RenderCache::new();
+        // Populate cache with an initial render
+        let _ = render_screen(&grid, "", false, &mut cache);
+        assert!(!cache.row_hashes.is_empty());
+
+        // Modify only row 2 — normally only row 2 would be redrawn
+        grid.cells[1][0].c = 'X';
+
+        // Render with scrollback — all rows must be redrawn (full redraw)
+        let scrollback = vec![b"old".to_vec()];
+        let result = render_screen_with_scrollback(&grid, "", &scrollback, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+
+        assert!(text.contains("\x1b[1;1H"), "row 1 must be redrawn after scrollback");
+        assert!(text.contains("\x1b[2;1H"), "row 2 must be redrawn after scrollback");
+        assert!(text.contains("\x1b[3;1H"), "row 3 must be redrawn after scrollback");
+    }
+
+    #[test]
+    fn no_scrollback_no_crlf_in_output() {
+        let grid = Grid::new(80, 24);
+        let mut cache = RenderCache::new();
+        let result = render_screen(&grid, "", false, &mut cache);
+        // Normal render must never contain \r\n — that's only emitted for scrollback
+        assert!(!result.windows(2).any(|w| w == b"\r\n"),
+            "render without scrollback must not contain \\r\\n");
+    }
+
+    /// Simulates the reattach scenario: history lines are written by the
+    /// client with `\r\n`, leaving the last `rows - 1` lines on screen.
+    /// The server prepends exactly `rows - 1` newlines to the ScreenUpdate
+    /// to flush them into the real terminal's scrollback buffer.
+    ///
+    /// If too few `\n`s are sent, some history lines are lost (cleared by
+    /// `\x1b[2J`).  If too many, a blank line leaks into the scrollback.
+    #[test]
+    fn reattach_history_flush_count() {
+        let rows: u16 = 5;
+        let grid = Grid::new(80, rows);
+        let mut cache = RenderCache::new();
+        let render = render_screen(&grid, "", true, &mut cache);
+
+        // Build the ScreenUpdate data the same way send_initial_state does:
+        // prepend (rows - 1) newlines, then the full render.
+        let mut reattach_data = Vec::new();
+        let flush_count = rows.saturating_sub(1) as usize;
+        reattach_data.extend(std::iter::repeat(b'\n').take(flush_count));
+        reattach_data.extend_from_slice(&render);
+
+        // Count leading \n bytes before any escape sequence
+        let leading_newlines = reattach_data.iter().take_while(|&&b| b == b'\n').count();
+        assert_eq!(leading_newlines, (rows - 1) as usize,
+            "reattach should prepend exactly rows-1 newlines, got {}", leading_newlines);
+
+        // The render portion must still start with sync begin
+        assert_eq!(&reattach_data[flush_count..flush_count + 8], b"\x1b[?2026h",
+            "render must start with synchronized output after flush newlines");
+    }
+
+    #[test]
+    fn reattach_no_flush_without_history() {
+        let grid = Grid::new(80, 5);
+        let mut cache = RenderCache::new();
+        let render = render_screen(&grid, "", true, &mut cache);
+        // Without history, no leading newlines should be added
+        assert_eq!(render[0], b'\x1b',
+            "render without history must start directly with escape, not newline");
     }
 }

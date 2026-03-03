@@ -14,7 +14,7 @@ pub struct ScreenPerformer<'a> {
     pub state: &'a mut ScreenState,
     pub scrollback: &'a mut VecDeque<Vec<u8>>,
     pub scrollback_limit: usize,
-    pub pending_scrollback: &'a mut Vec<Vec<u8>>,
+    pub pending_scrollback: &'a mut VecDeque<Vec<u8>>,
 }
 
 impl<'a> ScreenPerformer<'a> {
@@ -22,6 +22,7 @@ impl<'a> ScreenPerformer<'a> {
     fn blank_cell(&self) -> Cell {
         Cell {
             c: ' ',
+            combining: None,
             style: Style { bg: self.state.current_style.bg, ..Style::default() },
             width: 1,
         }
@@ -443,6 +444,29 @@ impl<'a> Perform for ScreenPerformer<'a> {
 
         // Zero-width characters (combining marks, etc.) — attach to previous cell
         if char_width == 0 {
+            let cx = self.grid.cursor_x as usize;
+            let cy = self.grid.cursor_y as usize;
+            if cy < self.grid.rows as usize {
+                // Find the target cell: if wrap_pending, the cursor sits on the
+                // last cell of the current line; otherwise step back one column.
+                let tx = if self.grid.wrap_pending {
+                    cx
+                } else if cx > 0 {
+                    cx - 1
+                } else {
+                    return; // no previous cell to attach to
+                };
+                if tx < self.grid.cols as usize {
+                    // If the target is a continuation cell (width==0), step back
+                    // one more to reach the actual wide character cell.
+                    let tx = if self.grid.cells[cy][tx].width == 0 && tx > 0 {
+                        tx - 1
+                    } else {
+                        tx
+                    };
+                    self.grid.cells[cy][tx].combining = Some(c);
+                }
+            }
             return;
         }
 
@@ -487,6 +511,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
 
             self.grid.cells[y][x] = Cell {
                 c,
+                combining: None,
                 style: self.state.current_style,
                 width: char_width as u8,
             };
@@ -499,6 +524,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                     self.fixup_wide_char(next, y);
                     self.grid.cells[y][next] = Cell {
                         c: '\0',
+                        combining: None,
                         style: self.state.current_style,
                         width: 0,
                     };
@@ -657,15 +683,28 @@ impl<'a> Perform for ScreenPerformer<'a> {
             .ok()
             .and_then(|s| s.parse::<u16>().ok());
 
-        // Set window title (OSC 0 / OSC 2)
-        // Other OSC codes (52=clipboard, 4/10/11=colors, 8=hyperlinks) are ignored
+        // Set window title (OSC 0 / OSC 2) — handled locally
         if let Some(0 | 2) = osc_num {
             if params.len() >= 2 {
                 if let Ok(title) = std::str::from_utf8(params[1]) {
                     self.state.title = title.to_string();
                 }
             }
+            return;
         }
+
+        // All other OSC sequences: reconstruct and forward to the outer terminal.
+        // This covers notifications (777, 9), clipboard (52), hyperlinks (8), etc.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x1b]");
+        for (i, param) in params.iter().enumerate() {
+            if i > 0 {
+                buf.push(b';');
+            }
+            buf.extend_from_slice(param);
+        }
+        buf.push(0x07); // BEL terminator
+        self.state.pending_passthrough.push(buf);
     }
 
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}

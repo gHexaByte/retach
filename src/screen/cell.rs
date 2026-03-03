@@ -4,6 +4,8 @@ use super::style::Style;
 #[derive(Copy, Clone, Debug, Hash)]
 pub struct Cell {
     pub c: char,
+    /// Combining mark (e.g. diacritic), if any. Covers 99%+ of real-world cases.
+    pub combining: Option<char>,
     pub style: Style,
     /// Display width: 1 for normal, 2 for wide char first cell, 0 for wide char continuation
     pub width: u8,
@@ -11,6 +13,6 @@ pub struct Cell {
 
 impl Default for Cell {
     fn default() -> Self {
-        Self { c: ' ', style: Style::default(), width: 1 }
+        Self { c: ' ', combining: None, style: Style::default(), width: 1 }
     }
 }

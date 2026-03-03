@@ -49,6 +49,8 @@ pub enum ServerMsg {
     Connected { name: String, new_session: bool },
     /// Session killed successfully
     SessionKilled { name: String },
+    /// OSC passthrough (notifications, clipboard, etc.) — written directly to outer terminal
+    Passthrough(Vec<u8>),
 }
 
 /// Snapshot of a session's metadata, used in list responses.

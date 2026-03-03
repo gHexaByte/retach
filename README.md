@@ -75,9 +75,9 @@ Client (retach)            Daemon                     Shell
 
 **Daemon + client over Unix socket** at `$XDG_RUNTIME_DIR/retach/retach.sock` (fallback: `/tmp/retach-<uid>/retach.sock`).
 
-The daemon spawns a PTY per session and parses all output through a VTE state machine. It maintains a virtual grid (the visible screen area) and a scrollback buffer. When a line scrolls off the top of the grid, it's sent to the client as a `ScrollbackLine` message — the client writes it to stdout followed by `\r\n`, letting the native terminal handle it. Periodically (60 FPS cap), the daemon sends a `ScreenUpdate` with the current grid rendered as ANSI escape sequences.
+The daemon spawns a PTY per session and parses all output through a VTE state machine. It maintains a virtual grid (the visible screen area) and a scrollback buffer. When a line scrolls off the top of the grid, it is included in the next `ScreenUpdate` as an atomic operation: the cursor is positioned at the bottom of the screen, the scrollback line is written with `\r\n` (triggering a real terminal scroll), and the grid is redrawn — all within a single synchronized-output block to prevent flicker. Periodically (60 FPS cap), the daemon sends incremental `ScreenUpdate` messages with only the changed rows.
 
-On reattach, the daemon sends the stored scrollback history followed by the current screen snapshot. The client terminal gets the full context without any copy mode.
+On reattach, the daemon sends the stored scrollback history as `History` messages (the client writes each line to stdout with `\r\n`, letting the native terminal scroll them into its scrollback buffer), then sends a full `ScreenUpdate` to redraw the visible area.
 
 **Alt screen** (vim, less, htop, etc.) is handled separately: scrollback passthrough is paused while the child process uses the alternate screen buffer. When the child exits alt screen, the main grid is restored.
 

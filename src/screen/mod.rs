@@ -38,6 +38,7 @@ pub struct ScreenState {
     pub saved_cursor_state: Option<SavedCursor>,
     pub saved_modes: Option<grid::TerminalModes>,
     pub pending_responses: Vec<Vec<u8>>,
+    pub pending_passthrough: Vec<Vec<u8>>,
     pub title: String,
     pub last_printed_char: char,
 }
@@ -51,6 +52,7 @@ impl Default for ScreenState {
             saved_cursor_state: None,
             saved_modes: None,
             pending_responses: Vec::new(),
+            pending_passthrough: Vec::new(),
             title: String::new(),
             last_printed_char: ' ',
         }
@@ -63,7 +65,7 @@ pub struct Screen {
     state: ScreenState,
     scrollback: VecDeque<Vec<u8>>,
     scrollback_limit: usize,
-    pending_scrollback: Vec<Vec<u8>>,
+    pending_scrollback: VecDeque<Vec<u8>>,
     parser: Parser,
 }
 
@@ -75,7 +77,7 @@ impl Screen {
             state: ScreenState::default(),
             scrollback: VecDeque::new(),
             scrollback_limit,
-            pending_scrollback: Vec::new(),
+            pending_scrollback: VecDeque::new(),
             parser: Parser::new(),
         }
     }
@@ -99,9 +101,14 @@ impl Screen {
         std::mem::take(&mut self.state.pending_responses)
     }
 
+    /// Take pending OSC passthrough sequences to forward to the outer terminal.
+    pub fn take_passthrough(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.state.pending_passthrough)
+    }
+
     /// Drain and return scrollback lines added since the last call.
     pub fn take_pending_scrollback(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.pending_scrollback)
+        std::mem::take(&mut self.pending_scrollback).into()
     }
 
     /// Return all accumulated scrollback lines as rendered ANSI bytes.
@@ -112,6 +119,16 @@ impl Screen {
     /// Render the current grid as ANSI output. Pass `full: true` for a full redraw.
     pub fn render(&self, full: bool, cache: &mut RenderCache) -> Vec<u8> {
         render_screen(&self.grid, &self.state.title, full, cache)
+    }
+
+    /// Render the screen with scrollback lines included in one atomic output.
+    ///
+    /// Scrollback lines are injected into the real terminal's native scrollback
+    /// buffer (cursor positioned at the bottom so `\r\n` scrolls), followed by
+    /// a full screen redraw.  Everything is inside a single synchronized-output
+    /// block to prevent flicker.
+    pub fn render_with_scrollback(&self, scrollback: &[Vec<u8>], cache: &mut RenderCache) -> Vec<u8> {
+        render::render_screen_with_scrollback(&self.grid, &self.state.title, scrollback, cache)
     }
 
     /// Resize the grid to new dimensions, clamping cursor and resetting scroll region.
@@ -312,6 +329,26 @@ mod tests {
         assert_eq!(screen.state.title, "My Terminal");
         screen.process(b"\x1b]2;New Title\x07");
         assert_eq!(screen.state.title, "New Title");
+    }
+
+    #[test]
+    fn osc_passthrough_non_title() {
+        let mut screen = Screen::new(80, 24, 100);
+        screen.process(b"\x1b]777;notify;Test;Hello\x07");
+        let pt = screen.take_passthrough();
+        assert_eq!(pt.len(), 1, "should have one passthrough sequence");
+        assert_eq!(pt[0], b"\x1b]777;notify;Test;Hello\x07");
+        // Title should not be set
+        assert_eq!(screen.state.title, "");
+    }
+
+    #[test]
+    fn osc_title_not_passedthrough() {
+        let mut screen = Screen::new(80, 24, 100);
+        screen.process(b"\x1b]0;My Title\x07");
+        let pt = screen.take_passthrough();
+        assert!(pt.is_empty(), "OSC 0 should not be passedthrough");
+        assert_eq!(screen.state.title, "My Title");
     }
 
     #[test]
@@ -1322,5 +1359,47 @@ mod tests {
         let first_line = String::from_utf8_lossy(&history[0]);
         assert!(first_line.contains('\u{4e16}'), "scrollback should contain wide char 世");
         assert!(first_line.contains('\u{754c}'), "scrollback should contain wide char 界");
+    }
+
+    #[test]
+    fn combining_mark_attaches_to_previous_cell() {
+        let mut screen = Screen::new(80, 24, 100);
+        // Print 'e' followed by combining acute accent U+0301
+        screen.process("e\u{0301}".as_bytes());
+        assert_eq!(screen.grid.cells[0][0].c, 'e');
+        assert_eq!(screen.grid.cells[0][0].combining, Some('\u{0301}'));
+    }
+
+    #[test]
+    fn combining_mark_with_wrap_pending() {
+        let mut screen = Screen::new(5, 3, 100);
+        // Fill the line to trigger wrap_pending
+        screen.process(b"ABCDE");
+        assert!(screen.grid.wrap_pending, "wrap should be pending after filling line");
+        // Now send a combining mark — it should attach to the last cell (E)
+        screen.process("\u{0308}".as_bytes()); // combining diaeresis
+        assert_eq!(screen.grid.cells[0][4].c, 'E');
+        assert_eq!(screen.grid.cells[0][4].combining, Some('\u{0308}'));
+    }
+
+    #[test]
+    fn combining_mark_on_wide_char() {
+        let mut screen = Screen::new(80, 24, 100);
+        // Print a wide char followed by a combining mark
+        screen.process("\u{4e16}\u{0301}".as_bytes()); // 世 + combining acute
+        // The combining mark should attach to the wide char cell (col 0), not the continuation (col 1)
+        assert_eq!(screen.grid.cells[0][0].c, '\u{4e16}');
+        assert_eq!(screen.grid.cells[0][0].combining, Some('\u{0301}'));
+        assert_eq!(screen.grid.cells[0][1].width, 0); // continuation cell
+    }
+
+    #[test]
+    fn combining_mark_renders_in_output() {
+        let mut screen = Screen::new(80, 24, 100);
+        screen.process("e\u{0301}".as_bytes());
+        let mut cache = RenderCache::new();
+        let output = screen.render(true, &mut cache);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("e\u{0301}"), "rendered output should contain base char + combining mark");
     }
 }

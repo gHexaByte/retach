@@ -27,6 +27,9 @@ fn dispatch_server_msg(msg: &ServerMsg, stdout: &mut impl Write) -> io::Result<D
         ServerMsg::ScreenUpdate(data) => {
             stdout.write_all(data)?;
         }
+        ServerMsg::Passthrough(data) => {
+            stdout.write_all(data)?;
+        }
         ServerMsg::History(lines) => {
             for line in lines {
                 stdout.write_all(line)?;
@@ -293,7 +296,7 @@ pub async fn connect(name: &str, history: usize, mode: crate::protocol::ConnectM
 fn cleanup_terminal() {
     let mut stdout = io::stdout();
     let _ = stdout.write_all(
-        b"\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?2026l\x1b>\x1b[0 q\x1b[0m",
+        b"\x1b[?25h\x1b[?7h\x1b[?1l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?2026l\x1b>\x1b[0 q\x1b[0m",
     );
     let _ = stdout.flush();
 }
