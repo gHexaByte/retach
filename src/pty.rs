@@ -1,5 +1,5 @@
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 /// Wrapper around a pseudo-terminal with shared access to the master, writer, and child process.
@@ -41,5 +41,12 @@ impl Pty {
     /// Return a shared reference to the master PTY (used for reading output and resizing).
     pub fn master_arc(&self) -> Arc<Mutex<Box<dyn MasterPty + Send>>> {
         self.master.clone()
+    }
+
+    /// Clone the PTY reader for use by the persistent reader thread.
+    pub fn clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
+        let master = self.master.lock()
+            .map_err(|e| anyhow::anyhow!("master mutex poisoned: {}", e))?;
+        master.try_clone_reader().map_err(|e| anyhow::anyhow!("{}", e))
     }
 }

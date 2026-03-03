@@ -92,7 +92,11 @@ impl<'a> ScreenPerformer<'a> {
 
     /// Enter alt screen: save grid/modes, clear screen, reset cursor and scroll region.
     /// If `save_cursor` is true, also save cursor state (mode 1049).
+    /// Ignored if already in alt screen (prevents overwriting the saved main screen).
     fn enter_alt_screen(&mut self, save_cursor: bool) {
+        if self.state.in_alt_screen {
+            return;
+        }
         if save_cursor {
             self.save_cursor();
         }
@@ -112,7 +116,11 @@ impl<'a> ScreenPerformer<'a> {
 
     /// Exit alt screen: restore grid/modes, reset scroll region.
     /// If `restore_cursor` is true, also restore cursor state (mode 1049).
+    /// Ignored if not currently in alt screen.
     fn exit_alt_screen(&mut self, do_restore_cursor: bool) {
+        if !self.state.in_alt_screen {
+            return;
+        }
         self.state.in_alt_screen = false;
         if let Some(saved) = self.state.saved_grid.take() {
             self.grid.cells = saved;
@@ -486,6 +494,10 @@ impl<'a> Perform for ScreenPerformer<'a> {
         // Wide char: if it doesn't fit at end of line, fill current cell with space and wrap
         if char_width == 2 && self.grid.cursor_x >= self.grid.cols - 1 {
             if self.grid.modes.autowrap_mode {
+                // If the terminal is too narrow for any wide char (cols < 2), drop it
+                if self.grid.cols < 2 {
+                    return;
+                }
                 let x = self.grid.cursor_x as usize;
                 let y = self.grid.cursor_y as usize;
                 if x < self.grid.cols as usize && y < self.grid.rows as usize {
@@ -654,6 +666,13 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 let x = self.grid.cursor_x as usize;
                 if x < self.grid.tab_stops.len() {
                     self.grid.tab_stops[x] = true;
+                }
+            }
+            ([], b'D') => { // IND — Index (scroll up at bottom margin)
+                if self.grid.cursor_y == self.grid.scroll_bottom {
+                    self.scroll_up();
+                } else if self.grid.cursor_y < self.grid.rows - 1 {
+                    self.grid.cursor_y += 1;
                 }
             }
             ([], b'M') => { // RI — Reverse Index (scroll down at top margin)

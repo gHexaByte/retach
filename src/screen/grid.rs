@@ -162,7 +162,7 @@ impl Grid {
         let bottom = self.scroll_bottom as usize;
 
         // Capture scrollback whenever a line scrolls off the top of the screen
-        if !in_alt_screen && top == 0 {
+        if !in_alt_screen && top == 0 && scrollback_limit > 0 {
             let line = self.cells[0].clone();
             if scrollback.len() >= scrollback_limit {
                 scrollback.pop_front();
@@ -336,7 +336,7 @@ mod tests {
         for _ in 0..20 {
             grid.scroll_up(false, &mut scrollback, 5, &mut pending, Cell::default());
         }
-        assert!(pending.len() <= 5, "pending_scrollback should be bounded, got {}", pending.len());
+        assert_eq!(pending.len(), 5, "pending_scrollback should be exactly at limit, got {}", pending.len());
     }
 
     #[test]

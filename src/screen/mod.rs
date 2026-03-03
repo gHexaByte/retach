@@ -82,6 +82,11 @@ impl Screen {
         }
     }
 
+    /// Whether the screen is currently in alternate screen mode.
+    pub fn in_alt_screen(&self) -> bool {
+        self.state.in_alt_screen
+    }
+
     /// Feed raw bytes through the VTE parser, updating the grid and state.
     pub fn process(&mut self, bytes: &[u8]) {
         let mut performer = ScreenPerformer {

@@ -1,6 +1,8 @@
 use crate::pty::Pty;
 use crate::screen::Screen;
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Check if a PTY child process is still alive.
@@ -25,10 +27,14 @@ pub struct Session {
     /// When a client is attached, holds the sender side of a watch channel.
     /// Sending `false` evicts the active client. Replaced on each new attach.
     pub evict_tx: Option<tokio::sync::watch::Sender<bool>>,
-    /// Signaled when the previous connection's PTY reader thread exits.
-    /// Used to prevent two reader threads from racing for PTY data on reconnect.
-    /// Starts with 1 permit so the first connection doesn't wait.
-    pub reader_exited: Arc<tokio::sync::Semaphore>,
+    /// Wakes the client relay when new PTY data has been processed.
+    pub screen_notify: Arc<tokio::sync::Notify>,
+    /// Whether a client is currently connected (used by reader to decide draining).
+    pub has_client: Arc<AtomicBool>,
+    /// Set to false when the persistent reader thread detects PTY EOF.
+    pub reader_alive: Arc<AtomicBool>,
+    /// Handle for the persistent PTY reader thread (joined on Drop).
+    reader_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Session {
@@ -37,11 +43,33 @@ impl Session {
         let pty = Pty::spawn(cols, rows)?;
         let screen = Arc::new(Mutex::new(Screen::new(cols, rows, history)));
         let dims = Arc::new(Mutex::new((cols, rows)));
-        // Start with 0 permits: the first connection skips the eviction block entirely
-        // (evict_tx is None), so it never waits. Each reader thread adds 1 permit on
-        // exit, ensuring subsequent connections wait for the previous reader to finish.
-        let reader_exited = Arc::new(tokio::sync::Semaphore::new(0));
-        Ok(Self { name, pty, screen, dims, evict_tx: None, reader_exited })
+        let screen_notify = Arc::new(tokio::sync::Notify::new());
+        let has_client = Arc::new(AtomicBool::new(false));
+        let reader_alive = Arc::new(AtomicBool::new(true));
+
+        // Spawn the persistent PTY reader thread.
+        let pty_reader = pty.clone_reader()?;
+        let pty_writer = pty.writer.clone();
+        let reader_handle = {
+            let screen = screen.clone();
+            let notify = screen_notify.clone();
+            let has_client = has_client.clone();
+            let reader_alive = reader_alive.clone();
+            let thread_name = format!("pty-reader-{}", name);
+            std::thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || {
+                    persistent_reader_loop(
+                        pty_reader, screen, pty_writer, notify, has_client, reader_alive,
+                    );
+                })?
+        };
+
+        Ok(Self {
+            name, pty, screen, dims, evict_tx: None,
+            screen_notify, has_client, reader_alive,
+            reader_handle: Some(reader_handle),
+        })
     }
 
     /// Check if the session's child process is still alive.
@@ -56,6 +84,69 @@ impl Session {
     }
 }
 
+/// Persistent PTY reader loop, runs for the entire session lifetime.
+/// Reads PTY output, feeds it through the screen's VTE parser, and notifies
+/// any connected client of new data.
+fn persistent_reader_loop(
+    mut reader: Box<dyn Read + Send>,
+    screen: Arc<Mutex<Screen>>,
+    pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    notify: Arc<tokio::sync::Notify>,
+    has_client: Arc<AtomicBool>,
+    reader_alive: Arc<AtomicBool>,
+) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                tracing::debug!("persistent pty reader: EOF");
+                break;
+            }
+            Ok(n) => {
+                let responses = {
+                    let mut scr = match screen.lock() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "screen mutex poisoned in reader loop");
+                            break;
+                        }
+                    };
+                    scr.process(&buf[..n]);
+                    let responses = scr.take_responses();
+                    // When no client is connected, drain pending data to prevent
+                    // unbounded growth. The data is already in the main scrollback.
+                    if !has_client.load(Ordering::Acquire) {
+                        let _ = scr.take_pending_scrollback();
+                        let _ = scr.take_passthrough();
+                    }
+                    responses
+                };
+
+                // Write PTY responses (DA, DSR replies) outside the screen lock.
+                if !responses.is_empty() {
+                    if let Ok(mut w) = pty_writer.lock() {
+                        for response in &responses {
+                            if let Err(e) = w.write_all(response) {
+                                tracing::warn!(error = %e, "failed to write response to PTY in reader loop");
+                                break;
+                            }
+                        }
+                        let _ = w.flush();
+                    }
+                }
+
+                notify.notify_one();
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "persistent pty reader: read error");
+                break;
+            }
+        }
+    }
+    reader_alive.store(false, Ordering::Release);
+    notify.notify_one(); // wake client to detect reader death
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         // Use lock() (blocking) — callers must ensure Session is dropped on
@@ -67,6 +158,10 @@ impl Drop for Session {
         // Evict any connected client
         if let Some(tx) = self.evict_tx.take() {
             let _ = tx.send(false);
+        }
+        // Wait for the reader thread to exit (it will see EOF after child kill).
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -161,6 +256,111 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    /// Helper: collect visible grid rows as trimmed strings.
+    fn screen_lines(screen: &crate::screen::Screen) -> Vec<String> {
+        screen.grid.cells.iter().map(|row| {
+            let s: String = row.iter().map(|c| c.c).collect();
+            s.trim_end().to_string()
+        }).collect()
+    }
+
+    /// Helper: collect scrollback history as plain text (ANSI stripped).
+    fn history_texts(screen: &crate::screen::Screen) -> Vec<String> {
+        screen.get_history().iter().map(|b| {
+            let s = String::from_utf8_lossy(b);
+            let mut out = String::new();
+            let mut in_esc = false;
+            for ch in s.chars() {
+                if in_esc {
+                    if ch.is_ascii_alphabetic() || ch == 'm' { in_esc = false; }
+                    continue;
+                }
+                if ch == '\x1b' { in_esc = true; continue; }
+                if ch >= ' ' { out.push(ch); }
+            }
+            out.trim_end().to_string()
+        }).collect()
+    }
+
+    /// Poll the screen until a predicate is satisfied or timeout expires.
+    fn wait_for_screen(
+        screen: &Arc<Mutex<crate::screen::Screen>>,
+        timeout: std::time::Duration,
+        pred: impl Fn(&crate::screen::Screen) -> bool,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if let Ok(scr) = screen.lock() {
+                if pred(&scr) { return true; }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Persistent reader processes PTY output while no client is connected.
+    ///
+    /// Simulates: client opens session running `sleep 2 && echo MARKER`,
+    /// disconnects immediately, reconnects after the command completes,
+    /// and finds MARKER in the screen or scrollback.
+    #[test]
+    fn persistent_reader_captures_output_without_client() {
+        let session = Session::new("test-persistent".into(), 80, 24, 1000).unwrap();
+
+        // No client connected — persistent reader is running with has_client=false.
+        assert!(!session.has_client.load(Ordering::Acquire));
+        assert!(session.reader_alive.load(Ordering::Acquire));
+
+        // Write a command that produces output after a short delay.
+        // Use a unique marker so we can find it unambiguously.
+        {
+            let mut w = session.pty.writer.lock().unwrap();
+            w.write_all(b"sleep 1 && echo PERSISTENT_READER_OK\n").unwrap();
+            w.flush().unwrap();
+        }
+
+        // Wait for the marker to appear in the screen (up to 5s).
+        let found = wait_for_screen(&session.screen, std::time::Duration::from_secs(5), |scr| {
+            let lines = screen_lines(scr);
+            let hist = history_texts(scr);
+            lines.iter().chain(hist.iter()).any(|l| l.contains("PERSISTENT_READER_OK"))
+        });
+
+        assert!(found, "persistent reader should capture PTY output even with no client connected");
+
+        // Reader should still be alive (shell is still running).
+        assert!(session.reader_alive.load(Ordering::Acquire));
+    }
+
+    /// After the child process exits, a reconnecting client sees the final
+    /// output and reader_alive is false.
+    #[test]
+    fn persistent_reader_detects_child_exit() {
+        let session = Session::new("test-exit".into(), 80, 24, 1000).unwrap();
+
+        // Tell the shell to print a marker and exit.
+        {
+            let mut w = session.pty.writer.lock().unwrap();
+            w.write_all(b"echo GOODBYE && exit\n").unwrap();
+            w.flush().unwrap();
+        }
+
+        // Wait for reader_alive to become false (child exited, PTY EOF).
+        let exited = wait_for_screen(&session.screen, std::time::Duration::from_secs(5), |_| {
+            !session.reader_alive.load(Ordering::Acquire)
+        });
+        assert!(exited, "reader_alive should become false after child exits");
+
+        // The marker should be visible in the screen or scrollback.
+        let scr = session.screen.lock().unwrap();
+        let lines = screen_lines(&scr);
+        let hist = history_texts(&scr);
+        let found = lines.iter().chain(hist.iter()).any(|l| l.contains("GOODBYE"));
+        assert!(found, "final output should be captured before reader exits");
+    }
 
     #[test]
     fn session_manager_create_and_list() {

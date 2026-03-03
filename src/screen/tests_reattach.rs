@@ -1059,3 +1059,595 @@ fn reattach_preserves_all_rows_after_partial_scroll() {
     assert!(!rendered.contains("Row1"), "reattach: Row1 should be scrolled off");
     assert!(!rendered.contains("Row2"), "reattach: Row2 should be scrolled off");
 }
+
+// ---------------------------------------------------------------
+// Bug: missing mode restoration on reattach (htop artifacts)
+// ---------------------------------------------------------------
+
+/// DECAWM (autowrap, ?7) must be restored on reattach.
+/// If an app disables autowrap and we reconnect, the outer terminal must
+/// also disable it — otherwise lines wrap unexpectedly.
+#[test]
+fn reattach_restores_autowrap_disabled() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b[?7l"); // disable autowrap
+    assert!(!screen.grid.modes.autowrap_mode);
+    let rendered = reattach_render(&screen);
+    assert!(rendered.contains("\x1b[?7l"),
+        "reattach: disabled autowrap (DECAWM) should be emitted in render output");
+}
+
+/// When autowrap is enabled (default), the render should explicitly set it
+/// so the outer terminal is in the correct state regardless of its previous state.
+#[test]
+fn reattach_restores_autowrap_enabled() {
+    let screen = Screen::new(80, 24, 100);
+    assert!(screen.grid.modes.autowrap_mode);
+    let rendered = reattach_render(&screen);
+    assert!(rendered.contains("\x1b[?7h"),
+        "reattach: enabled autowrap (DECAWM) should be emitted in render output");
+}
+
+/// G0 charset (line drawing) must be restored on reattach.
+/// Apps like `mc`, `vim`, `htop` use DEC line drawing for box borders.
+/// If the charset isn't restored, subsequent output uses ASCII instead of
+/// box-drawing characters.
+#[test]
+fn reattach_restores_g0_line_drawing_charset() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b(0"); // G0 = DEC line drawing
+    assert_eq!(screen.grid.modes.g0_charset, super::grid::Charset::LineDrawing);
+    let rendered = reattach_render(&screen);
+    // ESC ( 0 designates G0 as line drawing
+    assert!(rendered.contains("\x1b(0"),
+        "reattach: G0 line drawing charset should be restored");
+}
+
+/// G0 ASCII charset (default) should be explicitly set so the outer terminal
+/// is reset even if it was previously in line drawing mode.
+#[test]
+fn reattach_restores_g0_ascii_charset() {
+    let screen = Screen::new(80, 24, 100);
+    assert_eq!(screen.grid.modes.g0_charset, super::grid::Charset::Ascii);
+    let rendered = reattach_render(&screen);
+    // ESC ( B designates G0 as ASCII
+    assert!(rendered.contains("\x1b(B"),
+        "reattach: G0 ASCII charset should be explicitly set");
+}
+
+/// G1 line drawing charset must be restored.
+#[test]
+fn reattach_restores_g1_line_drawing_charset() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b)0"); // G1 = DEC line drawing
+    assert_eq!(screen.grid.modes.g1_charset, super::grid::Charset::LineDrawing);
+    let rendered = reattach_render(&screen);
+    assert!(rendered.contains("\x1b)0"),
+        "reattach: G1 line drawing charset should be restored");
+}
+
+/// Active charset (G1 via SO) must be restored on reattach.
+/// If the app switched to G1 with SO (0x0E), we must re-emit SO so the
+/// outer terminal maps characters through G1.
+#[test]
+fn reattach_restores_active_charset_g1() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x0e"); // SO — activate G1
+    assert_eq!(screen.grid.modes.active_charset, super::grid::ActiveCharset::G1);
+    let rendered = reattach_render(&screen);
+    // The render output should contain SO (0x0E) to activate G1
+    assert!(rendered.as_bytes().contains(&0x0E),
+        "reattach: active charset G1 (SO) should be restored");
+}
+
+/// When active charset is G0 (default), SI (0x0F) should be emitted to
+/// ensure the outer terminal isn't stuck in G1 from a previous session.
+#[test]
+fn reattach_restores_active_charset_g0() {
+    let screen = Screen::new(80, 24, 100);
+    assert_eq!(screen.grid.modes.active_charset, super::grid::ActiveCharset::G0);
+    let rendered = reattach_render(&screen);
+    // The render output should contain SI (0x0F) to ensure G0 is active
+    assert!(rendered.as_bytes().contains(&0x0F),
+        "reattach: active charset G0 (SI) should be explicitly set");
+}
+
+/// Incremental render (mode delta) must detect autowrap changes.
+#[test]
+fn mode_delta_detects_autowrap_change() {
+    let mut grid = super::grid::Grid::new(10, 3);
+    let mut cache = super::render::RenderCache::new();
+    // Initial render with default modes (autowrap=true)
+    let _ = super::render::render_screen(&grid, "", true, &mut cache);
+
+    // Disable autowrap
+    grid.modes.autowrap_mode = false;
+    let result = super::render::render_screen(&grid, "", false, &mut cache);
+    let text = String::from_utf8_lossy(&result);
+    assert!(text.contains("\x1b[?7l"),
+        "mode delta should emit DECAWM disable when autowrap changes to false");
+}
+
+/// Incremental render (mode delta) must detect charset changes.
+#[test]
+fn mode_delta_detects_charset_change() {
+    let mut grid = super::grid::Grid::new(10, 3);
+    let mut cache = super::render::RenderCache::new();
+    let _ = super::render::render_screen(&grid, "", true, &mut cache);
+
+    // Switch G0 to line drawing
+    grid.modes.g0_charset = super::grid::Charset::LineDrawing;
+    let result = super::render::render_screen(&grid, "", false, &mut cache);
+    let text = String::from_utf8_lossy(&result);
+    assert!(text.contains("\x1b(0"),
+        "mode delta should emit G0 line drawing when charset changes");
+}
+
+// ---------------------------------------------------------------
+// Simulated htop reattach scenarios
+// ---------------------------------------------------------------
+
+/// Simulate htop-like screen state (alt screen, colors, box drawing)
+/// and verify multiple reattach cycles produce correct output.
+#[test]
+fn reattach_htop_multiple_reconnections() {
+    let mut screen = Screen::new(40, 10, 100);
+
+    // Simulate htop: enter alt screen, set up UI
+    screen.process(b"\x1b[?1049h");  // enter alt screen
+    screen.process(b"\x1b[?25l");    // hide cursor
+
+    // Draw a colored header
+    screen.process(b"\x1b[1;1H\x1b[1;37;44m CPU [");
+    screen.process(b"\x1b[32m|||||||||\x1b[37m..........");
+    screen.process(b"\x1b[37;44m 45.2%]\x1b[0m");
+
+    // Draw some process lines
+    screen.process(b"\x1b[3;1H\x1b[32m  PID USER      PRI  NI\x1b[0m");
+    screen.process(b"\x1b[4;1H    1 root       20   0");
+
+    // First reattach — should be correct
+    let rendered1 = reattach_render(&screen);
+    assert!(rendered1.contains("CPU"), "first reattach: header content");
+    assert!(rendered1.contains("PID"), "first reattach: column headers");
+    assert!(rendered1.contains("root"), "first reattach: process data");
+
+    // Simulate htop updating between reconnections
+    screen.process(b"\x1b[1;1H\x1b[1;37;44m CPU [");
+    screen.process(b"\x1b[32m|||||||\x1b[37m...........");
+    screen.process(b"\x1b[37;44m 38.1%]\x1b[0m");
+
+    // Second reattach
+    let rendered2 = reattach_render(&screen);
+    assert!(rendered2.contains("38.1%"), "second reattach: updated percentage");
+    assert!(rendered2.contains("PID"), "second reattach: column headers still present");
+
+    // Third reattach with another update
+    screen.process(b"\x1b[1;1H\x1b[1;37;44m CPU [");
+    screen.process(b"\x1b[32m|||||\x1b[37m.............");
+    screen.process(b"\x1b[37;44m 27.5%]\x1b[0m");
+
+    let rendered3 = reattach_render(&screen);
+    assert!(rendered3.contains("27.5%"), "third reattach: updated percentage");
+    assert!(rendered3.contains("PID"), "third reattach: column headers still present");
+    assert!(rendered3.contains("root"), "third reattach: process data still present");
+}
+
+/// VTE parser state must not accumulate corruption across process() calls.
+/// Simulates data loss at connection boundary: a chunk ends mid-escape-sequence,
+/// and the next chunk starts with unrelated data.
+#[test]
+fn vte_parser_recovers_from_partial_escape_sequence() {
+    let mut screen = Screen::new(40, 5, 0);
+
+    // Normal output — sets up known state
+    screen.process(b"\x1b[1;1HBefore");
+
+    // Simulate a partial escape sequence (as if data was lost mid-sequence).
+    // Feed just the CSI introducer without the final byte.
+    screen.process(b"\x1b[38;5;");
+
+    // Now feed new data as if from a new connection's first read.
+    // This data starts with a digit that the parser will try to consume
+    // as part of the incomplete CSI. The parser should eventually recover.
+    screen.process(b"\x1b[2;1HAfter");
+
+    // The "After" text should appear correctly on row 2
+    let row2: String = screen.grid.cells[1].iter().map(|c| c.c).collect();
+    assert!(row2.starts_with("After"),
+        "VTE parser should recover from partial escape: row 2 = {:?}", row2.trim());
+}
+
+/// After a partial escape sequence, subsequent SGR commands should work correctly.
+#[test]
+fn vte_parser_sgr_correct_after_partial_sequence() {
+    let mut screen = Screen::new(40, 5, 0);
+
+    // Write initial content with a color
+    screen.process(b"\x1b[31mRed\x1b[0m");
+
+    // Simulate partial CSI (data loss)
+    screen.process(b"\x1b[1;");
+
+    // New data with a color change
+    screen.process(b"\x1b[32mGreen\x1b[0m");
+
+    // Find "Green" in the grid and verify its color
+    let mut found_green = false;
+    for row in &screen.grid.cells {
+        for (i, cell) in row.iter().enumerate() {
+            if cell.c == 'G' {
+                // Check subsequent cells spell "Green"
+                let word: String = row[i..].iter().take(5).map(|c| c.c).collect();
+                if word == "Green" {
+                    assert_eq!(cell.style.fg, Some(super::style::Color::Indexed(2)),
+                        "Green text should have green foreground after parser recovery");
+                    found_green = true;
+                    break;
+                }
+            }
+        }
+        if found_green { break; }
+    }
+    assert!(found_green, "Should find 'Green' text in grid after parser recovery");
+}
+
+/// Simulates the exact eviction scenario: screen has htop running,
+/// some data is "lost" (not processed), then a full render + new data arrives.
+#[test]
+fn reattach_after_simulated_data_loss() {
+    let mut screen = Screen::new(40, 10, 0);
+
+    // Enter alt screen (htop)
+    screen.process(b"\x1b[?1049h");
+
+    // Draw initial htop frame
+    screen.process(b"\x1b[1;1H\x1b[32mCPU: 50%\x1b[0m");
+    screen.process(b"\x1b[2;1H\x1b[33mMem: 2G/8G\x1b[0m");
+    screen.process(b"\x1b[3;1HPID  COMMAND");
+
+    // "Lost" data: partial escape sequence that never completes
+    // (simulates old reader consuming data but async task dropping it)
+    screen.process(b"\x1b[4;1H\x1b[38;2;");
+
+    // Verify screen is still usable after partial escape
+    let mut cache = RenderCache::new();
+    let render1 = screen.render(true, &mut cache);
+    assert!(!render1.is_empty(), "render after partial escape should work");
+
+    // New htop frame arrives (as if after reconnection)
+    screen.process(b"\x1b[1;1H\x1b[32mCPU: 65%\x1b[0m");
+    screen.process(b"\x1b[2;1H\x1b[33mMem: 3G/8G\x1b[0m");
+    screen.process(b"\x1b[3;1HPID  COMMAND");
+    screen.process(b"\x1b[4;1H  42 htop");
+
+    // Second render should show updated content
+    cache = RenderCache::new();
+    let render2 = screen.render(true, &mut cache);
+    let text = String::from_utf8_lossy(&render2);
+
+    assert!(text.contains("65%"), "updated CPU should appear after data loss recovery");
+    assert!(text.contains("3G/8G"), "updated Mem should appear after data loss recovery");
+    assert!(text.contains("htop"), "process list should appear after data loss recovery");
+}
+
+/// Verify that the render output includes ALL necessary sequences to fully
+/// initialize a fresh terminal. This catches missing mode restoration.
+#[test]
+fn reattach_render_is_self_contained() {
+    let mut screen = Screen::new(80, 24, 100);
+
+    // Set up non-default state for everything
+    screen.process(b"\x1b[?7l");     // autowrap off
+    screen.process(b"\x1b(0");       // G0 = line drawing
+    screen.process(b"\x1b)0");       // G1 = line drawing
+    screen.process(b"\x0e");         // SO — activate G1
+    screen.process(b"\x1b[?1h");     // cursor key mode
+    screen.process(b"\x1b[?2004h");  // bracketed paste
+    screen.process(b"\x1b[?1003h");  // mouse any-event
+    screen.process(b"\x1b[?1006h");  // SGR mouse encoding
+    screen.process(b"\x1b[?1004h");  // focus reporting
+    screen.process(b"\x1b=");        // keypad app mode
+    screen.process(b"\x1b[5 q");     // blinking bar cursor
+    screen.process(b"\x1b[?25l");    // hide cursor
+
+    let rendered = reattach_render(&screen);
+
+    // Every non-default mode must be present in the render output
+    assert!(rendered.contains("\x1b[?7l"), "self-contained: DECAWM off");
+    assert!(rendered.contains("\x1b(0"), "self-contained: G0 line drawing");
+    assert!(rendered.contains("\x1b)0"), "self-contained: G1 line drawing");
+    assert!(rendered.as_bytes().contains(&0x0E), "self-contained: SO (activate G1)");
+    assert!(rendered.contains("\x1b[?1h"), "self-contained: DECCKM");
+    assert!(rendered.contains("\x1b[?2004h"), "self-contained: bracketed paste");
+    assert!(rendered.contains("\x1b[?1003h"), "self-contained: mouse mode");
+    assert!(rendered.contains("\x1b[?1006h"), "self-contained: SGR encoding");
+    assert!(rendered.contains("\x1b[?1004h"), "self-contained: focus reporting");
+    assert!(rendered.contains("\x1b="), "self-contained: keypad app mode");
+    assert!(rendered.contains("\x1b[5 q"), "self-contained: cursor shape");
+    assert!(!rendered.contains("\x1b[?25h"), "self-contained: cursor hidden");
+}
+
+// ---------------------------------------------------------------
+// Bug: history re-injection in alt screen causes accumulating
+// blank lines in outer terminal scrollback on each reconnect
+// ---------------------------------------------------------------
+
+/// In alt screen mode, get_history() still returns main-screen scrollback.
+/// But send_initial_state must NOT inject it — the scrollback is irrelevant
+/// while the alt screen app (htop/vim) is running, and re-injecting on
+/// every reconnect accumulates duplicate lines in the outer terminal.
+#[test]
+fn alt_screen_skips_history_on_reattach() {
+    let mut screen = Screen::new(20, 5, 100);
+
+    // Generate scrollback on main screen
+    for i in 0..10 {
+        screen.process(format!("line{}\r\n", i).as_bytes());
+    }
+    assert!(!screen.get_history().is_empty(), "should have scrollback");
+
+    // Enter alt screen (htop)
+    screen.process(b"\x1b[?1049h");
+    screen.process(b"Alt content");
+    assert!(screen.in_alt_screen());
+
+    // Scrollback still exists internally
+    assert!(!screen.get_history().is_empty(),
+        "scrollback should persist internally in alt screen");
+
+    // But in_alt_screen() should be true so callers can skip injection
+    assert!(screen.in_alt_screen(),
+        "in_alt_screen() must be true so send_initial_state skips history");
+}
+
+/// After exiting alt screen, history should be available again for injection.
+#[test]
+fn history_available_after_alt_screen_exit() {
+    let mut screen = Screen::new(20, 5, 100);
+
+    // Generate scrollback
+    for i in 0..10 {
+        screen.process(format!("line{}\r\n", i).as_bytes());
+    }
+
+    // Alt screen roundtrip
+    screen.process(b"\x1b[?1049h");
+    screen.process(b"\x1b[?1049l");
+
+    assert!(!screen.in_alt_screen());
+    assert!(!screen.get_history().is_empty(),
+        "scrollback should be available after exiting alt screen");
+}
+
+/// Verify that the flush newlines (rows-1) are only emitted when history
+/// is non-empty. With empty history (alt screen case), no flush should occur.
+#[test]
+fn no_flush_newlines_without_history() {
+    let mut screen = Screen::new(20, 5, 100);
+    screen.process(b"\x1b[?1049h"); // enter alt screen
+    screen.process(b"Alt content");
+
+    // Render as if on reattach — no history means no flush newlines
+    let mut cache = RenderCache::new();
+    let render = screen.render(true, &mut cache);
+
+    // Count newlines before the first ESC sequence (flush newlines would be
+    // raw \n bytes before the sync-begin \x1b[?2026h)
+    let leading_newlines = render.iter().take_while(|&&b| b == b'\n').count();
+    assert_eq!(leading_newlines, 0,
+        "no flush newlines should be emitted when history is empty (alt screen)");
+}
+
+// ---------------------------------------------------------------
+// Scroll region (DECSTBM) restoration on reattach
+// ---------------------------------------------------------------
+
+/// Helper: extract the DECSTBM sequence (ESC[top;bottomr) from render output.
+/// Returns Some((top, bottom)) as 1-indexed values, or None if not found.
+fn extract_decstbm(rendered: &str) -> Option<(u16, u16)> {
+    let bytes = rendered.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let start = i + 2;
+            let mut j = start;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'r' {
+                let params = &rendered[start..j];
+                let parts: Vec<&str> = params.split(';').collect();
+                if parts.len() == 2 {
+                    if let (Ok(t), Ok(b)) = (parts[0].parse::<u16>(), parts[1].parse::<u16>()) {
+                        return Some((t, b));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// On reattach, a non-default scroll region must be restored via DECSTBM.
+#[test]
+fn reattach_restores_custom_scroll_region() {
+    let mut screen = Screen::new(80, 24, 100);
+    // Set scroll region to rows 2-23 (like htop: header at row 1, footer at row 24)
+    screen.process(b"\x1b[2;23r");
+    assert_eq!(screen.grid.scroll_top, 1);    // 0-based
+    assert_eq!(screen.grid.scroll_bottom, 22); // 0-based
+
+    let rendered = reattach_render(&screen);
+    let decstbm = extract_decstbm(&rendered);
+    assert_eq!(decstbm, Some((2, 23)),
+        "reattach: DECSTBM should restore scroll region 2;23");
+}
+
+/// Even a full-screen scroll region should be emitted on full render
+/// so the outer terminal's state is explicitly set.
+#[test]
+fn reattach_emits_full_screen_scroll_region() {
+    let screen = Screen::new(80, 24, 100);
+    // Default scroll region: full screen (1;24)
+    let rendered = reattach_render(&screen);
+    let decstbm = extract_decstbm(&rendered);
+    assert_eq!(decstbm, Some((1, 24)),
+        "reattach: DECSTBM should emit full-screen scroll region");
+}
+
+/// DECSTBM resets cursor to home, so it must appear BEFORE the final cursor
+/// position sequence. Otherwise cursor would be wrong.
+#[test]
+fn reattach_scroll_region_before_cursor_position() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b[2;23r");
+    screen.process(b"\x1b[10;5H"); // position cursor at row 10, col 5
+
+    let rendered = reattach_render(&screen);
+    let decstbm_pos = rendered.find(";23r")
+        .expect("DECSTBM should be present in render output");
+    // The final cursor CUP: ESC[10;5H
+    // Find it after the DECSTBM
+    let after_decstbm = &rendered[decstbm_pos..];
+    assert!(after_decstbm.contains("\x1b[10;5H"),
+        "cursor position must appear AFTER DECSTBM (which resets cursor)");
+}
+
+/// Simulate htop layout: fixed header, scrollable middle, fixed footer.
+/// After reattach, the scroll region must be preserved to keep the layout intact.
+#[test]
+fn reattach_htop_scroll_region_layout() {
+    let mut screen = Screen::new(80, 24, 100);
+    // Enter alt screen (htop)
+    screen.process(b"\x1b[?1049h");
+    // Set scroll region to rows 4-22 (header=rows 1-3, footer=row 23-24)
+    screen.process(b"\x1b[4;22r");
+    // Write header content (row 1)
+    screen.process(b"\x1b[1;1HCPU [||||||||  50%]");
+    // Write footer content (row 24)
+    screen.process(b"\x1b[24;1HF1Help F2Setup F10Quit");
+    // Position cursor in scrollable area
+    screen.process(b"\x1b[10;1H");
+
+    let rendered = reattach_render(&screen);
+    let decstbm = extract_decstbm(&rendered);
+    assert_eq!(decstbm, Some((4, 22)),
+        "reattach: htop scroll region (4;22) must be restored");
+
+    // Both header and footer content should be present
+    assert!(rendered.contains("CPU"), "header content should be preserved");
+    assert!(rendered.contains("F1Help"), "footer content should be preserved");
+}
+
+/// Incremental render should detect scroll region changes.
+#[test]
+fn mode_delta_detects_scroll_region_change() {
+    let mut screen = Screen::new(80, 24, 100);
+    let mut cache = RenderCache::new();
+    // Initial full render (default scroll region)
+    let _ = screen.render(true, &mut cache);
+
+    // Now change scroll region
+    screen.process(b"\x1b[5;20r");
+    let result = screen.render(false, &mut cache);
+    let text = String::from_utf8_lossy(&result);
+
+    // Should contain the new DECSTBM
+    let decstbm = extract_decstbm(&text);
+    assert_eq!(decstbm, Some((5, 20)),
+        "incremental render should detect scroll region change");
+}
+
+/// When scroll region hasn't changed, incremental render should skip DECSTBM.
+#[test]
+fn mode_delta_skips_unchanged_scroll_region() {
+    let screen = Screen::new(80, 24, 100);
+    let mut cache = RenderCache::new();
+    // Initial full render
+    let _ = screen.render(true, &mut cache);
+
+    // Render again with no scroll region change
+    let result = screen.render(false, &mut cache);
+    let text = String::from_utf8_lossy(&result);
+
+    // Should NOT contain DECSTBM (no change)
+    let decstbm = extract_decstbm(&text);
+    assert!(decstbm.is_none(),
+        "unchanged scroll region should not emit DECSTBM on incremental render");
+}
+
+// ---------------------------------------------------------------
+// VTE parser desync from data loss (channel eviction scenario)
+// ---------------------------------------------------------------
+
+/// Demonstrate that dropping PTY bytes mid-stream corrupts grid state.
+/// This is the root cause of artifacts after reconnection: the eviction
+/// path dropped unprocessed channel data, losing escape sequences.
+#[test]
+fn data_loss_corrupts_scroll_region() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b[?1049h"); // enter alt screen
+
+    // htop sets scroll region and draws header/footer
+    screen.process(b"\x1b[4;22r");
+    screen.process(b"\x1b[1;1HCPU [||||]");
+    screen.process(b"\x1b[24;1HF1Help");
+
+    // Now simulate a reconnection where DECSTBM is lost:
+    // htop sends a batch with cursor positioning + DECSTBM + content,
+    // but the DECSTBM bytes are in a channel chunk that gets dropped.
+    let mut screen_with_loss = Screen::new(80, 24, 100);
+    screen_with_loss.process(b"\x1b[?1049h");
+    // SKIP: b"\x1b[4;22r" — lost in eviction
+    screen_with_loss.process(b"\x1b[1;1HCPU [||||]");
+    screen_with_loss.process(b"\x1b[24;1HF1Help");
+
+    // Without the DECSTBM, scroll region defaults to full screen
+    assert_eq!(screen_with_loss.grid.scroll_top, 0,
+        "lost DECSTBM leaves scroll region at default");
+    assert_eq!(screen_with_loss.grid.scroll_bottom, 23,
+        "lost DECSTBM leaves scroll region at default");
+
+    // Now when htop scrolls at the bottom of its expected scroll region,
+    // the full screen scrolls instead, corrupting header/footer
+    screen_with_loss.process(b"\x1b[22;1H"); // cursor at htop's scroll_bottom
+    screen_with_loss.process(b"\n"); // LF — should scroll within region
+
+    // With correct scroll region (4;22), row 3 would scroll out, header stays
+    // With wrong scroll region (full screen), cursor just moves down (row 23)
+    // because cursor_y (21) != scroll_bottom (23)
+    // The real corruption happens over many cycles as htop's operations
+    // assume a different scroll region than what the grid has.
+    assert_ne!(screen.grid.scroll_top, screen_with_loss.grid.scroll_top,
+        "data loss should cause scroll region mismatch");
+}
+
+/// Full data processing (no loss) keeps grid perfectly in sync.
+#[test]
+fn full_data_processing_keeps_grid_in_sync() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b[?1049h");
+    screen.process(b"\x1b[4;22r");
+    screen.process(b"\x1b[1;1HCPU [||||||||  50%]");
+    screen.process(b"\x1b[24;1HF1Help F2Setup F10Quit");
+
+    // Fill process list area
+    for i in 4..=22 {
+        screen.process(format!("\x1b[{};1Hprocess_{:02}", i, i).as_bytes());
+    }
+
+    // Verify everything is correct
+    assert_eq!(screen.grid.scroll_top, 3); // 0-based
+    assert_eq!(screen.grid.scroll_bottom, 21); // 0-based
+    assert_eq!(screen.grid.cells[0][0].c, 'C'); // header
+    assert_eq!(screen.grid.cells[23][0].c, 'F'); // footer
+
+    // Scroll within region — header and footer must be preserved
+    screen.process(b"\x1b[22;1H\n"); // LF at scroll_bottom
+    assert_eq!(screen.grid.cells[0][0].c, 'C', "header must survive scroll");
+    assert_eq!(screen.grid.cells[23][0].c, 'F', "footer must survive scroll");
+    // Row 3 (old top of region) should have shifted up
+    assert_eq!(screen.grid.cells[3][0].c, 'p', "row 4 content shifted to row 3");
+}

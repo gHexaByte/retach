@@ -2,13 +2,14 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 
 use super::cell::Cell;
-use super::grid::{Grid, TerminalModes};
+use super::grid::{ActiveCharset, Charset, Grid, TerminalModes};
 use super::style::{Style, write_u16};
 
 /// Per-connection render cache for dirty tracking and mode delta.
 pub struct RenderCache {
     row_hashes: Vec<u64>,
     last_modes: Option<TerminalModes>,
+    last_scroll_region: Option<(u16, u16)>,
     last_title: String,
 }
 
@@ -17,6 +18,7 @@ impl RenderCache {
         Self {
             row_hashes: Vec::new(),
             last_modes: None,
+            last_scroll_region: None,
             last_title: String::new(),
         }
     }
@@ -25,6 +27,7 @@ impl RenderCache {
     pub fn invalidate(&mut self) {
         self.row_hashes.clear();
         self.last_modes = None;
+        self.last_scroll_region = None;
         self.last_title.clear();
     }
 }
@@ -77,6 +80,17 @@ fn emit_dec_mode(out: &mut Vec<u8>, code: u16, enabled: bool) {
     out.push(if enabled { b'h' } else { b'l' });
 }
 
+/// Emit a character set designation: ESC `slot` `final`.
+/// `slot` is `(` for G0, `)` for G1.
+fn emit_charset(out: &mut Vec<u8>, slot: u8, charset: Charset) {
+    out.push(0x1b);
+    out.push(slot);
+    out.push(match charset {
+        Charset::Ascii => b'B',
+        Charset::LineDrawing => b'0',
+    });
+}
+
 /// Emit escape sequences for one mode, unconditionally.
 fn emit_mode(out: &mut Vec<u8>, modes: &TerminalModes) {
     // Cursor shape (DECSCUSR)
@@ -86,6 +100,7 @@ fn emit_mode(out: &mut Vec<u8>, modes: &TerminalModes) {
 
     // Boolean DEC private modes
     emit_dec_mode(out, 1, modes.cursor_key_mode);
+    emit_dec_mode(out, 7, modes.autowrap_mode);
     emit_dec_mode(out, 2004, modes.bracketed_paste);
 
     // Mouse mode: always reset all first, then enable the active one
@@ -101,6 +116,16 @@ fn emit_mode(out: &mut Vec<u8>, modes: &TerminalModes) {
 
     // Keypad mode (not DEC private — uses ESC = / ESC >)
     out.extend_from_slice(if modes.keypad_app_mode { b"\x1b=" } else { b"\x1b>" });
+
+    // Character set designations (G0/G1)
+    emit_charset(out, b'(', modes.g0_charset);
+    emit_charset(out, b')', modes.g1_charset);
+
+    // Active charset: SI (0x0F) for G0, SO (0x0E) for G1
+    out.push(match modes.active_charset {
+        ActiveCharset::G0 => 0x0F, // SI
+        ActiveCharset::G1 => 0x0E, // SO
+    });
 }
 
 /// Emit mouse encoding sequence for the given encoding mode.
@@ -123,6 +148,9 @@ fn emit_mode_delta(out: &mut Vec<u8>, modes: &TerminalModes, prev: &TerminalMode
     if modes.cursor_key_mode != prev.cursor_key_mode {
         emit_dec_mode(out, 1, modes.cursor_key_mode);
     }
+    if modes.autowrap_mode != prev.autowrap_mode {
+        emit_dec_mode(out, 7, modes.autowrap_mode);
+    }
     if modes.bracketed_paste != prev.bracketed_paste {
         emit_dec_mode(out, 2004, modes.bracketed_paste);
     }
@@ -143,6 +171,18 @@ fn emit_mode_delta(out: &mut Vec<u8>, modes: &TerminalModes, prev: &TerminalMode
     }
     if modes.keypad_app_mode != prev.keypad_app_mode {
         out.extend_from_slice(if modes.keypad_app_mode { b"\x1b=" } else { b"\x1b>" });
+    }
+    if modes.g0_charset != prev.g0_charset {
+        emit_charset(out, b'(', modes.g0_charset);
+    }
+    if modes.g1_charset != prev.g1_charset {
+        emit_charset(out, b')', modes.g1_charset);
+    }
+    if modes.active_charset != prev.active_charset {
+        out.push(match modes.active_charset {
+            ActiveCharset::G0 => 0x0F, // SI
+            ActiveCharset::G1 => 0x0E, // SO
+        });
     }
 }
 
@@ -250,7 +290,19 @@ fn render_screen_impl(
         out.extend_from_slice(b"\x1b[0m\x1b[K");
     }
 
-    // Cursor position
+    // Scroll region (DECSTBM): must be emitted BEFORE cursor position because
+    // setting the scroll region resets the cursor to home.
+    let scroll_region = (grid.scroll_top, grid.scroll_bottom);
+    if full || cache.last_scroll_region != Some(scroll_region) {
+        out.extend_from_slice(b"\x1b[");
+        write_u16(&mut out, grid.scroll_top + 1);
+        out.push(b';');
+        write_u16(&mut out, grid.scroll_bottom + 1);
+        out.push(b'r');
+        cache.last_scroll_region = Some(scroll_region);
+    }
+
+    // Cursor position (after scroll region, since DECSTBM resets cursor)
     out.extend_from_slice(b"\x1b[");
     write_u16(&mut out, grid.cursor_y + 1);
     out.push(b';');

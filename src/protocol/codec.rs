@@ -331,4 +331,162 @@ mod tests {
         let result: Result<ClientMsg, _> = read_one_message(&mut read_half).await;
         assert!(result.is_err(), "should reject oversized buffer accumulation");
     }
+
+    #[test]
+    fn decode_frame_zero_length() {
+        // A frame claiming 0 bytes should be decodable (returns 0 bytes of data)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let result = decode_frame(&buf).unwrap();
+        assert!(result.is_some());
+        let (data, consumed) = result.unwrap();
+        assert_eq!(data.len(), 0);
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn decode_frame_empty_buffer() {
+        let result = decode_frame(&[]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn decode_frame_1_byte_buffer() {
+        let result = decode_frame(&[0x00]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn decode_frame_3_byte_buffer() {
+        let result = decode_frame(&[0x00, 0x00, 0x00]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn frame_reader_with_leftover() {
+        let msg = ClientMsg::Detach;
+        let encoded = encode(&msg).unwrap();
+        let mut reader = FrameReader::with_leftover(encoded);
+        let result: Option<ClientMsg> = reader.decode_next().unwrap();
+        assert!(result.is_some());
+        match result.unwrap() {
+            ClientMsg::Detach => {}
+            other => panic!("expected Detach, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn frame_reader_multiple_messages_in_buffer() {
+        let msg1 = ClientMsg::Detach;
+        let msg2 = ClientMsg::ListSessions;
+        let msg3 = ClientMsg::RefreshScreen;
+        let mut buf = encode(&msg1).unwrap();
+        buf.extend_from_slice(&encode(&msg2).unwrap());
+        buf.extend_from_slice(&encode(&msg3).unwrap());
+
+        let mut reader = FrameReader::with_leftover(buf);
+        let r1: Option<ClientMsg> = reader.decode_next().unwrap();
+        assert!(matches!(r1, Some(ClientMsg::Detach)));
+        let r2: Option<ClientMsg> = reader.decode_next().unwrap();
+        assert!(matches!(r2, Some(ClientMsg::ListSessions)));
+        let r3: Option<ClientMsg> = reader.decode_next().unwrap();
+        assert!(matches!(r3, Some(ClientMsg::RefreshScreen)));
+        let r4: Option<ClientMsg> = reader.decode_next().unwrap();
+        assert!(r4.is_none());
+    }
+
+    #[test]
+    fn frame_reader_leftover_after_decode() {
+        let msg = ClientMsg::Detach;
+        let mut buf = encode(&msg).unwrap();
+        buf.extend_from_slice(&[0xDE, 0xAD]); // trailing junk
+
+        let mut reader = FrameReader::with_leftover(buf);
+        let _: ClientMsg = reader.decode_next().unwrap().unwrap();
+        let leftover = reader.into_leftover();
+        assert_eq!(leftover, &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn encode_all_client_msg_variants() {
+        // Ensure all ClientMsg variants can be encoded and decoded
+        let messages: Vec<ClientMsg> = vec![
+            ClientMsg::Input(vec![0x61, 0x62]),
+            ClientMsg::Resize { cols: 120, rows: 40 },
+            ClientMsg::Detach,
+            ClientMsg::ListSessions,
+            ClientMsg::Connect {
+                name: "test".into(),
+                history: 500,
+                cols: 80,
+                rows: 24,
+                mode: ConnectMode::CreateOrAttach,
+            },
+            ClientMsg::KillSession { name: "kill-me".into() },
+            ClientMsg::RefreshScreen,
+        ];
+        for msg in &messages {
+            let encoded = encode(msg).unwrap();
+            let (data, _) = decode_frame(&encoded).unwrap().unwrap();
+            let _decoded: ClientMsg = decode(data).unwrap();
+        }
+    }
+
+    #[test]
+    fn encode_all_server_msg_variants() {
+        let messages: Vec<ServerMsg> = vec![
+            ServerMsg::ScrollbackLine(vec![0x41]),
+            ServerMsg::ScreenUpdate(vec![0x1b, 0x5b, 0x48]),
+            ServerMsg::History(vec![vec![0x41], vec![0x42]]),
+            ServerMsg::SessionList(vec![SessionInfo {
+                name: "s1".into(), pid: 42, cols: 80, rows: 24,
+            }]),
+            ServerMsg::SessionEnded,
+            ServerMsg::Error("test error".into()),
+            ServerMsg::Connected { name: "test".into(), new_session: true },
+            ServerMsg::SessionKilled { name: "dead".into() },
+            ServerMsg::Passthrough(vec![0x07]),
+        ];
+        for msg in &messages {
+            let encoded = encode(msg).unwrap();
+            let (data, _) = decode_frame(&encoded).unwrap().unwrap();
+            let _decoded: ServerMsg = decode(data).unwrap();
+        }
+    }
+
+    #[test]
+    fn encode_empty_collections() {
+        // Empty vectors, empty strings
+        let msg = ServerMsg::History(vec![]);
+        let encoded = encode(&msg).unwrap();
+        let (data, _) = decode_frame(&encoded).unwrap().unwrap();
+        let decoded: ServerMsg = decode(data).unwrap();
+        match decoded {
+            ServerMsg::History(lines) => assert!(lines.is_empty()),
+            other => panic!("expected History, got {:?}", other),
+        }
+
+        let msg = ServerMsg::SessionList(vec![]);
+        let encoded = encode(&msg).unwrap();
+        let (data, _) = decode_frame(&encoded).unwrap().unwrap();
+        let decoded: ServerMsg = decode(data).unwrap();
+        match decoded {
+            ServerMsg::SessionList(list) => assert!(list.is_empty()),
+            other => panic!("expected SessionList, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn encode_large_input() {
+        // Large input message (64KB)
+        let data = vec![0x41u8; 65536];
+        let msg = ClientMsg::Input(data.clone());
+        let encoded = encode(&msg).unwrap();
+        let (frame_data, _) = decode_frame(&encoded).unwrap().unwrap();
+        let decoded: ClientMsg = decode(frame_data).unwrap();
+        match decoded {
+            ClientMsg::Input(d) => assert_eq!(d.len(), 65536),
+            other => panic!("expected Input, got {:?}", other),
+        }
+    }
 }
