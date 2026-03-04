@@ -7,10 +7,8 @@ pub mod grid;
 pub mod performer;
 pub mod render;
 
-use std::collections::VecDeque;
 use vte::Parser;
 
-use cell::Cell;
 use grid::Grid;
 use performer::ScreenPerformer;
 use render::render_screen;
@@ -34,7 +32,7 @@ pub struct SavedCursor {
 pub struct ScreenState {
     pub current_style: Style,
     pub in_alt_screen: bool,
-    pub saved_grid: Option<std::collections::VecDeque<Vec<Cell>>>,
+    pub saved_grid: Option<grid::SavedGrid>,
     pub saved_cursor_state: Option<SavedCursor>,
     pub saved_modes: Option<grid::TerminalModes>,
     pub pending_responses: Vec<Vec<u8>>,
@@ -63,9 +61,6 @@ impl Default for ScreenState {
 pub struct Screen {
     pub grid: Grid,
     state: ScreenState,
-    scrollback: VecDeque<Vec<Cell>>,
-    scrollback_limit: usize,
-    pending_scrollback: VecDeque<Vec<Cell>>,
     parser: Parser,
 }
 
@@ -73,11 +68,8 @@ impl Screen {
     /// Create a screen with the given dimensions and scrollback line limit.
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize) -> Self {
         Self {
-            grid: Grid::new(cols, rows),
+            grid: Grid::new(cols, rows, scrollback_limit),
             state: ScreenState::default(),
-            scrollback: VecDeque::new(),
-            scrollback_limit,
-            pending_scrollback: VecDeque::new(),
             parser: Parser::new(),
         }
     }
@@ -92,9 +84,6 @@ impl Screen {
         let mut performer = ScreenPerformer {
             grid: &mut self.grid,
             state: &mut self.state,
-            scrollback: &mut self.scrollback,
-            scrollback_limit: self.scrollback_limit,
-            pending_scrollback: &mut self.pending_scrollback,
         };
         for &byte in bytes {
             self.parser.advance(&mut performer, byte);
@@ -113,15 +102,18 @@ impl Screen {
 
     /// Drain and return scrollback lines added since the last call, rendered as ANSI bytes.
     pub fn take_pending_scrollback(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.pending_scrollback)
-            .into_iter()
-            .map(|row| render::render_line(&row))
+        let start = self.grid.pending_start;
+        let end = self.grid.scrollback_len;
+        self.grid.pending_start = end;
+        self.grid.cells.iter().skip(start).take(end - start)
+            .map(|row| render::render_line(row))
             .collect()
     }
 
     /// Return all accumulated scrollback lines as rendered ANSI bytes.
     pub fn get_history(&self) -> Vec<Vec<u8>> {
-        self.scrollback.iter().map(|row| render::render_line(row)).collect()
+        self.grid.cells.iter().take(self.grid.scrollback_len)
+            .map(|row| render::render_line(row)).collect()
     }
 
     /// Render the current grid as ANSI output. Pass `full: true` for a full redraw.
@@ -143,16 +135,13 @@ impl Screen {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let old_rows = self.grid.rows;
 
-        // Restore scrollback lines when growing vertically (not in alt screen)
+        // Restore scrollback lines when growing vertically (not in alt screen).
+        // With unified buffer, scrollback rows are already in cells — just move the boundary.
         if !self.state.in_alt_screen && rows > old_rows {
             let grow = (rows - old_rows) as usize;
-            let restore_count = grow.min(self.scrollback.len());
-            // Pop from the end of scrollback (most recent lines) and insert at top of grid
-            for _ in 0..restore_count {
-                if let Some(row) = self.scrollback.pop_back() {
-                    self.grid.cells.push_front(row);
-                }
-            }
+            let restore_count = grow.min(self.grid.scrollback_len);
+            self.grid.scrollback_len -= restore_count;
+            self.grid.pending_start = self.grid.pending_start.min(self.grid.scrollback_len);
             self.grid.cursor_y += restore_count as u16;
         }
 
@@ -170,3 +159,9 @@ mod tests_screen;
 mod tests_reattach;
 #[cfg(test)]
 mod tests_resize;
+#[cfg(test)]
+mod tests_reconnect_scrollback;
+#[cfg(test)]
+mod tests_live_scrollback;
+#[cfg(test)]
+mod tests_progress_bar_scrollback;

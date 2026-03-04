@@ -644,7 +644,7 @@ fn reattach_content_last_column() {
     // Place char at last column
     screen.process(b"\x1b[1;10H");
     screen.process(b"X");
-    assert_eq!(screen.grid.cells[0][9].c, 'X');
+    assert_eq!(screen.grid.visible_row(0)[9].c, 'X');
     let rendered = reattach_render(&screen);
     assert!(rendered.contains("X"),
         "reattach: content at last column should be present");
@@ -822,9 +822,9 @@ fn reattach_tab_aligned_content() {
     assert!(rendered.contains("B"), "reattach: content after first tab");
     assert!(rendered.contains("C"), "reattach: content after second tab");
     // Verify tab alignment: B should be at column 8 (0-indexed)
-    assert_eq!(screen.grid.cells[0][8].c, 'B',
+    assert_eq!(screen.grid.visible_row(0)[8].c, 'B',
         "reattach: B should be at tab stop column 8");
-    assert_eq!(screen.grid.cells[0][16].c, 'C',
+    assert_eq!(screen.grid.visible_row(0)[16].c, 'C',
         "reattach: C should be at tab stop column 16");
 }
 
@@ -835,7 +835,7 @@ fn reattach_background_color_erase() {
     screen.process(b"\x1b[41m"); // red background
     screen.process(b"\x1b[2K");  // erase entire line
     // Cells on row 0 should have red background
-    assert_eq!(screen.grid.cells[0][0].style.bg,
+    assert_eq!(screen.grid.visible_row(0)[0].style.bg,
         Some(super::style::Color::Indexed(1)),
         "BCE: erased cells should have red background");
     // Verify render includes the background color
@@ -1033,7 +1033,7 @@ fn reattach_hidden_text_attribute() {
     let mut screen = Screen::new(20, 3, 100);
     screen.process(b"\x1b[8mSECRET\x1b[0m");
     // Cell content should be there, just with hidden attribute
-    assert!(screen.grid.cells[0][0].style.hidden);
+    assert!(screen.grid.visible_row(0)[0].style.hidden);
     let rendered = reattach_render(&screen);
     // Content should still be in render (hidden is an SGR attribute, terminal handles display)
     assert!(rendered.contains("SECRET"),
@@ -1155,7 +1155,7 @@ fn reattach_restores_active_charset_g0() {
 /// Incremental render (mode delta) must detect autowrap changes.
 #[test]
 fn mode_delta_detects_autowrap_change() {
-    let mut grid = super::grid::Grid::new(10, 3);
+    let mut grid = super::grid::Grid::new(10, 3, 0);
     let mut cache = super::render::RenderCache::new();
     // Initial render with default modes (autowrap=true)
     let _ = super::render::render_screen(&grid, "", true, &mut cache);
@@ -1171,7 +1171,7 @@ fn mode_delta_detects_autowrap_change() {
 /// Incremental render (mode delta) must detect charset changes.
 #[test]
 fn mode_delta_detects_charset_change() {
-    let mut grid = super::grid::Grid::new(10, 3);
+    let mut grid = super::grid::Grid::new(10, 3, 0);
     let mut cache = super::render::RenderCache::new();
     let _ = super::render::render_screen(&grid, "", true, &mut cache);
 
@@ -1253,7 +1253,7 @@ fn vte_parser_recovers_from_partial_escape_sequence() {
     screen.process(b"\x1b[2;1HAfter");
 
     // The "After" text should appear correctly on row 2
-    let row2: String = screen.grid.cells[1].iter().map(|c| c.c).collect();
+    let row2: String = screen.grid.visible_row(1).iter().map(|c| c.c).collect();
     assert!(row2.starts_with("After"),
         "VTE parser should recover from partial escape: row 2 = {:?}", row2.trim());
 }
@@ -1274,7 +1274,7 @@ fn vte_parser_sgr_correct_after_partial_sequence() {
 
     // Find "Green" in the grid and verify its color
     let mut found_green = false;
-    for row in &screen.grid.cells {
+    for row in screen.grid.visible_rows() {
         for (i, cell) in row.iter().enumerate() {
             if cell.c == 'G' {
                 // Check subsequent cells spell "Green"
@@ -1641,13 +1641,13 @@ fn full_data_processing_keeps_grid_in_sync() {
     // Verify everything is correct
     assert_eq!(screen.grid.scroll_top, 3); // 0-based
     assert_eq!(screen.grid.scroll_bottom, 21); // 0-based
-    assert_eq!(screen.grid.cells[0][0].c, 'C'); // header
-    assert_eq!(screen.grid.cells[23][0].c, 'F'); // footer
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'C'); // header
+    assert_eq!(screen.grid.visible_row(23)[0].c, 'F'); // footer
 
     // Scroll within region — header and footer must be preserved
     screen.process(b"\x1b[22;1H\n"); // LF at scroll_bottom
-    assert_eq!(screen.grid.cells[0][0].c, 'C', "header must survive scroll");
-    assert_eq!(screen.grid.cells[23][0].c, 'F', "footer must survive scroll");
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'C', "header must survive scroll");
+    assert_eq!(screen.grid.visible_row(23)[0].c, 'F', "footer must survive scroll");
     // Row 3 (old top of region) should have shifted up
-    assert_eq!(screen.grid.cells[3][0].c, 'p', "row 4 content shifted to row 3");
+    assert_eq!(screen.grid.visible_row(3)[0].c, 'p', "row 4 content shifted to row 3");
 }

@@ -284,7 +284,7 @@ mod tests {
 
     /// Helper: collect visible grid rows as trimmed strings.
     fn screen_lines(screen: &crate::screen::Screen) -> Vec<String> {
-        screen.grid.cells.iter().map(|row| {
+        screen.grid.visible_rows().map(|row| {
             let s: String = row.iter().map(|c| c.c).collect();
             s.trim_end().to_string()
         }).collect()
@@ -466,5 +466,44 @@ mod tests {
         let mut mgr = SessionManager::new();
         assert!(mgr.create("bad/name".into(), 80, 24, 1000).is_err());
         assert!(mgr.get_or_create("bad name", 80, 24, 1000).is_err());
+    }
+
+    #[test]
+    fn take_dead_sessions_returns_dead() {
+        let mut mgr = SessionManager::new();
+        mgr.create("alive".into(), 80, 24, 100).unwrap();
+        mgr.create("doomed".into(), 80, 24, 100).unwrap();
+
+        // Kill the doomed session's child process
+        {
+            let session = mgr.get("doomed").unwrap();
+            let child_arc = session.pty.child_arc();
+            let mut child = child_arc.lock().unwrap();
+            child.kill().ok();
+            child.wait().ok();
+        }
+
+        // Give the reader thread a moment to detect EOF
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let dead = mgr.take_dead_sessions();
+        let dead_names: Vec<&str> = dead.iter().map(|s| s.name.as_str()).collect();
+        assert!(dead_names.contains(&"doomed"), "dead list should contain 'doomed': {:?}", dead_names);
+        assert!(!dead_names.contains(&"alive"), "dead list should not contain 'alive': {:?}", dead_names);
+
+        // Only 'alive' should remain
+        assert_eq!(mgr.list().len(), 1);
+        assert_eq!(mgr.list()[0].name, "alive");
+    }
+
+    #[test]
+    fn take_dead_sessions_empty_when_all_alive() {
+        let mut mgr = SessionManager::new();
+        mgr.create("s1".into(), 80, 24, 100).unwrap();
+        mgr.create("s2".into(), 80, 24, 100).unwrap();
+
+        let dead = mgr.take_dead_sessions();
+        assert!(dead.is_empty(), "no sessions should be dead: {:?}", dead.iter().map(|s| &s.name).collect::<Vec<_>>());
+        assert_eq!(mgr.list().len(), 2);
     }
 }

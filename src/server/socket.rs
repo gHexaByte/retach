@@ -126,4 +126,52 @@ mod tests {
             "directory should still exist after second call"
         );
     }
+
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn socket_dir_rejects_symlink() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        let sym_dir = tmp.path().join("retach");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &sym_dir).unwrap();
+
+        // Point XDG_RUNTIME_DIR at the parent so socket_dir() computes sym_dir
+        std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+        let result = socket_dir();
+        // Restore env
+        std::env::remove_var("XDG_RUNTIME_DIR");
+
+        assert!(result.is_err(), "should reject symlink socket directory");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("symlink"), "error should mention symlink: {}", err);
+    }
+
+    #[test]
+    fn socket_dir_repairs_wrong_permissions() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("retach");
+        std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
+
+        std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+        let result = socket_dir();
+        std::env::remove_var("XDG_RUNTIME_DIR");
+
+        assert!(result.is_ok(), "should succeed and repair permissions");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "permissions should be repaired to 0o700, got: {:#o}", mode);
+    }
+
+    #[test]
+    fn lock_path_format() {
+        let path = lock_path().unwrap();
+        assert!(path.ends_with("retach.lock"),
+            "lock_path should end with 'retach.lock', got: {:?}", path);
+    }
 }

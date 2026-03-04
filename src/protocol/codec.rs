@@ -180,11 +180,12 @@ mod tests {
         assert_eq!(consumed, encoded.len());
         let decoded: ClientMsg = decode(data).unwrap();
         match decoded {
-            ClientMsg::Connect { name, history, cols, rows, .. } => {
+            ClientMsg::Connect { name, history, cols, rows, mode } => {
                 assert_eq!(name, "test");
                 assert_eq!(history, 1000);
                 assert_eq!(cols, 80);
                 assert_eq!(rows, 24);
+                assert_eq!(mode, ConnectMode::CreateOrAttach);
             }
             _ => panic!("wrong variant"),
         }
@@ -487,6 +488,57 @@ mod tests {
         match decoded {
             ClientMsg::Input(d) => assert_eq!(d.len(), 65536),
             other => panic!("expected Input, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn encode_decode_connect_mode_create_only() {
+        let msg = ClientMsg::Connect {
+            name: "new-session".into(),
+            history: 500,
+            cols: 120,
+            rows: 40,
+            mode: ConnectMode::CreateOnly,
+        };
+        let encoded = encode(&msg).unwrap();
+        let (data, _) = decode_frame(&encoded).unwrap().unwrap();
+        let decoded: ClientMsg = decode(data).unwrap();
+        match decoded {
+            ClientMsg::Connect { mode, .. } => assert_eq!(mode, ConnectMode::CreateOnly),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn encode_decode_connect_mode_attach_only() {
+        let msg = ClientMsg::Connect {
+            name: "existing".into(),
+            history: 0,
+            cols: 80,
+            rows: 24,
+            mode: ConnectMode::AttachOnly,
+        };
+        let encoded = encode(&msg).unwrap();
+        let (data, _) = decode_frame(&encoded).unwrap().unwrap();
+        let decoded: ClientMsg = decode(data).unwrap();
+        match decoded {
+            ClientMsg::Connect { mode, .. } => assert_eq!(mode, ConnectMode::AttachOnly),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_corrupted_payload() {
+        // Valid 4-byte header claiming 10 bytes, followed by garbage
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&10u32.to_be_bytes());
+        buf.extend_from_slice(&[0xFF; 10]);
+        let (data, _) = decode_frame(&buf).unwrap().unwrap();
+        let result: Result<ClientMsg, _> = decode(data);
+        assert!(result.is_err(), "corrupted payload should fail deserialization");
+        match result.unwrap_err() {
+            ProtocolError::Deserialize(_) => {} // expected
+            other => panic!("expected Deserialize error, got {:?}", other),
         }
     }
 }

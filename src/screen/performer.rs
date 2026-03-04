@@ -1,10 +1,8 @@
-use std::collections::VecDeque;
-
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
 use super::cell::Cell;
-use super::grid::{ActiveCharset, Charset, CursorShape, Grid, MouseEncoding, MouseMode, TerminalModes};
+use super::grid::{ActiveCharset, Charset, CursorShape, Grid, MouseEncoding, TerminalModes};
 use super::ScreenState;
 use super::style::Style;
 
@@ -12,9 +10,6 @@ use super::style::Style;
 pub struct ScreenPerformer<'a> {
     pub grid: &'a mut Grid,
     pub state: &'a mut ScreenState,
-    pub scrollback: &'a mut VecDeque<Vec<Cell>>,
-    pub scrollback_limit: usize,
-    pub pending_scrollback: &'a mut VecDeque<Vec<Cell>>,
 }
 
 impl<'a> ScreenPerformer<'a> {
@@ -30,13 +25,7 @@ impl<'a> ScreenPerformer<'a> {
 
     fn scroll_up(&mut self) {
         let fill = self.blank_cell();
-        self.grid.scroll_up(
-            self.state.in_alt_screen,
-            self.scrollback,
-            self.scrollback_limit,
-            self.pending_scrollback,
-            fill,
-        );
+        self.grid.scroll_up(self.state.in_alt_screen, fill);
     }
 
     fn scroll_down(&mut self) {
@@ -100,13 +89,20 @@ impl<'a> ScreenPerformer<'a> {
         if save_cursor {
             self.save_cursor();
         }
-        self.state.saved_grid = Some(self.grid.cells.clone());
+        use super::grid::SavedGrid;
+        // Save visible rows; scrollback stays in the active grid
+        let saved_visible = self.grid.cells.drain(self.grid.scrollback_len..).collect();
+        self.state.saved_grid = Some(SavedGrid {
+            visible_cells: saved_visible,
+            scrollback_limit: self.grid.scrollback_limit,
+        });
+        // Create blank visible rows for alt screen
+        for _ in 0..self.grid.rows as usize {
+            self.grid.cells.push_back(vec![Cell::default(); self.grid.cols as usize]);
+        }
+        self.grid.scrollback_limit = 0;
         self.state.saved_modes = Some(self.grid.modes.clone());
         self.state.in_alt_screen = true;
-        let blank = Cell::default();
-        for row in self.grid.cells.iter_mut() {
-            for cell in row.iter_mut() { *cell = blank.clone(); }
-        }
         self.grid.cursor_x = 0;
         self.grid.cursor_y = 0;
         self.grid.scroll_top = 0;
@@ -123,16 +119,24 @@ impl<'a> ScreenPerformer<'a> {
         }
         self.state.in_alt_screen = false;
         if let Some(saved) = self.state.saved_grid.take() {
-            self.grid.cells = saved;
+            // Remove alt screen visible rows, keep scrollback
+            self.grid.cells.truncate(self.grid.scrollback_len);
+            // Restore saved visible rows
+            for row in saved.visible_cells {
+                self.grid.cells.push_back(row);
+            }
+            self.grid.scrollback_limit = saved.scrollback_limit;
+            // Adjust visible rows for current dimensions (may have resized during alt screen)
             let rows_usize = self.grid.rows as usize;
-            while self.grid.cells.len() > rows_usize {
+            while self.grid.visible_row_count() > rows_usize {
                 self.grid.cells.pop_back();
             }
-            while self.grid.cells.len() < rows_usize {
+            while self.grid.visible_row_count() < rows_usize {
                 self.grid.cells.push_back(vec![Cell::default(); self.grid.cols as usize]);
             }
-            for row in &mut self.grid.cells {
-                row.resize(self.grid.cols as usize, Cell::default());
+            let cols_usize = self.grid.cols as usize;
+            for row in self.grid.visible_rows_mut() {
+                row.resize(cols_usize, Cell::default());
             }
         }
         if let Some(modes) = self.state.saved_modes.take() {
@@ -151,16 +155,16 @@ impl<'a> ScreenPerformer<'a> {
         if y >= self.grid.rows as usize || x >= self.grid.cols as usize {
             return;
         }
-        let cell_width = self.grid.cells[y][x].width;
+        let cell_width = self.grid.visible_row(y)[x].width;
         if cell_width == 2 {
             // This is the first half; blank the continuation cell too
             let next = x + 1;
             if next < self.grid.cols as usize {
-                self.grid.cells[y][next] = self.blank_cell();
+                self.grid.visible_row_mut(y)[next] = self.blank_cell();
             }
         } else if cell_width == 0 && x > 0 {
             // This is the continuation half; blank the first half too
-            self.grid.cells[y][x - 1] = self.blank_cell();
+            self.grid.visible_row_mut(y)[x - 1] = self.blank_cell();
         }
     }
 
@@ -241,32 +245,33 @@ impl<'a> ScreenPerformer<'a> {
                 let y = self.grid.cursor_y as usize;
                 let x = self.grid.cursor_x as usize;
                 self.fixup_wide_char(x, y);
-                for i in x..self.grid.cols as usize { self.grid.cells[y][i] = blank.clone(); }
-                for row in self.grid.cells.iter_mut().skip(y + 1) {
+                for i in x..self.grid.cols as usize { self.grid.visible_row_mut(y)[i] = blank.clone(); }
+                for row in self.grid.visible_rows_mut().skip(y + 1) {
                     for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
             }
             1 => {
                 let y = self.grid.cursor_y as usize;
                 let x = self.grid.cursor_x as usize;
-                for row in self.grid.cells.iter_mut().take(y) {
+                for row in self.grid.visible_rows_mut().take(y) {
                     for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
                 let end = x.min(self.grid.cols as usize - 1);
                 self.fixup_wide_char(end, y);
-                for i in 0..=end { self.grid.cells[y][i] = blank.clone(); }
+                for i in 0..=end { self.grid.visible_row_mut(y)[i] = blank.clone(); }
             }
             2 => {
-                for row in self.grid.cells.iter_mut() {
+                for row in self.grid.visible_rows_mut() {
                     for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
             }
             3 => {
-                for row in self.grid.cells.iter_mut() {
+                for row in self.grid.visible_rows_mut() {
                     for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
-                self.scrollback.clear();
-                self.pending_scrollback.clear();
+                self.grid.cells.drain(..self.grid.scrollback_len);
+                self.grid.scrollback_len = 0;
+                self.grid.pending_start = 0;
             }
             _ => {}
         }
@@ -279,14 +284,14 @@ impl<'a> ScreenPerformer<'a> {
         match mode {
             0 => {
                 self.fixup_wide_char(x, y);
-                for i in x..self.grid.cols as usize { self.grid.cells[y][i] = blank.clone(); }
+                for i in x..self.grid.cols as usize { self.grid.visible_row_mut(y)[i] = blank.clone(); }
             }
             1 => {
                 let end = x.min(self.grid.cols as usize - 1);
                 self.fixup_wide_char(end, y);
-                for i in 0..=end { self.grid.cells[y][i] = blank.clone(); }
+                for i in 0..=end { self.grid.visible_row_mut(y)[i] = blank.clone(); }
             }
-            2 => { for cell in self.grid.cells[y].iter_mut() { *cell = blank.clone(); } }
+            2 => { for cell in self.grid.visible_row_mut(y).iter_mut() { *cell = blank.clone(); } }
             _ => {}
         }
     }
@@ -303,7 +308,7 @@ impl<'a> ScreenPerformer<'a> {
                 self.fixup_wide_char(end, y);
             }
             for i in x..end {
-                self.grid.cells[y][i] = blank.clone();
+                self.grid.visible_row_mut(y)[i] = blank.clone();
             }
         }
     }
@@ -317,11 +322,11 @@ impl<'a> ScreenPerformer<'a> {
         if y < self.grid.rows as usize {
             self.fixup_wide_char(x, y);
             for _ in 0..n.min(cols.saturating_sub(x)) {
-                self.grid.cells[y].remove(x);
-                self.grid.cells[y].push(blank.clone());
+                self.grid.visible_row_mut(y).remove(x);
+                self.grid.visible_row_mut(y).push(blank.clone());
             }
-            if x < cols && self.grid.cells[y][x].width == 0 {
-                self.grid.cells[y][x] = blank.clone();
+            if x < cols && self.grid.visible_row(y)[x].width == 0 {
+                self.grid.visible_row_mut(y)[x] = blank.clone();
             }
         }
     }
@@ -335,12 +340,12 @@ impl<'a> ScreenPerformer<'a> {
         if y < self.grid.rows as usize {
             self.fixup_wide_char(x, y);
             for _ in 0..n.min(cols.saturating_sub(x)) {
-                self.grid.cells[y].pop();
-                self.grid.cells[y].insert(x, blank.clone());
+                self.grid.visible_row_mut(y).pop();
+                self.grid.visible_row_mut(y).insert(x, blank.clone());
             }
             let last = cols - 1;
-            if self.grid.cells[y][last].width == 2 {
-                self.grid.cells[y][last] = blank.clone();
+            if self.grid.visible_row(y)[last].width == 2 {
+                self.grid.visible_row_mut(y)[last] = blank.clone();
             }
         }
     }
@@ -365,9 +370,9 @@ impl<'a> ScreenPerformer<'a> {
             self.grid.wrap_pending = false;
             let n = n.min(bottom - y + 1);
             for _ in 0..n {
-                if y <= bottom && bottom < self.grid.cells.len() {
-                    self.grid.cells.remove(y);
-                    self.grid.cells.insert(bottom, vec![blank.clone(); self.grid.cols as usize]);
+                if y <= bottom && bottom < self.grid.visible_row_count() {
+                    self.grid.remove_visible_row(y);
+                    self.grid.insert_visible_row(bottom, vec![blank.clone(); self.grid.cols as usize]);
                 }
             }
         }
@@ -383,9 +388,9 @@ impl<'a> ScreenPerformer<'a> {
             self.grid.wrap_pending = false;
             let n = n.min(bottom - y + 1);
             for _ in 0..n {
-                if y <= bottom && bottom < self.grid.cells.len() {
-                    self.grid.cells.remove(bottom);
-                    self.grid.cells.insert(y, vec![blank.clone(); self.grid.cols as usize]);
+                if y <= bottom && bottom < self.grid.visible_row_count() {
+                    self.grid.remove_visible_row(bottom);
+                    self.grid.insert_visible_row(y, vec![blank.clone(); self.grid.cols as usize]);
                 }
             }
         }
@@ -411,11 +416,7 @@ impl<'a> ScreenPerformer<'a> {
                 Some(12) => {} // Cursor blink — cosmetic, ignore
                 Some(25) => self.grid.cursor_visible = enable,
                 Some(1000 | 1002 | 1003) => {
-                    self.grid.modes.mouse_mode = if enable {
-                        MouseMode::from_param(param[0]).unwrap_or(MouseMode::Off)
-                    } else {
-                        MouseMode::Off
-                    };
+                    self.grid.modes.mouse_modes.set(param[0], enable);
                 }
                 Some(1005 | 1006) => {
                     self.grid.modes.mouse_encoding = if enable {
@@ -468,14 +469,14 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 if tx < self.grid.cols as usize {
                     // If the target is a continuation cell (width==0), step back
                     // one more to reach the actual wide character cell.
-                    let tx = if self.grid.cells[cy][tx].width == 0 && tx > 0 {
+                    let tx = if self.grid.visible_row(cy)[tx].width == 0 && tx > 0 {
                         tx - 1
                     } else {
                         tx
                     };
                     const MAX_COMBINING: usize = 16;
-                    if self.grid.cells[cy][tx].combining.len() < MAX_COMBINING {
-                        self.grid.cells[cy][tx].combining.push(c);
+                    if self.grid.visible_row(cy)[tx].combining.len() < MAX_COMBINING {
+                        self.grid.visible_row_mut(cy)[tx].combining.push(c);
                     }
                 }
             }
@@ -504,7 +505,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 let x = self.grid.cursor_x as usize;
                 let y = self.grid.cursor_y as usize;
                 if x < self.grid.cols as usize && y < self.grid.rows as usize {
-                    self.grid.cells[y][x] = self.blank_cell();
+                    self.grid.visible_row_mut(y)[x] = self.blank_cell();
                 }
                 // Wrap
                 self.grid.cursor_x = 0;
@@ -525,7 +526,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
             // Fix up any wide char we're overwriting
             self.fixup_wide_char(x, y);
 
-            self.grid.cells[y][x] = Cell {
+            self.grid.visible_row_mut(y)[x] = Cell {
                 c,
                 combining: Vec::new(),
                 style: self.state.current_style,
@@ -538,7 +539,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 if next < self.grid.cols as usize {
                     // Fix up any wide char at the continuation position
                     self.fixup_wide_char(next, y);
-                    self.grid.cells[y][next] = Cell {
+                    self.grid.visible_row_mut(y)[next] = Cell {
                         c: '\0',
                         combining: Vec::new(),
                         style: self.state.current_style,
@@ -703,7 +704,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 self.state.last_printed_char = ' ';
                 self.grid.tab_stops = super::grid::default_tab_stops(self.grid.cols);
                 let blank = Cell::default();
-                for row in self.grid.cells.iter_mut() {
+                for row in self.grid.visible_rows_mut() {
                     for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
             }

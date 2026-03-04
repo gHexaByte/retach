@@ -40,8 +40,7 @@ fn strip_ansi(bytes: &[u8]) -> String {
 fn screen_lines(screen: &Screen) -> Vec<String> {
     screen
         .grid
-        .cells
-        .iter()
+        .visible_rows()
         .map(|row| {
             let s: String = row.iter().map(|c| c.c).collect();
             s.trim_end().to_string()
@@ -250,12 +249,15 @@ fn render_with_large_pending_scrollback() {
     let output = screen.render_with_scrollback(&pending, &mut cache);
     let text = String::from_utf8_lossy(&output);
 
-    // Should have sync block
-    assert!(text.starts_with("\x1b[?2026h"));
+    // Should end with sync end (screen redraw is inside sync block)
     assert!(text.ends_with("\x1b[?2026l"));
 
-    // Scrollback lines should appear before screen clear
+    // Scrollback lines should appear before sync block (outside it)
     let pos_l001 = text.find("L001").expect("L001 should be in scrollback");
+    let sync_begin = text.find("\x1b[?2026h").expect("sync begin should be present");
+    assert!(pos_l001 < sync_begin, "scrollback should precede sync block");
+
+    // Scrollback lines should appear before screen clear
     let pos_clear = text.find("\x1b[2J").expect("screen clear should be present");
     assert!(pos_l001 < pos_clear, "scrollback should precede screen clear");
 
@@ -480,9 +482,9 @@ fn bulk_output_with_scroll_region() {
     }
 
     // Row 1 (outside scroll region, top) should be untouched
-    assert_eq!(screen.grid.cells[0][0].c, ' ', "row 0 should be blank (outside scroll region)");
+    assert_eq!(screen.grid.visible_row(0)[0].c, ' ', "row 0 should be blank (outside scroll region)");
     // Row 5 (outside scroll region, bottom) should be untouched
-    assert_eq!(screen.grid.cells[4][0].c, ' ', "row 4 should be blank (outside scroll region)");
+    assert_eq!(screen.grid.visible_row(4)[0].c, ' ', "row 4 should be blank (outside scroll region)");
 
     // Scroll region rows should have the last 3 of the 10 lines:
     // 10 lines written in region of 3 rows → 7 scrolled off, R08/R09/R10 remain

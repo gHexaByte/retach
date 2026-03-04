@@ -8,15 +8,15 @@ fn reattach_render(screen: &Screen) -> String {
 }
 
 fn assert_cell(screen: &Screen, row: usize, col: usize, expected: char) {
-    let actual = screen.grid.cells[row][col].c;
+    let actual = screen.grid.visible_row(row)[col].c;
     assert_eq!(actual, expected,
         "cell ({}, {}) expected '{}', got '{}'", row, col, expected, actual);
 }
 
 /// Helper: collect all visible lines as strings (first char of each row, trimmed).
 fn collect_screen_lines(screen: &Screen) -> Vec<String> {
-    screen.grid.cells.iter().map(|row| {
-        let s: String = row.iter().map(|c| c.c).collect();
+    (0..screen.grid.visible_row_count()).map(|y| {
+        let s: String = screen.grid.visible_row(y).iter().map(|c| c.c).collect();
         s.trim_end().to_string()
     }).collect()
 }
@@ -179,7 +179,7 @@ fn resize_preserves_styled_content() {
     screen.resize(20, 5); // expand
     // Verify styled cells survived
     assert_cell(&screen, 0, 0, 'S');
-    assert!(screen.grid.cells[0][0].style.bold, "bold should survive resize");
+    assert!(screen.grid.visible_row(0)[0].style.bold, "bold should survive resize");
     let rendered = reattach_render(&screen);
     assert!(rendered.contains("STYLED"),
         "styled text should survive resize and render");
@@ -302,23 +302,38 @@ fn resize_scrollback_contains_correct_content() {
 }
 
 #[test]
-fn resize_pending_scrollback_independent_of_resize() {
+fn resize_pending_scrollback_independent_of_horizontal_resize() {
     let mut screen = Screen::new(15, 3, 100);
     for i in 1..=5 {
         screen.process(format!("L{}\r\n", i).as_bytes());
     }
-    // Don't drain pending — resize should not affect it
-    let pending_before: Vec<Vec<Cell>> = screen.pending_scrollback.iter().cloned().collect();
-    assert!(!pending_before.is_empty(), "pending scrollback should exist");
+    // Don't drain pending — horizontal-only resize should not affect it
+    let pending_before = screen.grid.scrollback_len - screen.grid.pending_start;
+    assert!(pending_before > 0, "pending scrollback should exist");
 
-    screen.resize(20, 5);
+    screen.resize(20, 3); // same rows, different cols
 
-    let pending_after: Vec<Vec<Cell>> = screen.pending_scrollback.iter().cloned().collect();
-    assert_eq!(pending_before.len(), pending_after.len(),
-        "pending scrollback count should survive resize");
-    for (i, (b, a)) in pending_before.iter().zip(pending_after.iter()).enumerate() {
-        assert_eq!(b.len(), a.len(), "pending scrollback line {} length changed after resize", i);
+    let pending_after = screen.grid.scrollback_len - screen.grid.pending_start;
+    assert_eq!(pending_before, pending_after,
+        "pending scrollback count should survive horizontal-only resize");
+}
+
+#[test]
+fn resize_vertical_grow_restores_scrollback_from_pending() {
+    let mut screen = Screen::new(15, 3, 100);
+    for i in 1..=5 {
+        screen.process(format!("L{}\r\n", i).as_bytes());
     }
+    let sb_before = screen.grid.scrollback_len;
+    assert!(sb_before > 0, "scrollback should exist");
+
+    // Growing vertically restores scrollback rows into visible area
+    screen.resize(15, 5);
+
+    let restored = sb_before - screen.grid.scrollback_len;
+    assert!(restored > 0, "some scrollback should have been restored");
+    // pending_start clamped to scrollback_len
+    assert!(screen.grid.pending_start <= screen.grid.scrollback_len);
 }
 
 #[test]
@@ -525,13 +540,18 @@ fn render_with_scrollback_after_resize_positions_correctly() {
     let output = screen.render_with_scrollback(&history, &mut cache);
     let rendered = String::from_utf8_lossy(&output);
 
-    // Cursor positioning for scrollback injection should use row 8 (new height)
+    // Cursor positioning for scrollback injection should use row 8 (new height).
+    // Scrollback injection now happens BEFORE the sync block, so the scroll
+    // position (\n at the bottom) should target the new row count.
     assert!(rendered.contains("\x1b[8;1H"),
         "scrollback injection should position at new row count (8), \
          rendered: {}", rendered.chars().take(200).collect::<String>());
-    // Should NOT contain old row count positioning
-    assert!(!rendered.contains("\x1b[5;1H") || rendered.contains("\x1b[5;1H"),
-        "sanity: render should use current dimensions");
+    // Scrollback injection should appear before the sync block begins.
+    let sync_start = rendered.find("\x1b[?2026h").unwrap();
+    let scroll_pos = rendered.find("\x1b[8;1H").unwrap();
+    assert!(scroll_pos < sync_start,
+        "scrollback injection (pos {}) should appear before sync block (pos {})",
+        scroll_pos, sync_start);
 }
 
 #[test]
@@ -688,13 +708,13 @@ fn resize_shrink_splits_wide_char_at_boundary() {
     let mut screen = Screen::new(10, 3, 100);
     screen.process(b"\x1b[1;5H"); // col 5 (0-indexed col 4)
     screen.process("你".as_bytes()); // wide char at cols 4-5
-    assert_eq!(screen.grid.cells[0][4].width, 2);
-    assert_eq!(screen.grid.cells[0][5].width, 0);
+    assert_eq!(screen.grid.visible_row(0)[4].width, 2);
+    assert_eq!(screen.grid.visible_row(0)[5].width, 0);
 
     screen.resize(5, 3); // shrink — col 5 gone, col 4 is last
     // The orphaned width=2 cell should not remain broken.
     // It either gets blanked or its width becomes 1.
-    let cell4 = &screen.grid.cells[0][4];
+    let cell4 = &screen.grid.visible_row(0)[4];
     assert_ne!(cell4.width, 2,
         "orphaned wide char (width=2 without continuation) should be cleaned up, \
          got width={} char='{}'", cell4.width, cell4.c);
@@ -706,14 +726,14 @@ fn resize_shrink_wide_char_fully_inside_survives() {
     let mut screen = Screen::new(10, 3, 100);
     screen.process(b"\x1b[1;3H"); // col 3 (0-indexed col 2)
     screen.process("世".as_bytes()); // wide char at cols 2-3
-    assert_eq!(screen.grid.cells[0][2].c, '世');
-    assert_eq!(screen.grid.cells[0][2].width, 2);
-    assert_eq!(screen.grid.cells[0][3].width, 0);
+    assert_eq!(screen.grid.visible_row(0)[2].c, '世');
+    assert_eq!(screen.grid.visible_row(0)[2].width, 2);
+    assert_eq!(screen.grid.visible_row(0)[3].width, 0);
 
     screen.resize(6, 3);
-    assert_eq!(screen.grid.cells[0][2].c, '世');
-    assert_eq!(screen.grid.cells[0][2].width, 2);
-    assert_eq!(screen.grid.cells[0][3].width, 0,
+    assert_eq!(screen.grid.visible_row(0)[2].c, '世');
+    assert_eq!(screen.grid.visible_row(0)[2].width, 2);
+    assert_eq!(screen.grid.visible_row(0)[3].width, 0,
         "wide char fully inside new width should survive intact");
 }
 
@@ -724,11 +744,11 @@ fn resize_shrink_wide_char_at_exact_right_edge() {
     let mut screen = Screen::new(10, 3, 100);
     screen.process(b"\x1b[1;9H"); // col 9 (0-indexed col 8)
     screen.process("界".as_bytes()); // wide char at cols 8-9
-    assert_eq!(screen.grid.cells[0][8].width, 2);
-    assert_eq!(screen.grid.cells[0][9].width, 0);
+    assert_eq!(screen.grid.visible_row(0)[8].width, 2);
+    assert_eq!(screen.grid.visible_row(0)[9].width, 0);
 
     screen.resize(9, 3); // shrink — col 9 gone
-    let cell8 = &screen.grid.cells[0][8];
+    let cell8 = &screen.grid.visible_row(0)[8];
     assert_ne!(cell8.width, 2,
         "wide char at right edge with truncated continuation should be cleaned up");
 }
@@ -742,12 +762,12 @@ fn resize_shrink_multiple_wide_chars_on_boundary() {
     // Shrink to 7 cols — wide char at cols 6-7 is split (col 7 lost)
     screen.resize(7, 3);
     // Chars at 0-1, 2-3, 4-5 should survive
-    assert_eq!(screen.grid.cells[0][0].c, '你');
-    assert_eq!(screen.grid.cells[0][0].width, 2);
-    assert_eq!(screen.grid.cells[0][2].c, '好');
-    assert_eq!(screen.grid.cells[0][4].c, '世');
+    assert_eq!(screen.grid.visible_row(0)[0].c, '你');
+    assert_eq!(screen.grid.visible_row(0)[0].width, 2);
+    assert_eq!(screen.grid.visible_row(0)[2].c, '好');
+    assert_eq!(screen.grid.visible_row(0)[4].c, '世');
     // Col 6 had '界' (width=2) with continuation at col 7 — now orphaned
-    assert_ne!(screen.grid.cells[0][6].width, 2,
+    assert_ne!(screen.grid.visible_row(0)[6].width, 2,
         "wide char split at resize boundary should be cleaned up");
 }
 
@@ -760,17 +780,17 @@ fn resize_preserves_combining_marks() {
     let mut screen = Screen::new(10, 3, 100);
     // 'e' followed by combining acute accent U+0301
     screen.process("e\u{0301}".as_bytes());
-    assert_eq!(screen.grid.cells[0][0].c, 'e');
-    assert_eq!(screen.grid.cells[0][0].combining, vec!['\u{0301}']);
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
+    assert_eq!(screen.grid.visible_row(0)[0].combining, vec!['\u{0301}']);
 
     screen.resize(20, 5);
-    assert_eq!(screen.grid.cells[0][0].c, 'e');
-    assert_eq!(screen.grid.cells[0][0].combining, vec!['\u{0301}'],
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
+    assert_eq!(screen.grid.visible_row(0)[0].combining, vec!['\u{0301}'],
         "combining marks should survive resize expand");
 
     screen.resize(5, 2);
-    assert_eq!(screen.grid.cells[0][0].c, 'e');
-    assert_eq!(screen.grid.cells[0][0].combining, vec!['\u{0301}'],
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
+    assert_eq!(screen.grid.visible_row(0)[0].combining, vec!['\u{0301}'],
         "combining marks should survive resize shrink");
 }
 
@@ -779,14 +799,14 @@ fn resize_wide_char_with_combining_survives() {
     let mut screen = Screen::new(10, 3, 100);
     // Wide char '你' followed by combining mark
     screen.process("你\u{0308}".as_bytes()); // 你 + diaeresis
-    assert_eq!(screen.grid.cells[0][0].c, '你');
-    assert_eq!(screen.grid.cells[0][0].width, 2);
-    assert!(screen.grid.cells[0][0].combining.contains(&'\u{0308}'));
+    assert_eq!(screen.grid.visible_row(0)[0].c, '你');
+    assert_eq!(screen.grid.visible_row(0)[0].width, 2);
+    assert!(screen.grid.visible_row(0)[0].combining.contains(&'\u{0308}'));
 
     screen.resize(15, 3); // expand — should survive
-    assert_eq!(screen.grid.cells[0][0].c, '你');
-    assert_eq!(screen.grid.cells[0][0].width, 2);
-    assert!(screen.grid.cells[0][0].combining.contains(&'\u{0308}'),
+    assert_eq!(screen.grid.visible_row(0)[0].c, '你');
+    assert_eq!(screen.grid.visible_row(0)[0].width, 2);
+    assert!(screen.grid.visible_row(0)[0].combining.contains(&'\u{0308}'),
         "combining mark on wide char should survive resize");
 }
 
@@ -942,8 +962,8 @@ fn resize_in_alt_screen_then_exit_restores_main_resized() {
     assert!(!screen.state.in_alt_screen);
 
     // Grid dimensions should match resize
-    assert_eq!(screen.grid.cells.len(), 3);
-    assert_eq!(screen.grid.cells[0].len(), 10);
+    assert_eq!(screen.grid.visible_row_count(), 3);
+    assert_eq!(screen.grid.visible_row(0).len(), 10);
     // Main content that fits in 10x3 should be restored
     for (i, ch) in "MainConten".chars().enumerate() {
         assert_cell(&screen, 0, i, ch);
@@ -958,8 +978,8 @@ fn resize_in_alt_screen_expand_then_exit() {
     screen.resize(20, 6); // expand
     screen.process(b"\x1b[?1049l"); // exit alt
 
-    assert_eq!(screen.grid.cells.len(), 6);
-    assert_eq!(screen.grid.cells[0].len(), 20);
+    assert_eq!(screen.grid.visible_row_count(), 6);
+    assert_eq!(screen.grid.visible_row(0).len(), 20);
     // Original content should be on row 0
     for (i, ch) in "Small".chars().enumerate() {
         assert_cell(&screen, 0, i, ch);
@@ -981,8 +1001,8 @@ fn resize_in_alt_screen_multiple_then_exit() {
 
     screen.process(b"\x1b[?1049l"); // exit alt
 
-    assert_eq!(screen.grid.cells.len(), 4);
-    assert_eq!(screen.grid.cells[0].len(), 15);
+    assert_eq!(screen.grid.visible_row_count(), 4);
+    assert_eq!(screen.grid.visible_row(0).len(), 15);
     // "Original" (8 chars) fits in 15 cols
     for (i, ch) in "Original".chars().enumerate() {
         assert_cell(&screen, 0, i, ch);
@@ -999,15 +1019,15 @@ fn resize_current_style_persists_for_new_content() {
     // Set bold red
     screen.process(b"\x1b[1;31m");
     screen.process(b"AB"); // write styled text
-    assert!(screen.grid.cells[0][0].style.bold);
+    assert!(screen.grid.visible_row(0)[0].style.bold);
 
     screen.resize(20, 5);
 
     // Write more text — should inherit the pre-resize style
     screen.process(b"CD");
-    assert!(screen.grid.cells[0][2].style.bold,
+    assert!(screen.grid.visible_row(0)[2].style.bold,
         "new text after resize should inherit bold from pre-resize style");
-    assert_eq!(screen.grid.cells[0][2].c, 'C');
+    assert_eq!(screen.grid.visible_row(0)[2].c, 'C');
 }
 
 #[test]
@@ -1026,7 +1046,7 @@ fn resize_does_not_reset_sgr_state() {
 
     // Write after resize — same style
     screen.process(b"Y");
-    assert_eq!(screen.grid.cells[0][1].style, style_before,
+    assert_eq!(screen.grid.visible_row(0)[1].style, style_before,
         "text written after resize should have identical style");
 }
 
@@ -1225,7 +1245,7 @@ fn resize_mid_sgr_sequence_style_applied_after() {
     // Finish: "1m" → complete SGR is [1;31m = bold + red
     screen.process(b"1m");
     screen.process(b"X");
-    assert!(screen.grid.cells[0][0].style.bold,
+    assert!(screen.grid.visible_row(0)[0].style.bold,
         "bold should be applied despite resize mid-SGR");
 }
 
@@ -1240,7 +1260,7 @@ fn resize_in_alt_screen_modes_restored_correctly() {
     screen.process(b"\x1b[?2004h"); // bracketed paste
     screen.process(b"\x1b[?1000h"); // mouse mode
     assert!(screen.grid.modes.bracketed_paste);
-    assert_eq!(screen.grid.modes.mouse_mode, super::grid::MouseMode::Click);
+    assert!(screen.grid.modes.mouse_modes.click);
 
     // Enter alt screen (saves modes)
     screen.process(b"\x1b[?1049h");
@@ -1255,7 +1275,7 @@ fn resize_in_alt_screen_modes_restored_correctly() {
     screen.process(b"\x1b[?1049l");
     assert!(screen.grid.modes.bracketed_paste,
         "bracketed paste should be restored from saved modes after resize");
-    assert_eq!(screen.grid.modes.mouse_mode, super::grid::MouseMode::Click,
+    assert!(screen.grid.modes.mouse_modes.click,
         "mouse mode should be restored from saved modes after resize");
     // Scroll region should be reset to new dimensions
     assert_eq!(screen.grid.scroll_top, 0);
@@ -1284,11 +1304,11 @@ fn resize_rapid_with_mixed_content() {
 
     // After settling back to original size, verify no crash and
     // content that survived all the shrinks is correct
-    assert_eq!(screen.grid.cells.len(), 5);
-    assert_eq!(screen.grid.cells[0].len(), 20);
+    assert_eq!(screen.grid.visible_row_count(), 5);
+    assert_eq!(screen.grid.visible_row(0).len(), 20);
     // 'A' at col 0 should survive all resizes (always within bounds)
     assert_cell(&screen, 0, 0, 'A');
-    assert!(screen.grid.cells[0][0].style.bold,
+    assert!(screen.grid.visible_row(0)[0].style.bold,
         "style should survive rapid resizes");
 }
 
@@ -1306,12 +1326,12 @@ fn resize_vertical_expand_restores_scrollback() {
     screen.resize(10, 5);
 
     // Restored: Line1 at row 0, Line2 at row 1, original content shifted down
-    assert_eq!(screen.grid.cells[0][0].c, 'L');
-    assert_eq!(screen.grid.cells[0][4].c, '1');
-    assert_eq!(screen.grid.cells[1][4].c, '2');
-    assert_eq!(screen.grid.cells[2][4].c, '3');
-    assert_eq!(screen.grid.cells[3][4].c, '4');
-    assert_eq!(screen.grid.cells[4][4].c, '5');
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'L');
+    assert_eq!(screen.grid.visible_row(0)[4].c, '1');
+    assert_eq!(screen.grid.visible_row(1)[4].c, '2');
+    assert_eq!(screen.grid.visible_row(2)[4].c, '3');
+    assert_eq!(screen.grid.visible_row(3)[4].c, '4');
+    assert_eq!(screen.grid.visible_row(4)[4].c, '5');
 }
 
 #[test]
@@ -1338,12 +1358,12 @@ fn resize_vertical_expand_limited_by_scrollback() {
     screen.resize(10, 7); // grow by 4, but only 1 in scrollback
 
     // Row 0: restored AAA
-    assert_eq!(screen.grid.cells[0][0].c, 'A');
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'A');
     // Row 1: BBB (shifted by 1)
-    assert_eq!(screen.grid.cells[1][0].c, 'B');
+    assert_eq!(screen.grid.visible_row(1)[0].c, 'B');
     // Rows 4-6: blank (not enough scrollback)
     for r in 4..7 {
-        assert_eq!(screen.grid.cells[r][0].c, ' ',
+        assert_eq!(screen.grid.visible_row(r)[0].c, ' ',
             "row {} should be blank", r);
     }
     // Cursor shifted by 1
@@ -1361,7 +1381,7 @@ fn resize_vertical_expand_no_restore_in_alt_screen() {
 
     // No restoration in alt screen — rows should be blank
     for r in 0..5 {
-        assert_eq!(screen.grid.cells[r][0].c, ' ',
+        assert_eq!(screen.grid.visible_row(r)[0].c, ' ',
             "row {} should be blank in alt screen", r);
     }
 }
@@ -1423,9 +1443,9 @@ fn resize_scrollback_screen_boundary_integrity() {
     }
     // Boundary check: scrollback now has 3 lines, screen row 0 should be L04
     assert_eq!(screen.get_history().len(), 3);
-    assert_eq!(screen.grid.cells[0][0].c, 'L');
-    assert_eq!(screen.grid.cells[0][1].c, '0');
-    assert_eq!(screen.grid.cells[0][2].c, '4');
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'L');
+    assert_eq!(screen.grid.visible_row(0)[1].c, '0');
+    assert_eq!(screen.grid.visible_row(0)[2].c, '4');
 
     // --- Shrink 7→4: loses bottom 3 rows, no scrollback change ---
     screen.resize(10, 4);
@@ -1450,4 +1470,31 @@ fn resize_scrollback_screen_boundary_integrity() {
     // Followed by L04..L07 that were on screen
     assert!(screen_lines[3].contains("L04"),
         "row 3 should be L04, got: '{}'", screen_lines[3]);
+}
+
+#[test]
+fn resize_expand_in_alt_screen_skips_scrollback_restore() {
+    // Scrollback should not be consumed during alt screen resize,
+    // and should be preserved for later use.
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process(b"L1\r\nL2\r\nL3\r\nL4\r\nL5");
+    let hist_before = screen.get_history().len();
+    assert!(hist_before > 0, "should have scrollback before alt screen");
+
+    // Enter alt screen
+    screen.process(b"\x1b[?1049h");
+
+    // Expand while in alt screen
+    screen.resize(10, 8);
+
+    // Scrollback should NOT be consumed
+    assert_eq!(screen.get_history().len(), hist_before,
+        "scrollback should be preserved during alt screen resize");
+
+    // Exit alt screen
+    screen.process(b"\x1b[?1049l");
+
+    // Scrollback should still be intact
+    assert_eq!(screen.get_history().len(), hist_before,
+        "scrollback should be preserved after exiting alt screen");
 }

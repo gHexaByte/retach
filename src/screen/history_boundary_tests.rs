@@ -18,8 +18,7 @@ use render::RenderCache;
 fn screen_lines(screen: &Screen) -> Vec<String> {
     screen
         .grid
-        .cells
-        .iter()
+        .visible_rows()
         .map(|row| {
             let s: String = row.iter().map(|c| c.c).collect();
             s.trim_end().to_string()
@@ -244,7 +243,7 @@ fn resize_expand_moves_scrollback_to_screen_no_duplication() {
 }
 
 #[test]
-fn resize_shrink_then_expand_roundtrip_no_loss() {
+fn resize_shrink_then_expand_roundtrip_no_duplication() {
     let mut screen = Screen::new(10, 5, 100);
     write_labeled_lines(&mut screen, 8);
     let _ = screen.take_pending_scrollback();

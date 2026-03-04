@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Connection mode for Connect message.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum ConnectMode {
     /// Create or attach (Open subcommand)
     CreateOrAttach,
@@ -12,7 +12,7 @@ pub enum ConnectMode {
 }
 
 /// Message sent from a client to the server.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum ClientMsg {
     /// Keyboard input from client
     Input(Vec<u8>),
@@ -31,7 +31,7 @@ pub enum ClientMsg {
 }
 
 /// Message sent from the server to a client.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum ServerMsg {
     /// Scrollback line (passthrough to terminal)
     ScrollbackLine(Vec<u8>),
@@ -54,7 +54,7 @@ pub enum ServerMsg {
 }
 
 /// Snapshot of a session's metadata, used in list responses.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SessionInfo {
     pub name: String,
     pub pid: u32,

@@ -1,6 +1,6 @@
 [package]
 name = "retach"
-version = "0.5.0"
+version = "0.6.1"
 edition = "2021"
 description = "Persistent terminal sessions with native scrollback passthrough"
 license = "BSD-2-Clause"
@@ -24,3 +24,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 terminal_size = "0.4"
 unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

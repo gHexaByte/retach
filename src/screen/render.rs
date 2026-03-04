@@ -103,11 +103,10 @@ fn emit_mode(out: &mut Vec<u8>, modes: &TerminalModes) {
     emit_dec_mode(out, 7, modes.autowrap_mode);
     emit_dec_mode(out, 2004, modes.bracketed_paste);
 
-    // Mouse mode: always reset all first, then enable the active one
-    out.extend_from_slice(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l");
-    if modes.mouse_mode.is_enabled() {
-        emit_dec_mode(out, modes.mouse_mode.to_param(), true);
-    }
+    // Mouse modes: emit each independently
+    emit_dec_mode(out, 1000, modes.mouse_modes.click);
+    emit_dec_mode(out, 1002, modes.mouse_modes.button);
+    emit_dec_mode(out, 1003, modes.mouse_modes.any);
 
     // Mouse encoding
     emit_mouse_encoding(out, modes.mouse_encoding);
@@ -154,14 +153,14 @@ fn emit_mode_delta(out: &mut Vec<u8>, modes: &TerminalModes, prev: &TerminalMode
     if modes.bracketed_paste != prev.bracketed_paste {
         emit_dec_mode(out, 2004, modes.bracketed_paste);
     }
-    if modes.mouse_mode != prev.mouse_mode {
-        // Disable the old mode first, then enable the new one
-        if prev.mouse_mode.is_enabled() {
-            emit_dec_mode(out, prev.mouse_mode.to_param(), false);
-        }
-        if modes.mouse_mode.is_enabled() {
-            emit_dec_mode(out, modes.mouse_mode.to_param(), true);
-        }
+    if modes.mouse_modes.click != prev.mouse_modes.click {
+        emit_dec_mode(out, 1000, modes.mouse_modes.click);
+    }
+    if modes.mouse_modes.button != prev.mouse_modes.button {
+        emit_dec_mode(out, 1002, modes.mouse_modes.button);
+    }
+    if modes.mouse_modes.any != prev.mouse_modes.any {
+        emit_dec_mode(out, 1003, modes.mouse_modes.any);
     }
     if modes.mouse_encoding != prev.mouse_encoding {
         emit_mouse_encoding(out, modes.mouse_encoding);
@@ -217,24 +216,57 @@ fn render_screen_impl(
     cache: &mut RenderCache,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    // Synchronized output: begin
-    out.extend_from_slice(b"\x1b[?2026h");
-    // Hide cursor during redraw
-    out.extend_from_slice(b"\x1b[?25l");
 
-    // Scrollback injection: position cursor at the bottom of the screen so
-    // that each `\r\n` triggers real terminal scrolling, pushing the top
-    // screen row into the native scrollback buffer.
+    // Scrollback injection: emitted OUTSIDE the synchronized output block.
+    //
+    // Some terminals (notably Blink/hterm on iOS) buffer all output during
+    // a sync block and apply it atomically, which means intermediate scroll
+    // operations (\r\n at the bottom row) don't push content into the native
+    // scrollback buffer.
+    //
+    // Algorithm: overwrite visible rows with scrollback content, then scroll
+    // them off via \n at the bottom row.  Processed in chunks of `rows` so
+    // that any amount of scrollback is handled correctly.
     if !scrollback.is_empty() {
-        out.extend_from_slice(b"\x1b[");
-        write_u16(&mut out, grid.rows);
-        out.extend_from_slice(b";1H");
-        for line in scrollback {
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
+        let rows = grid.rows as usize;
+        // Hide cursor and reset scroll region to full screen so \n at the
+        // bottom scrolls the entire display (not just a scroll region).
+        out.extend_from_slice(b"\x1b[?25l\x1b[r");
+
+        for chunk in scrollback.chunks(rows) {
+            // Overwrite visible rows 1..chunk.len() with scrollback content.
+            for (i, line) in chunk.iter().enumerate() {
+                out.extend_from_slice(b"\x1b[");
+                write_u16(&mut out, (i + 1) as u16);
+                out.extend_from_slice(b";1H\x1b[0m");
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\x1b[K");
+            }
+            // Erase remaining rows below the chunk to prevent stale content
+            // from leaking into native scrollback on the next pass.
+            if chunk.len() < rows {
+                for i in chunk.len()..rows {
+                    out.extend_from_slice(b"\x1b[");
+                    write_u16(&mut out, (i + 1) as u16);
+                    out.extend_from_slice(b";1H\x1b[2K");
+                }
+            }
+            // Position at the bottom row and scroll chunk.len() lines off
+            // the top into native scrollback.
+            out.extend_from_slice(b"\x1b[");
+            write_u16(&mut out, grid.rows);
+            out.extend_from_slice(b";1H");
+            for _ in 0..chunk.len() {
+                out.push(b'\n');
+            }
         }
         cache.invalidate();
     }
+
+    // Synchronized output: begin (screen redraw only)
+    out.extend_from_slice(b"\x1b[?2026h");
+    // Hide cursor during redraw
+    out.extend_from_slice(b"\x1b[?25l");
 
     let full = full || !scrollback.is_empty();
 
@@ -246,12 +278,12 @@ fn render_screen_impl(
     }
 
     // Ensure cache row_hashes is the right length
-    let num_rows = grid.cells.len();
+    let num_rows = grid.visible_row_count();
     if cache.row_hashes.len() != num_rows {
         cache.row_hashes.resize(num_rows, u64::MAX); // sentinel: won't match any real hash
     }
 
-    for (y, row) in grid.cells.iter().enumerate() {
+    for (y, row) in grid.visible_rows().enumerate() {
         let row_hash = hash_row(row);
 
         // Skip unchanged rows on incremental renders
@@ -344,7 +376,7 @@ fn render_screen_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::grid::{CursorShape, MouseEncoding, MouseMode};
+    use super::super::grid::{CursorShape, MouseEncoding};
     use super::super::style::Color;
 
     #[test]
@@ -377,7 +409,7 @@ mod tests {
 
     #[test]
     fn render_screen_full() {
-        let grid = Grid::new(10, 3);
+        let grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -389,7 +421,7 @@ mod tests {
 
     #[test]
     fn render_screen_incremental() {
-        let grid = Grid::new(10, 3);
+        let grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -413,7 +445,7 @@ mod tests {
 
     #[test]
     fn render_screen_includes_title() {
-        let grid = Grid::new(10, 3);
+        let grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "My Title", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -422,7 +454,7 @@ mod tests {
 
     #[test]
     fn render_screen_no_title_when_empty() {
-        let grid = Grid::new(10, 3);
+        let grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -431,7 +463,7 @@ mod tests {
 
     #[test]
     fn render_screen_hidden_cursor() {
-        let mut grid = Grid::new(10, 3);
+        let mut grid = Grid::new(10, 3, 0);
         grid.cursor_visible = false;
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", false, &mut cache);
@@ -444,7 +476,7 @@ mod tests {
 
     #[test]
     fn render_screen_incremental_dirty_tracking() {
-        let mut grid = Grid::new(10, 5);
+        let mut grid = Grid::new(10, 5, 0);
         // Move cursor to a unique position so cursor-position output doesn't
         // collide with row-position sequences we're checking.
         grid.cursor_x = 3;
@@ -469,7 +501,7 @@ mod tests {
             "unchanged rows should be skipped in incremental render");
 
         // Now change row 2 (0-indexed=1) and render again
-        grid.cells[1][0].c = 'X';
+        grid.visible_row_mut(1)[0].c = 'X';
         let result3 = render_screen(&grid, "", false, &mut cache);
         let text3 = String::from_utf8_lossy(&result3);
         // Row 2 (1-indexed) should be redrawn
@@ -484,7 +516,7 @@ mod tests {
 
     #[test]
     fn render_screen_synchronized_output() {
-        let grid = Grid::new(10, 3);
+        let grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -497,7 +529,7 @@ mod tests {
 
     #[test]
     fn render_screen_cursor_position() {
-        let mut grid = Grid::new(10, 5);
+        let mut grid = Grid::new(10, 5, 0);
         grid.cursor_x = 4;
         grid.cursor_y = 2;
         let mut cache = RenderCache::new();
@@ -511,7 +543,7 @@ mod tests {
 
     #[test]
     fn render_screen_title_cached() {
-        let grid = Grid::new(10, 3);
+        let grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         // First render with title
         let result1 = render_screen(&grid, "Title1", false, &mut cache);
@@ -530,7 +562,7 @@ mod tests {
 
     #[test]
     fn render_screen_title_sanitized() {
-        let grid = Grid::new(10, 3);
+        let grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         // Title with BEL (0x07) that would break OSC
         let evil_title = "bad\x07title";
@@ -563,34 +595,32 @@ mod tests {
     }
 
     #[test]
-    fn render_screen_full_mode_resets_all_mouse_modes() {
-        let mut grid = Grid::new(10, 3);
-        grid.modes.mouse_mode = MouseMode::Any;
+    fn render_screen_full_mode_emits_mouse_modes() {
+        let mut grid = Grid::new(10, 3, 0);
+        grid.modes.mouse_modes.any = true;
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);
-        // Full render should reset all mouse modes first
+        // Full render should disable inactive modes and enable active
         assert!(text.contains("\x1b[?1000l"),
-            "full render should reset mouse mode 1000");
+            "full render should disable mouse mode 1000");
         assert!(text.contains("\x1b[?1002l"),
-            "full render should reset mouse mode 1002");
-        assert!(text.contains("\x1b[?1003l"),
-            "full render should reset mouse mode 1003");
-        // Then enable the active one
+            "full render should disable mouse mode 1002");
         assert!(text.contains("\x1b[?1003h"),
             "full render should enable active mouse mode 1003");
     }
 
     #[test]
     fn render_screen_mode_delta_mouse_switch() {
-        let mut grid = Grid::new(10, 3);
-        grid.modes.mouse_mode = MouseMode::Click;
+        let mut grid = Grid::new(10, 3, 0);
+        grid.modes.mouse_modes.click = true;
         let mut cache = RenderCache::new();
         // Initial render (full)
         let _ = render_screen(&grid, "", true, &mut cache);
 
-        // Switch mouse mode from Click to Any
-        grid.modes.mouse_mode = MouseMode::Any;
+        // Switch: disable click, enable any
+        grid.modes.mouse_modes.click = false;
+        grid.modes.mouse_modes.any = true;
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
         // Should disable old mode
@@ -603,7 +633,7 @@ mod tests {
 
     #[test]
     fn render_screen_mode_delta_bracketed_paste() {
-        let mut grid = Grid::new(10, 3);
+        let mut grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         let _ = render_screen(&grid, "", true, &mut cache);
 
@@ -617,7 +647,7 @@ mod tests {
 
     #[test]
     fn render_cache_invalidate() {
-        let grid = Grid::new(10, 3);
+        let grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         // Populate cache
         let _ = render_screen(&grid, "test", false, &mut cache);
@@ -720,7 +750,7 @@ mod tests {
     #[test]
     fn render_screen_title_cleared() {
         // Bug 1 regression test: title change to "" should emit empty OSC
-        let grid = Grid::new(10, 3);
+        let grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         // First render with a non-empty title
         let _ = render_screen(&grid, "Hello", false, &mut cache);
@@ -734,12 +764,12 @@ mod tests {
     #[test]
     fn render_screen_after_resize() {
         // When row count changes, all rows should be redrawn
-        let grid = Grid::new(10, 3);
+        let grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         let _ = render_screen(&grid, "", false, &mut cache);
 
         // Simulate resize: new grid with more rows
-        let grid2 = Grid::new(10, 5);
+        let grid2 = Grid::new(10, 5, 0);
         let result = render_screen(&grid2, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
         // Cache had 3 rows, now 5 — row_hashes resized with sentinels, all should redraw
@@ -751,12 +781,12 @@ mod tests {
     #[test]
     fn render_screen_style_only_change_detected() {
         // Cell changes color but same char → row should be redrawn
-        let mut grid = Grid::new(10, 3);
+        let mut grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         let _ = render_screen(&grid, "", false, &mut cache);
 
         // Change style of a cell without changing the char
-        grid.cells[1][0].style.fg = Some(Color::Indexed(1));
+        grid.visible_row_mut(1)[0].style.fg = Some(Color::Indexed(1));
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("\x1b[2;1H"),
@@ -765,7 +795,7 @@ mod tests {
 
     #[test]
     fn render_screen_1x1_grid() {
-        let grid = Grid::new(1, 1);
+        let grid = Grid::new(1, 1, 0);
         let mut cache = RenderCache::new();
         // Should not panic
         let result = render_screen(&grid, "", true, &mut cache);
@@ -775,7 +805,7 @@ mod tests {
 
     #[test]
     fn render_screen_cursor_bottom_right() {
-        let mut grid = Grid::new(80, 24);
+        let mut grid = Grid::new(80, 24, 0);
         grid.cursor_x = 79;
         grid.cursor_y = 23;
         let mut cache = RenderCache::new();
@@ -787,7 +817,7 @@ mod tests {
 
     #[test]
     fn render_screen_mouse_encoding_1006() {
-        let mut grid = Grid::new(10, 3);
+        let mut grid = Grid::new(10, 3, 0);
         grid.modes.mouse_encoding = MouseEncoding::Sgr;
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
@@ -797,7 +827,7 @@ mod tests {
 
     #[test]
     fn render_screen_mouse_encoding_1005() {
-        let mut grid = Grid::new(10, 3);
+        let mut grid = Grid::new(10, 3, 0);
         grid.modes.mouse_encoding = MouseEncoding::Utf8;
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
@@ -807,7 +837,7 @@ mod tests {
 
     #[test]
     fn render_screen_cursor_shape_delta() {
-        let mut grid = Grid::new(10, 3);
+        let mut grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         let _ = render_screen(&grid, "", true, &mut cache);
 
@@ -820,7 +850,7 @@ mod tests {
 
     #[test]
     fn render_screen_keypad_mode_delta() {
-        let mut grid = Grid::new(10, 3);
+        let mut grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         let _ = render_screen(&grid, "", true, &mut cache);
 
@@ -861,7 +891,7 @@ mod tests {
 
     #[test]
     fn scrollback_positions_cursor_at_bottom() {
-        let grid = Grid::new(80, 24);
+        let grid = Grid::new(80, 24, 0);
         let mut cache = RenderCache::new();
         let scrollback = vec![b"line one".to_vec()];
         let result = render_screen_with_scrollback(&grid, "", &scrollback, &mut cache);
@@ -873,41 +903,42 @@ mod tests {
 
     #[test]
     fn scrollback_lines_appear_before_screen_clear() {
-        let grid = Grid::new(80, 24);
+        let grid = Grid::new(80, 24, 0);
         let mut cache = RenderCache::new();
         let scrollback = vec![b"old prompt".to_vec(), b"ls output".to_vec()];
         let result = render_screen_with_scrollback(&grid, "", &scrollback, &mut cache);
         let text = String::from_utf8_lossy(&result);
 
-        let pos_cursor = text.find("\x1b[24;1H").expect("cursor positioning missing");
         let pos_line1 = text.find("old prompt").expect("scrollback line 1 missing");
         let pos_line2 = text.find("ls output").expect("scrollback line 2 missing");
         let pos_clear = text.find("\x1b[2J").expect("screen clear missing");
 
-        assert!(pos_cursor < pos_line1, "cursor positioning must precede scrollback");
         assert!(pos_line1 < pos_line2, "scrollback lines must be in order");
         assert!(pos_line2 < pos_clear, "scrollback must precede screen clear");
     }
 
     #[test]
-    fn scrollback_lines_have_crlf() {
-        let grid = Grid::new(80, 24);
+    fn scrollback_lines_use_cursor_positioning() {
+        let grid = Grid::new(80, 24, 0);
         let mut cache = RenderCache::new();
         let scrollback = vec![b"AAA".to_vec(), b"BBB".to_vec()];
         let result = render_screen_with_scrollback(&grid, "", &scrollback, &mut cache);
-        // Check raw bytes for \r\n after each scrollback line
+        let text = String::from_utf8_lossy(&result);
+
+        // Lines should be written at rows 1 and 2 via CUP
+        assert!(text.contains("AAA"), "AAA should be present");
+        assert!(text.contains("BBB"), "BBB should be present");
+        // Should end each line with EL (erase to end of line)
         let raw = &result;
         let pos_a = raw.windows(3).position(|w| w == b"AAA").expect("AAA missing");
-        let pos_b = raw.windows(3).position(|w| w == b"BBB").expect("BBB missing");
-        assert_eq!(&raw[pos_a + 3..pos_a + 5], b"\r\n",
-            "scrollback line must end with \\r\\n");
-        assert_eq!(&raw[pos_b + 3..pos_b + 5], b"\r\n",
-            "scrollback line must end with \\r\\n");
+        // After "AAA" there should be \x1b[K (erase to end of line)
+        assert_eq!(&raw[pos_a + 3..pos_a + 6], b"\x1b[K",
+            "scrollback line should end with EL");
     }
 
     #[test]
-    fn scrollback_wrapped_in_sync_block() {
-        let grid = Grid::new(80, 24);
+    fn scrollback_outside_sync_block() {
+        let grid = Grid::new(80, 24, 0);
         let mut cache = RenderCache::new();
         let scrollback = vec![b"scroll line".to_vec()];
         let result = render_screen_with_scrollback(&grid, "", &scrollback, &mut cache);
@@ -917,20 +948,23 @@ mod tests {
         let pos_scroll = text.find("scroll line").expect("scrollback content missing");
         let sync_end = text.rfind("\x1b[?2026l").expect("sync end missing");
 
-        assert!(sync_begin < pos_scroll, "scrollback must be after sync begin");
-        assert!(pos_scroll < sync_end, "scrollback must be before sync end");
+        // Scrollback injection must be BEFORE the sync block
+        assert!(pos_scroll < sync_begin,
+            "scrollback must be before sync begin (scrollback at {}, sync at {})",
+            pos_scroll, sync_begin);
+        assert!(sync_begin < sync_end, "sync begin must precede sync end");
     }
 
     #[test]
     fn scrollback_forces_full_redraw() {
-        let mut grid = Grid::new(10, 3);
+        let mut grid = Grid::new(10, 3, 0);
         let mut cache = RenderCache::new();
         // Populate cache with an initial render
         let _ = render_screen(&grid, "", false, &mut cache);
         assert!(!cache.row_hashes.is_empty());
 
         // Modify only row 2 — normally only row 2 would be redrawn
-        grid.cells[1][0].c = 'X';
+        grid.visible_row_mut(1)[0].c = 'X';
 
         // Render with scrollback — all rows must be redrawn (full redraw)
         let scrollback = vec![b"old".to_vec()];
@@ -944,7 +978,7 @@ mod tests {
 
     #[test]
     fn no_scrollback_no_crlf_in_output() {
-        let grid = Grid::new(80, 24);
+        let grid = Grid::new(80, 24, 0);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", false, &mut cache);
         // Normal render must never contain \r\n — that's only emitted for scrollback
@@ -962,7 +996,7 @@ mod tests {
     #[test]
     fn reattach_history_flush_count() {
         let rows: u16 = 5;
-        let grid = Grid::new(80, rows);
+        let grid = Grid::new(80, rows, 0);
         let mut cache = RenderCache::new();
         let render = render_screen(&grid, "", true, &mut cache);
 
@@ -985,7 +1019,7 @@ mod tests {
 
     #[test]
     fn reattach_no_flush_without_history() {
-        let grid = Grid::new(80, 5);
+        let grid = Grid::new(80, 5, 0);
         let mut cache = RenderCache::new();
         let render = render_screen(&grid, "", true, &mut cache);
         // Without history, no leading newlines should be added
@@ -999,7 +1033,7 @@ mod tests {
     /// never a standalone bell that would trigger an audible beep.
     #[test]
     fn render_no_standalone_bell() {
-        let grid = Grid::new(80, 24);
+        let grid = Grid::new(80, 24, 0);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "My Title", true, &mut cache);
         // Find all BEL bytes and verify each is preceded by an OSC intro
@@ -1018,7 +1052,7 @@ mod tests {
     /// Full redraw should not produce standalone BEL even with title changes.
     #[test]
     fn render_full_redraw_no_standalone_bell() {
-        let grid = Grid::new(80, 24);
+        let grid = Grid::new(80, 24, 0);
         let mut cache = RenderCache::new();
         // First render with title
         let _ = render_screen(&grid, "Title1", false, &mut cache);
@@ -1038,7 +1072,7 @@ mod tests {
     /// Render without title should produce zero BEL bytes.
     #[test]
     fn render_no_title_no_bell_bytes() {
-        let grid = Grid::new(80, 24);
+        let grid = Grid::new(80, 24, 0);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", false, &mut cache);
         let bell_count = result.iter().filter(|&&b| b == 0x07).count();
@@ -1049,7 +1083,7 @@ mod tests {
     /// Repeated renders with the same title should not produce BEL on second render.
     #[test]
     fn render_cached_title_no_bell() {
-        let grid = Grid::new(80, 24);
+        let grid = Grid::new(80, 24, 0);
         let mut cache = RenderCache::new();
         let _ = render_screen(&grid, "Hello", false, &mut cache);
         // Second render with same title — should skip title OSC entirely
