@@ -272,6 +272,8 @@ impl<'a> ScreenPerformer<'a> {
                 self.grid.cells.drain(..self.grid.scrollback_len);
                 self.grid.scrollback_len = 0;
                 self.grid.pending_start = 0;
+                // Forward to outer terminal so it clears its native scrollback too
+                self.state.pending_passthrough.push(b"\x1b[3J".to_vec());
             }
             _ => {}
         }

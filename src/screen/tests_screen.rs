@@ -382,6 +382,68 @@ fn osc_777_not_resent_on_render_with_scrollback() {
     assert!(pt.is_empty(), "OSC 777 must not re-appear after render_with_scrollback");
 }
 
+// --- ED mode 3 (clear scrollback) passthrough tests ---
+
+#[test]
+fn ed3_clears_scrollback_and_forwards_passthrough() {
+    let mut screen = Screen::new(80, 24, 100);
+    // Generate scrollback
+    for i in 0..30 {
+        screen.process(format!("Line{}\r\n", i).as_bytes());
+    }
+    assert!(screen.grid.scrollback_len > 0, "should have scrollback");
+    let _ = screen.take_passthrough(); // drain any prior
+
+    // ED mode 3: clear scrollback
+    screen.process(b"\x1b[3J");
+    assert_eq!(screen.grid.scrollback_len, 0, "scrollback should be cleared");
+
+    let pt = screen.take_passthrough();
+    assert_eq!(pt.len(), 1, "ED mode 3 should produce one passthrough entry");
+    assert_eq!(pt[0], b"\x1b[3J", "passthrough should be \\e[3J");
+}
+
+#[test]
+fn ed3_passthrough_even_without_scrollback() {
+    // Even with no internal scrollback, outer terminal may have native scrollback
+    // from previous render_with_scrollback cycles — must still forward
+    let mut screen = Screen::new(80, 24, 0); // scrollback_limit=0
+    screen.process(b"\x1b[3J");
+    let pt = screen.take_passthrough();
+    assert_eq!(pt.len(), 1, "ED mode 3 should forward even with empty scrollback");
+    assert_eq!(pt[0], b"\x1b[3J");
+}
+
+#[test]
+fn ed3_passthrough_drained_after_take() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b[3J");
+    let pt1 = screen.take_passthrough();
+    assert_eq!(pt1.len(), 1);
+    let pt2 = screen.take_passthrough();
+    assert!(pt2.is_empty(), "ED mode 3 should not persist after take_passthrough()");
+}
+
+#[test]
+fn ed3_passthrough_not_resent_on_render() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b[3J");
+    let _ = screen.take_passthrough(); // drain
+    let mut cache = RenderCache::new();
+    let _ = screen.render(true, &mut cache);
+    let pt = screen.take_passthrough();
+    assert!(pt.is_empty(), "ED mode 3 must not be re-sent on full redraw");
+}
+
+#[test]
+fn ed2_does_not_produce_passthrough() {
+    // ED mode 2 (clear visible) should NOT passthrough — render handles it
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b[2J");
+    let pt = screen.take_passthrough();
+    assert!(pt.is_empty(), "ED mode 2 should not produce passthrough");
+}
+
 #[test]
 fn mode_flags_bracketed_paste() {
     let mut screen = Screen::new(80, 24, 100);

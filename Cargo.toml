@@ -1,6 +1,6 @@
 [package]
 name = "retach"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 description = "Persistent terminal sessions with native scrollback passthrough"
 license = "BSD-2-Clause"
