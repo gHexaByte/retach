@@ -12,6 +12,9 @@ use tracing::{info, warn};
 
 pub use socket::socket_path;
 
+/// Interval between dead session cleanup sweeps.
+const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Start the daemon server: bind the Unix socket, spawn the cleanup task, and accept clients.
 pub async fn run_server() -> anyhow::Result<()> {
     // Ignore SIGHUP so SSH disconnects don't kill us
@@ -47,7 +50,7 @@ pub async fn run_server() -> anyhow::Result<()> {
     // Dead session cleanup task — drops dead sessions outside the lock
     let cleanup_manager = manager.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         loop {
             interval.tick().await;
             let dead_sessions = {

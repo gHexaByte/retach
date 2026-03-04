@@ -5,6 +5,13 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Default terminal dimensions when actual size is unavailable.
+pub const DEFAULT_COLS: u16 = 80;
+pub const DEFAULT_ROWS: u16 = 24;
+
+const MAX_SESSION_NAME_LEN: usize = 128;
+const PTY_READ_BUF_SIZE: usize = 4096;
+
 /// Check if a PTY child process is still alive.
 /// Uses `try_lock()` to avoid blocking Tokio workers when called from async tasks.
 pub fn is_child_alive(child: &Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>) -> bool {
@@ -95,7 +102,7 @@ fn persistent_reader_loop(
     has_client: Arc<AtomicBool>,
     reader_alive: Arc<AtomicBool>,
 ) {
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; PTY_READ_BUF_SIZE];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
@@ -166,6 +173,20 @@ impl Drop for Session {
     }
 }
 
+/// Validate a session name: max 128 bytes, only `[a-zA-Z0-9_-.]`.
+pub fn validate_session_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("session name cannot be empty");
+    }
+    if name.len() > MAX_SESSION_NAME_LEN {
+        anyhow::bail!("session name too long (max {} bytes)", MAX_SESSION_NAME_LEN);
+    }
+    if let Some(ch) = name.chars().find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.')) {
+        anyhow::bail!("invalid character '{}' in session name (allowed: a-zA-Z0-9_-.)", ch);
+    }
+    Ok(())
+}
+
 /// Registry of named sessions with create, lookup, and cleanup operations.
 pub struct SessionManager {
     sessions: HashMap<String, Session>,
@@ -181,6 +202,7 @@ impl SessionManager {
 
     /// Create a new session with the given name, failing if it already exists.
     pub fn create(&mut self, name: String, cols: u16, rows: u16, history: usize) -> anyhow::Result<()> {
+        validate_session_name(&name)?;
         if self.sessions.contains_key(&name) {
             anyhow::bail!("session '{}' already exists", name);
         }
@@ -192,9 +214,10 @@ impl SessionManager {
     /// Get existing session or create a new one.
     /// Returns (session, is_new).
     pub fn get_or_create(&mut self, name: &str, cols: u16, rows: u16, history: usize) -> anyhow::Result<(&mut Session, bool)> {
+        validate_session_name(name)?;
         let is_new = if !self.sessions.contains_key(name) {
-            let c = if cols > 0 { cols } else { 80 };
-            let r = if rows > 0 { rows } else { 24 };
+            let c = if cols > 0 { cols } else { DEFAULT_COLS };
+            let r = if rows > 0 { rows } else { DEFAULT_ROWS };
             tracing::debug!(session = %name, cols = c, rows = r, "creating new session");
             self.create(name.to_string(), c, r, history)?;
             true
@@ -202,7 +225,7 @@ impl SessionManager {
             tracing::debug!(session = %name, "reattaching to existing session");
             false
         };
-        Ok((self.sessions.get_mut(name).unwrap(), is_new))
+        Ok((self.sessions.get_mut(name).expect("session was just created"), is_new))
     }
 
     /// Get an existing session by name.
@@ -222,7 +245,7 @@ impl SessionManager {
                 Ok(d) => *d,
                 Err(e) => {
                     tracing::warn!(session = %s.name, error = %e, "dims mutex poisoned in list");
-                    (80, 24)
+                    (DEFAULT_COLS, DEFAULT_ROWS)
                 }
             };
             crate::protocol::SessionInfo {
@@ -409,5 +432,39 @@ mod tests {
         assert_eq!(cols, 80);
         assert_eq!(rows, 24);
         assert!(is_new);
+    }
+
+    #[test]
+    fn validate_session_name_valid() {
+        assert!(validate_session_name("my-session.1_OK").is_ok());
+        assert!(validate_session_name("a").is_ok());
+        assert!(validate_session_name(&"x".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn validate_session_name_empty() {
+        let err = validate_session_name("").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn validate_session_name_too_long() {
+        let err = validate_session_name(&"x".repeat(129)).unwrap_err();
+        assert!(err.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn validate_session_name_invalid_chars() {
+        assert!(validate_session_name("foo/bar").is_err());
+        assert!(validate_session_name("foo bar").is_err());
+        assert!(validate_session_name("foo\0bar").is_err());
+        assert!(validate_session_name("../escape").is_err());
+    }
+
+    #[test]
+    fn session_manager_rejects_invalid_names() {
+        let mut mgr = SessionManager::new();
+        assert!(mgr.create("bad/name".into(), 80, 24, 1000).is_err());
+        assert!(mgr.get_or_create("bad name", 80, 24, 1000).is_err());
     }
 }

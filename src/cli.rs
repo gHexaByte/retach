@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+const DEFAULT_HISTORY: usize = 10000;
+
 #[derive(Parser)]
 #[command(name = "retach", version, about = "Terminal multiplexer with native scrollback")]
 pub struct Cli {
@@ -14,7 +16,7 @@ pub enum Command {
         /// Session name
         name: String,
         /// Scrollback history size (used when creating)
-        #[arg(long, default_value = "10000")]
+        #[arg(long, default_value_t = DEFAULT_HISTORY)]
         history: usize,
     },
     /// Create a new session
@@ -22,7 +24,7 @@ pub enum Command {
         /// Session name (auto-generated if omitted)
         name: Option<String>,
         /// Scrollback history size
-        #[arg(long, default_value = "10000")]
+        #[arg(long, default_value_t = DEFAULT_HISTORY)]
         history: usize,
     },
     /// Attach to an existing session

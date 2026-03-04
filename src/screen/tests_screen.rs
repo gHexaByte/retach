@@ -406,11 +406,11 @@ fn mode_flags_cursor_key_mode() {
 fn mode_flags_mouse() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[?1000h");
-    assert_eq!(screen.grid.modes.mouse_mode, 1000);
+    assert_eq!(screen.grid.modes.mouse_mode, super::grid::MouseMode::Click);
     screen.process(b"\x1b[?1006h");
-    assert_eq!(screen.grid.modes.mouse_encoding, 1006);
+    assert_eq!(screen.grid.modes.mouse_encoding, super::grid::MouseEncoding::Sgr);
     screen.process(b"\x1b[?1000l");
-    assert_eq!(screen.grid.modes.mouse_mode, 0);
+    assert_eq!(screen.grid.modes.mouse_mode, super::grid::MouseMode::Off);
 }
 
 #[test]
@@ -3274,27 +3274,27 @@ fn scroll_down_within_region_does_not_produce_scrollback() {
 }
 
 #[test]
-fn mouse_mode_disable_resets_to_zero() {
-    // Disabling any mouse mode should set mouse_mode to 0
+fn mouse_mode_disable_resets_to_off() {
+    // Disabling any mouse mode should set mouse_mode to Off
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[?1003h"); // any-event tracking
-    assert_eq!(screen.grid.modes.mouse_mode, 1003);
+    assert_eq!(screen.grid.modes.mouse_mode, super::grid::MouseMode::Any);
     screen.process(b"\x1b[?1003l"); // disable
-    assert_eq!(screen.grid.modes.mouse_mode, 0);
+    assert_eq!(screen.grid.modes.mouse_mode, super::grid::MouseMode::Off);
     // Disabling a different mode number should also reset
     screen.process(b"\x1b[?1002h");
-    assert_eq!(screen.grid.modes.mouse_mode, 1002);
+    assert_eq!(screen.grid.modes.mouse_mode, super::grid::MouseMode::Button);
     screen.process(b"\x1b[?1000l"); // disable 1000 (not the active one)
-    assert_eq!(screen.grid.modes.mouse_mode, 0);
+    assert_eq!(screen.grid.modes.mouse_mode, super::grid::MouseMode::Off);
 }
 
 #[test]
-fn mouse_encoding_disable_resets_to_zero() {
+fn mouse_encoding_disable_resets_to_x10() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[?1006h"); // SGR encoding
-    assert_eq!(screen.grid.modes.mouse_encoding, 1006);
+    assert_eq!(screen.grid.modes.mouse_encoding, super::grid::MouseEncoding::Sgr);
     screen.process(b"\x1b[?1006l");
-    assert_eq!(screen.grid.modes.mouse_encoding, 0);
+    assert_eq!(screen.grid.modes.mouse_encoding, super::grid::MouseEncoding::X10);
 }
 
 #[test]

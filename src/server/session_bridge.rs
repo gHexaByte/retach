@@ -6,39 +6,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use crate::session::{DEFAULT_COLS, DEFAULT_ROWS};
 use tracing::{debug, warn};
+
+/// Minimum interval between consecutive screen renders to the client.
+const RENDER_THROTTLE: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Lock a `StdMutex` and convert poisoning into `anyhow::Error`.
 fn lock_mutex<'a, T>(mutex: &'a StdMutex<T>, label: &str) -> anyhow::Result<std::sync::MutexGuard<'a, T>> {
     mutex.lock().map_err(|e| anyhow::anyhow!("{} mutex poisoned: {}", label, e))
 }
 
-/// Per-session I/O handles extracted from SessionManager.
-/// Cheap Arc clones — no global lock needed during I/O.
-pub struct SessionIo {
-    pub pty_writer: Arc<StdMutex<Box<dyn Write + Send>>>,
-    pub screen: Arc<StdMutex<Screen>>,
-}
-
-impl SessionIo {
-    /// Resize the PTY master and the virtual screen to the given dimensions.
-    pub fn resize(
-        master: &Arc<StdMutex<Box<dyn portable_pty::MasterPty + Send>>>,
-        screen: &Arc<StdMutex<Screen>>,
-        cols: u16,
-        rows: u16,
-    ) -> anyhow::Result<()> {
-        let (cols, rows) = crate::screen::grid::sanitize_dimensions(cols, rows);
-        let m = lock_mutex(master, "master")?;
-        m.resize(portable_pty::PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        lock_mutex(screen, "screen")?.resize(cols, rows);
-        Ok(())
-    }
+/// Resize the PTY master and the virtual screen to the given dimensions.
+fn resize_pty(
+    master: &Arc<StdMutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    screen: &Arc<StdMutex<Screen>>,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<()> {
+    let (cols, rows) = crate::screen::grid::sanitize_dimensions(cols, rows);
+    let m = lock_mutex(master, "master")?;
+    m.resize(portable_pty::PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    lock_mutex(screen, "screen")?.resize(cols, rows);
+    Ok(())
 }
 
 /// Render the screen and send the update to the client.
@@ -54,16 +49,34 @@ async fn render_and_send(
     Ok(())
 }
 
-/// Handles returned from `setup_session`, containing everything needed for the I/O loops.
-struct SessionSetup {
-    io: SessionIo,
-    master_arc: Arc<StdMutex<Box<dyn portable_pty::MasterPty + Send>>>,
-    is_new_session: bool,
-    evict_rx: tokio::sync::watch::Receiver<bool>,
-    dims_arc: Arc<StdMutex<(u16, u16)>>,
+/// Shared session handles, passed to relay loops by Arc-clone.
+#[derive(Clone)]
+struct SessionHandles {
+    screen: Arc<StdMutex<Screen>>,
+    pty_writer: Arc<StdMutex<Box<dyn Write + Send>>>,
+    master: Arc<StdMutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    dims: Arc<StdMutex<(u16, u16)>>,
     screen_notify: Arc<tokio::sync::Notify>,
     has_client: Arc<AtomicBool>,
     reader_alive: Arc<AtomicBool>,
+    name: String,
+}
+
+/// Handles returned from `setup_session`, containing everything needed for the I/O loops.
+struct SessionSetup {
+    handles: SessionHandles,
+    is_new_session: bool,
+    evict_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Parameters for a session connection request.
+pub struct ConnectRequest {
+    pub name: String,
+    pub history: usize,
+    pub cols: u16,
+    pub rows: u16,
+    pub leftover: Vec<u8>,
+    pub mode: crate::protocol::ConnectMode,
 }
 
 /// Acquire or create the session, set up eviction, resize, and extract handles.
@@ -80,7 +93,7 @@ async fn setup_session(
     let mut mgr = manager.lock().await;
 
     use crate::protocol::ConnectMode;
-    let (session, _is_new) = match mode {
+    let (session, is_new) = match mode {
         ConnectMode::CreateOrAttach => {
             match mgr.get_or_create(name, cols, rows, history) {
                 Ok(s) => s,
@@ -121,15 +134,10 @@ async fn setup_session(
     session.has_client.store(true, Ordering::Release);
 
     // Evict previous client if any.
-    let had_eviction = if let Some(old_tx) = session.evict_tx.take() {
+    if let Some(old_tx) = session.evict_tx.take() {
         debug!(session = %name, "evicting previous client");
         let _ = old_tx.send(false);
-        true
-    } else {
-        false
-    };
-
-    let is_new = !had_eviction && session.evict_tx.is_none();
+    }
 
     // Create eviction channel for this client
     let (evict_tx, evict_rx) = tokio::sync::watch::channel(true);
@@ -140,7 +148,7 @@ async fn setup_session(
         Ok(d) => *d,
         Err(e) => {
             warn!(session = %name, error = %e, "dims mutex poisoned during reattach");
-            (80, 24)
+            (DEFAULT_COLS, DEFAULT_ROWS)
         }
     };
     if !is_new {
@@ -153,7 +161,7 @@ async fn setup_session(
                 new_cols = cols, new_rows = rows,
                 "resizing session for reattach"
             );
-            if let Err(e) = SessionIo::resize(&master, &screen, cols, rows) {
+            if let Err(e) = resize_pty(&master, &screen, cols, rows) {
                 warn!(session = %name, error = %e, "failed to resize on reattach");
             } else {
                 match session.dims.lock() {
@@ -181,36 +189,33 @@ async fn setup_session(
         }
     }
 
-    let io = SessionIo {
-        pty_writer: session.pty.writer.clone(),
+    let handles = SessionHandles {
         screen: session.screen.clone(),
+        pty_writer: session.pty.writer.clone(),
+        master: session.pty.master_arc(),
+        dims: session.dims.clone(),
+        screen_notify: session.screen_notify.clone(),
+        has_client: session.has_client.clone(),
+        reader_alive: session.reader_alive.clone(),
+        name: name.to_string(),
     };
-    let master_arc = session.pty.master_arc();
-    let dims_arc = session.dims.clone();
-    let screen_notify = session.screen_notify.clone();
-    let has_client = session.has_client.clone();
-    let reader_alive = session.reader_alive.clone();
 
-    Ok(SessionSetup {
-        io, master_arc, is_new_session: is_new, evict_rx, dims_arc,
-        screen_notify, has_client, reader_alive,
-    })
+    Ok(SessionSetup { handles, is_new_session: is_new, evict_rx })
 }
 
 /// Send Connected message, scrollback history, and initial screen state.
 /// Returns the render_cache for subsequent incremental renders.
 async fn send_initial_state(
-    io: &SessionIo,
-    name: &str,
+    handles: &SessionHandles,
     is_new_session: bool,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> anyhow::Result<RenderCache> {
-    let connected = protocol::encode(&ServerMsg::Connected { name: name.to_string(), new_session: is_new_session })?;
+    let connected = protocol::encode(&ServerMsg::Connected { name: handles.name.clone(), new_session: is_new_session })?;
     writer.write_all(&connected).await?;
 
     let mut render_cache = RenderCache::new();
     let (hist_chunks, screen_msg) = {
-        let screen = lock_mutex(&io.screen, "screen")?;
+        let screen = lock_mutex(&handles.screen, "screen")?;
         // Skip history injection when in alt screen (e.g. htop, vim).
         // The scrollback is from the main screen and not relevant while the
         // alt screen app is running.  Re-injecting it on every reconnect
@@ -266,7 +271,7 @@ async fn send_initial_state(
 
     // Drain stale pending scrollback so the screen→client loop starts clean.
     {
-        let mut screen = lock_mutex(&io.screen, "screen")?;
+        let mut screen = lock_mutex(&handles.screen, "screen")?;
         let _ = screen.take_pending_scrollback();
         let _ = screen.take_passthrough();
     }
@@ -276,17 +281,12 @@ async fn send_initial_state(
 
 /// Screen → client relay loop: waits for the persistent reader to signal new
 /// data, then renders and sends updates to the client.
-#[allow(clippy::too_many_arguments)]
 async fn screen_to_client(
-    screen: Arc<StdMutex<Screen>>,
+    h: SessionHandles,
     mut render_cache: RenderCache,
     refresh_notify: Arc<tokio::sync::Notify>,
     mut evict_rx: tokio::sync::watch::Receiver<bool>,
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    session_name: String,
-    screen_notify: Arc<tokio::sync::Notify>,
-    has_client: Arc<AtomicBool>,
-    reader_alive: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     use std::pin::pin;
     use std::time::Duration;
@@ -294,25 +294,24 @@ async fn screen_to_client(
 
     // If the reader is already dead (child exited before we connected),
     // send final state and SessionEnded immediately.
-    if !reader_alive.load(Ordering::Acquire) {
-        render_and_send(&screen, &mut render_cache, &mut writer, true).await?;
+    if !h.reader_alive.load(Ordering::Acquire) {
+        render_and_send(&h.screen, &mut render_cache, &mut writer, true).await?;
         let msg = protocol::encode(&ServerMsg::SessionEnded)?;
         writer.write_all(&msg).await?;
-        has_client.store(false, Ordering::Release);
+        h.has_client.store(false, Ordering::Release);
         return Ok(());
     }
 
-    let throttle_interval = Duration::from_millis(16);
     let mut throttle_sleep = pin!(tokio::time::sleep(Duration::ZERO));
     let mut pending_render = false;
 
     loop {
         tokio::select! {
-            _ = screen_notify.notified() => {
-                if !reader_alive.load(Ordering::Acquire) {
+            _ = h.screen_notify.notified() => {
+                if !h.reader_alive.load(Ordering::Acquire) {
                     // Reader exited (PTY EOF). Do a final render + send SessionEnded.
                     let (scrollback_lines, passthrough) = {
-                        let mut scr = lock_mutex(&screen, "screen")?;
+                        let mut scr = lock_mutex(&h.screen, "screen")?;
                         (scr.take_pending_scrollback(), scr.take_passthrough())
                     };
                     for chunk in passthrough {
@@ -320,23 +319,23 @@ async fn screen_to_client(
                         writer.write_all(&msg).await?;
                     }
                     if !scrollback_lines.is_empty() {
-                        let update = lock_mutex(&screen, "screen")?
+                        let update = lock_mutex(&h.screen, "screen")?
                             .render_with_scrollback(&scrollback_lines, &mut render_cache);
                         let msg = protocol::encode(&ServerMsg::ScreenUpdate(update))?;
                         writer.write_all(&msg).await?;
                     } else {
-                        render_and_send(&screen, &mut render_cache, &mut writer, false).await?;
+                        render_and_send(&h.screen, &mut render_cache, &mut writer, false).await?;
                     }
                     let msg = protocol::encode(&ServerMsg::SessionEnded)?;
                     writer.write_all(&msg).await?;
                     break;
                 }
                 pending_render = true;
-                throttle_sleep.as_mut().reset(Instant::now() + throttle_interval);
+                throttle_sleep.as_mut().reset(Instant::now() + RENDER_THROTTLE);
             }
             _ = &mut throttle_sleep, if pending_render => {
                 let (scrollback_lines, passthrough) = {
-                    let mut scr = lock_mutex(&screen, "screen")?;
+                    let mut scr = lock_mutex(&h.screen, "screen")?;
                     (scr.take_pending_scrollback(), scr.take_passthrough())
                 };
 
@@ -346,53 +345,54 @@ async fn screen_to_client(
                 }
 
                 if !scrollback_lines.is_empty() {
-                    let update = lock_mutex(&screen, "screen")?
+                    let update = lock_mutex(&h.screen, "screen")?
                         .render_with_scrollback(&scrollback_lines, &mut render_cache);
                     let msg = protocol::encode(&ServerMsg::ScreenUpdate(update))?;
                     writer.write_all(&msg).await?;
                 } else {
-                    render_and_send(&screen, &mut render_cache, &mut writer, false).await?;
+                    render_and_send(&h.screen, &mut render_cache, &mut writer, false).await?;
                 }
                 pending_render = false;
             }
             _ = refresh_notify.notified() => {
-                render_and_send(&screen, &mut render_cache, &mut writer, true).await?;
+                render_and_send(&h.screen, &mut render_cache, &mut writer, true).await?;
             }
             _ = evict_rx.changed() => {
-                debug!(session = %session_name, "client evicted by new connection");
+                debug!(session = %h.name, "client evicted by new connection");
                 let msg = protocol::encode(&ServerMsg::Error("evicted by new client".into()))?;
                 let _ = writer.write_all(&msg).await;
                 break;
             }
         }
     }
-    has_client.store(false, Ordering::Release);
+    // Only clear has_client if we were NOT evicted.  When evicted, the new
+    // client already set has_client=true and clearing it here would race with
+    // the new connection, causing the persistent reader to drain pending data.
+    // evict_rx initial value is `true`; eviction sends `false`.
+    if *evict_rx.borrow() {
+        h.has_client.store(false, Ordering::Release);
+    }
     Ok(())
 }
 
 /// Client → PTY relay loop: reads client messages and dispatches them.
-#[allow(clippy::too_many_arguments)]
 async fn client_to_pty(
+    h: SessionHandles,
     mut sock_reader: tokio::net::unix::OwnedReadHalf,
-    pty_writer: Arc<StdMutex<Box<dyn Write + Send>>>,
-    master_arc: Arc<StdMutex<Box<dyn portable_pty::MasterPty + Send>>>,
-    screen: Arc<StdMutex<Screen>>,
-    dims_arc: Arc<StdMutex<(u16, u16)>>,
     refresh_notify: Arc<tokio::sync::Notify>,
     leftover: Vec<u8>,
-    name: String,
 ) -> anyhow::Result<()> {
     let mut frames = FrameReader::with_leftover(leftover);
 
     loop {
         if !frames.fill_from(&mut sock_reader).await? {
-            debug!(session = %name, "client socket closed");
+            debug!(session = %h.name, "client socket closed");
             break;
         }
         while let Some(msg) = frames.decode_next::<ClientMsg>()? {
             match msg {
                 ClientMsg::Input(input) => {
-                    let pw = pty_writer.clone();
+                    let pw = h.pty_writer.clone();
                     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                         let mut w = lock_mutex(&pw, "pty_writer")?;
                         w.write_all(&input)?;
@@ -401,21 +401,28 @@ async fn client_to_pty(
                     }).await??;
                 }
                 ClientMsg::Resize { cols, rows } => {
-                    SessionIo::resize(&master_arc, &screen, cols, rows)?;
-                    match dims_arc.lock() {
-                        Ok(mut dims) => *dims = crate::screen::grid::sanitize_dimensions(cols, rows),
-                        Err(e) => warn!(session = %name, error = %e, "dims mutex poisoned during client resize"),
-                    }
+                    let master_clone = h.master.clone();
+                    let screen_clone = h.screen.clone();
+                    let dims_clone = h.dims.clone();
+                    let name_clone = h.name.clone();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        resize_pty(&master_clone, &screen_clone, cols, rows)?;
+                        match dims_clone.lock() {
+                            Ok(mut dims) => *dims = crate::screen::grid::sanitize_dimensions(cols, rows),
+                            Err(e) => warn!(session = %name_clone, error = %e, "dims mutex poisoned during client resize"),
+                        }
+                        Ok(())
+                    }).await??;
                 }
                 ClientMsg::RefreshScreen => {
                     refresh_notify.notify_one();
                 }
                 ClientMsg::Detach => {
-                    debug!(session = %name, "client detached");
+                    debug!(session = %h.name, "client detached");
                     return Ok(());
                 }
                 other => {
-                    debug!(session = %name, "ignoring unexpected client message: {:?}", std::mem::discriminant(&other));
+                    debug!(session = %h.name, "ignoring unexpected client message: {:?}", std::mem::discriminant(&other));
                 }
             }
         }
@@ -424,48 +431,41 @@ async fn client_to_pty(
 }
 
 /// Bridge a connected client to a session, relaying screen updates and client input bidirectionally.
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_session(
     mut stream: tokio::net::UnixStream,
     manager: Arc<Mutex<SessionManager>>,
-    name: String,
-    history: usize,
-    cols: u16,
-    rows: u16,
-    leftover: Vec<u8>,
-    mode: crate::protocol::ConnectMode,
+    req: ConnectRequest,
 ) -> anyhow::Result<()> {
-    let setup = setup_session(&mut stream, &manager, &name, history, cols, rows, mode).await?;
+    let setup = setup_session(&mut stream, &manager, &req.name, req.history, req.cols, req.rows, req.mode).await?;
     // Manager lock dropped — not held during I/O
 
-    let has_client = setup.has_client.clone();
+    let has_client = setup.handles.has_client.clone();
     let (reader, mut writer) = stream.into_split();
 
-    let render_cache = send_initial_state(&setup.io, &name, setup.is_new_session, &mut writer).await?;
+    let render_cache = match send_initial_state(&setup.handles, setup.is_new_session, &mut writer).await {
+        Ok(cache) => cache,
+        Err(e) => {
+            has_client.store(false, Ordering::Release);
+            return Err(e);
+        }
+    };
 
     let refresh_notify = Arc::new(tokio::sync::Notify::new());
+    let evict_rx_local = setup.evict_rx.clone();
 
     let mut screen_to_client_task = tokio::spawn(screen_to_client(
-        setup.io.screen.clone(),
+        setup.handles.clone(),
         render_cache,
         refresh_notify.clone(),
         setup.evict_rx,
         writer,
-        name.clone(),
-        setup.screen_notify,
-        setup.has_client,
-        setup.reader_alive,
     ));
 
     let mut client_to_pty_task = tokio::spawn(client_to_pty(
+        setup.handles,
         reader,
-        setup.io.pty_writer,
-        setup.master_arc,
-        setup.io.screen,
-        setup.dims_arc,
         refresh_notify,
-        leftover,
-        name,
+        req.leftover,
     ));
 
     tokio::select! {
@@ -477,9 +477,12 @@ pub async fn handle_session(
         r = &mut client_to_pty_task => {
             debug!("client_to_pty finished: {:?}", r.as_ref().map(|r| r.as_ref().map(|_| "ok")));
             screen_to_client_task.abort();
-            // Client disconnected — ensure has_client is cleared so the
-            // persistent reader drains pending data instead of accumulating it.
-            has_client.store(false, Ordering::Release);
+            // Only clear has_client if we were NOT evicted.  When evicted, the
+            // new client already set has_client=true and clearing it here would
+            // race with the new connection.
+            if *evict_rx_local.borrow() {
+                has_client.store(false, Ordering::Release);
+            }
             r??;
         }
     }

@@ -1240,7 +1240,7 @@ fn resize_in_alt_screen_modes_restored_correctly() {
     screen.process(b"\x1b[?2004h"); // bracketed paste
     screen.process(b"\x1b[?1000h"); // mouse mode
     assert!(screen.grid.modes.bracketed_paste);
-    assert_eq!(screen.grid.modes.mouse_mode, 1000);
+    assert_eq!(screen.grid.modes.mouse_mode, super::grid::MouseMode::Click);
 
     // Enter alt screen (saves modes)
     screen.process(b"\x1b[?1049h");
@@ -1255,7 +1255,7 @@ fn resize_in_alt_screen_modes_restored_correctly() {
     screen.process(b"\x1b[?1049l");
     assert!(screen.grid.modes.bracketed_paste,
         "bracketed paste should be restored from saved modes after resize");
-    assert_eq!(screen.grid.modes.mouse_mode, 1000,
+    assert_eq!(screen.grid.modes.mouse_mode, super::grid::MouseMode::Click,
         "mouse mode should be restored from saved modes after resize");
     // Scroll region should be reset to new dimensions
     assert_eq!(screen.grid.scroll_top, 0);

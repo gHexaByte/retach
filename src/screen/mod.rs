@@ -163,6 +163,8 @@ impl Screen {
 #[cfg(test)]
 mod history_boundary_tests;
 #[cfg(test)]
+mod tests_large_updates;
+#[cfg(test)]
 mod tests_screen;
 #[cfg(test)]
 mod tests_reattach;

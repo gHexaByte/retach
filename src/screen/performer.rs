@@ -4,7 +4,7 @@ use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
 use super::cell::Cell;
-use super::grid::{ActiveCharset, Charset, CursorShape, Grid, TerminalModes};
+use super::grid::{ActiveCharset, Charset, CursorShape, Grid, MouseEncoding, MouseMode, TerminalModes};
 use super::ScreenState;
 use super::style::Style;
 
@@ -411,18 +411,18 @@ impl<'a> ScreenPerformer<'a> {
                 Some(12) => {} // Cursor blink — cosmetic, ignore
                 Some(25) => self.grid.cursor_visible = enable,
                 Some(1000 | 1002 | 1003) => {
-                    if enable {
-                        self.grid.modes.mouse_mode = param[0];
+                    self.grid.modes.mouse_mode = if enable {
+                        MouseMode::from_param(param[0]).unwrap_or(MouseMode::Off)
                     } else {
-                        self.grid.modes.mouse_mode = 0;
-                    }
+                        MouseMode::Off
+                    };
                 }
                 Some(1005 | 1006) => {
-                    if enable {
-                        self.grid.modes.mouse_encoding = param[0];
+                    self.grid.modes.mouse_encoding = if enable {
+                        MouseEncoding::from_param(param[0]).unwrap_or(MouseEncoding::X10)
                     } else {
-                        self.grid.modes.mouse_encoding = 0;
-                    }
+                        MouseEncoding::X10
+                    };
                 }
                 Some(1004) => self.grid.modes.focus_reporting = enable,
                 Some(1048) => {
@@ -473,7 +473,10 @@ impl<'a> Perform for ScreenPerformer<'a> {
                     } else {
                         tx
                     };
-                    self.grid.cells[cy][tx].combining.push(c);
+                    const MAX_COMBINING: usize = 16;
+                    if self.grid.cells[cy][tx].combining.len() < MAX_COMBINING {
+                        self.grid.cells[cy][tx].combining.push(c);
+                    }
                 }
             }
             return;
@@ -630,7 +633,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                     self.state.pending_responses.push(b"\x1b[>0;10;1c".to_vec());
                 }
             }
-            'q' if intermediates == b" " => self.grid.modes.cursor_shape = CursorShape::from_sgr(p(0, 0) as u8),
+            'q' if intermediates == b" " => self.grid.modes.cursor_shape = CursorShape::from_param(p(0, 0) as u8),
             'S' => self.csi_scroll_up_n(p(0, 1)),
             'T' if ps.len() <= 1 => self.csi_scroll_down_n(p(0, 1)),
             'M' => self.csi_delete_lines(p(0, 1)),

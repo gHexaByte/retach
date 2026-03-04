@@ -2,7 +2,7 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 
 use super::cell::Cell;
-use super::grid::{ActiveCharset, Charset, Grid, TerminalModes};
+use super::grid::{ActiveCharset, Charset, Grid, MouseEncoding, TerminalModes};
 use super::style::{Style, write_u16};
 
 /// Per-connection render cache for dirty tracking and mode delta.
@@ -105,8 +105,8 @@ fn emit_mode(out: &mut Vec<u8>, modes: &TerminalModes) {
 
     // Mouse mode: always reset all first, then enable the active one
     out.extend_from_slice(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l");
-    if modes.mouse_mode != 0 {
-        emit_dec_mode(out, modes.mouse_mode, true);
+    if modes.mouse_mode.is_enabled() {
+        emit_dec_mode(out, modes.mouse_mode.to_param(), true);
     }
 
     // Mouse encoding
@@ -129,11 +129,11 @@ fn emit_mode(out: &mut Vec<u8>, modes: &TerminalModes) {
 }
 
 /// Emit mouse encoding sequence for the given encoding mode.
-fn emit_mouse_encoding(out: &mut Vec<u8>, encoding: u16) {
+fn emit_mouse_encoding(out: &mut Vec<u8>, encoding: MouseEncoding) {
     match encoding {
-        1006 => { out.extend_from_slice(b"\x1b[?1005l"); out.extend_from_slice(b"\x1b[?1006h"); }
-        1005 => { out.extend_from_slice(b"\x1b[?1006l"); out.extend_from_slice(b"\x1b[?1005h"); }
-        _ => out.extend_from_slice(b"\x1b[?1006l\x1b[?1005l"),
+        MouseEncoding::Sgr => { out.extend_from_slice(b"\x1b[?1005l"); out.extend_from_slice(b"\x1b[?1006h"); }
+        MouseEncoding::Utf8 => { out.extend_from_slice(b"\x1b[?1006l"); out.extend_from_slice(b"\x1b[?1005h"); }
+        MouseEncoding::X10 => out.extend_from_slice(b"\x1b[?1006l\x1b[?1005l"),
     }
 }
 
@@ -156,11 +156,11 @@ fn emit_mode_delta(out: &mut Vec<u8>, modes: &TerminalModes, prev: &TerminalMode
     }
     if modes.mouse_mode != prev.mouse_mode {
         // Disable the old mode first, then enable the new one
-        if prev.mouse_mode != 0 {
-            emit_dec_mode(out, prev.mouse_mode, false);
+        if prev.mouse_mode.is_enabled() {
+            emit_dec_mode(out, prev.mouse_mode.to_param(), false);
         }
-        if modes.mouse_mode != 0 {
-            emit_dec_mode(out, modes.mouse_mode, true);
+        if modes.mouse_mode.is_enabled() {
+            emit_dec_mode(out, modes.mouse_mode.to_param(), true);
         }
     }
     if modes.mouse_encoding != prev.mouse_encoding {
@@ -344,7 +344,7 @@ fn render_screen_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::grid::CursorShape;
+    use super::super::grid::{CursorShape, MouseEncoding, MouseMode};
     use super::super::style::Color;
 
     #[test]
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn render_screen_full_mode_resets_all_mouse_modes() {
         let mut grid = Grid::new(10, 3);
-        grid.modes.mouse_mode = 1003;
+        grid.modes.mouse_mode = MouseMode::Any;
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -584,13 +584,13 @@ mod tests {
     #[test]
     fn render_screen_mode_delta_mouse_switch() {
         let mut grid = Grid::new(10, 3);
-        grid.modes.mouse_mode = 1000;
+        grid.modes.mouse_mode = MouseMode::Click;
         let mut cache = RenderCache::new();
         // Initial render (full)
         let _ = render_screen(&grid, "", true, &mut cache);
 
-        // Switch mouse mode from 1000 to 1003
-        grid.modes.mouse_mode = 1003;
+        // Switch mouse mode from Click to Any
+        grid.modes.mouse_mode = MouseMode::Any;
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
         // Should disable old mode
@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn render_screen_mouse_encoding_1006() {
         let mut grid = Grid::new(10, 3);
-        grid.modes.mouse_encoding = 1006;
+        grid.modes.mouse_encoding = MouseEncoding::Sgr;
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -798,7 +798,7 @@ mod tests {
     #[test]
     fn render_screen_mouse_encoding_1005() {
         let mut grid = Grid::new(10, 3);
-        grid.modes.mouse_encoding = 1005;
+        grid.modes.mouse_encoding = MouseEncoding::Utf8;
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);

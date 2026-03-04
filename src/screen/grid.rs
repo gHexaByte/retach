@@ -33,7 +33,7 @@ pub enum CursorShape {
 
 impl CursorShape {
     /// Convert from raw DECSCUSR parameter.
-    pub fn from_sgr(n: u8) -> Self {
+    pub fn from_param(n: u8) -> Self {
         match n {
             1 => Self::BlinkBlock,
             2 => Self::SteadyBlock,
@@ -66,8 +66,8 @@ pub struct TerminalModes {
     pub bracketed_paste: bool,    // ?2004
     pub autowrap_mode: bool,      // ?7 DECAWM (default true)
     pub focus_reporting: bool,    // ?1004
-    pub mouse_mode: u16,          // 0=off, 1000/1002/1003
-    pub mouse_encoding: u16,      // 0=X10, 1006=SGR
+    pub mouse_mode: MouseMode,
+    pub mouse_encoding: MouseEncoding,
     pub keypad_app_mode: bool,    // ESC = / ESC >
     pub cursor_shape: CursorShape,
     // DEC character sets
@@ -83,13 +83,69 @@ impl Default for TerminalModes {
             bracketed_paste: false,
             autowrap_mode: true,
             focus_reporting: false,
-            mouse_mode: 0,
-            mouse_encoding: 0,
+            mouse_mode: MouseMode::Off,
+            mouse_encoding: MouseEncoding::X10,
             keypad_app_mode: false,
             cursor_shape: CursorShape::Default,
             g0_charset: Charset::Ascii,
             g1_charset: Charset::Ascii,
             active_charset: ActiveCharset::G0,
+        }
+    }
+}
+
+/// Mouse tracking mode.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Hash)]
+pub enum MouseMode {
+    #[default]
+    Off,
+    Click,  // ?1000
+    Button, // ?1002
+    Any,    // ?1003
+}
+
+impl MouseMode {
+    /// Convert from a DEC private mode parameter.
+    pub fn from_param(p: u16) -> Option<Self> {
+        match p {
+            1000 => Some(Self::Click),
+            1002 => Some(Self::Button),
+            1003 => Some(Self::Any),
+            _ => None,
+        }
+    }
+
+    /// Convert to a DEC private mode parameter, or 0 if off.
+    pub fn to_param(self) -> u16 {
+        match self {
+            Self::Off => 0,
+            Self::Click => 1000,
+            Self::Button => 1002,
+            Self::Any => 1003,
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// Mouse coordinate encoding.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Hash)]
+pub enum MouseEncoding {
+    #[default]
+    X10,
+    Utf8, // ?1005
+    Sgr,  // ?1006
+}
+
+impl MouseEncoding {
+    /// Convert from a DEC private mode parameter.
+    pub fn from_param(p: u16) -> Option<Self> {
+        match p {
+            1005 => Some(Self::Utf8),
+            1006 => Some(Self::Sgr),
+            _ => None,
         }
     }
 }
@@ -345,7 +401,7 @@ mod tests {
         assert!(modes.autowrap_mode);
         assert!(!modes.cursor_key_mode);
         assert!(!modes.bracketed_paste);
-        assert_eq!(modes.mouse_mode, 0);
+        assert_eq!(modes.mouse_mode, MouseMode::Off);
         assert_eq!(modes.cursor_shape, CursorShape::Default);
     }
 

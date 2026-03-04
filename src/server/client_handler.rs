@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 use tracing::info;
 
-use super::session_bridge::handle_session;
+use super::session_bridge::{handle_session, ConnectRequest};
 
 /// Read initial message with a timeout to prevent idle connections from leaking resources.
 const INITIAL_MSG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -32,7 +32,16 @@ pub async fn handle_client(
         if let Some(msg) = frames.decode_next::<ClientMsg>()? {
             match msg {
                 ClientMsg::Connect { name, history, cols, rows, mode } => {
-                    return handle_session(stream, manager, name, history, cols, rows, frames.into_leftover(), mode).await;
+                    if let Err(e) = crate::session::validate_session_name(&name) {
+                        let resp = protocol::encode(&ServerMsg::Error(format!("{}", e)))?;
+                        stream.write_all(&resp).await?;
+                        return Ok(());
+                    }
+                    return handle_session(stream, manager, ConnectRequest {
+                        name, history, cols, rows,
+                        leftover: frames.into_leftover(),
+                        mode,
+                    }).await;
                 }
                 ClientMsg::ListSessions => {
                     let list = manager.lock().await.list();
@@ -41,6 +50,11 @@ pub async fn handle_client(
                     return Ok(());
                 }
                 ClientMsg::KillSession { name } => {
+                    if let Err(e) = crate::session::validate_session_name(&name) {
+                        let resp = protocol::encode(&ServerMsg::Error(format!("{}", e)))?;
+                        stream.write_all(&resp).await?;
+                        return Ok(());
+                    }
                     let removed = {
                         let mut mgr = manager.lock().await;
                         mgr.remove(&name)

@@ -11,6 +11,13 @@ use tokio::net::UnixStream;
 use raw_mode::RawMode;
 use server_launcher::ensure_server_running;
 
+/// Detach key: Ctrl+\ (0x1c).
+const DETACH_KEY: u8 = 0x1c;
+/// Focus-in event: ESC [ I
+const FOCUS_IN: u8 = b'I';
+/// Focus-out event: ESC [ O
+const FOCUS_OUT: u8 = b'O';
+
 /// RAII guard that removes the custom panic hook on drop.
 struct PanicHookGuard;
 
@@ -64,13 +71,10 @@ fn dispatch_server_msg(msg: &ServerMsg, stdout: &mut impl Write) -> io::Result<D
 }
 
 fn get_terminal_size() -> (u16, u16) {
-    if let Some((w, h)) = term_size::dimensions() {
-        (
-            u16::try_from(w).unwrap_or(80),
-            u16::try_from(h).unwrap_or(24),
-        )
+    if let Some(size) = terminal_size::terminal_size() {
+        (size.0 .0, size.1 .0)
     } else {
-        (80, 24)
+        (crate::session::DEFAULT_COLS, crate::session::DEFAULT_ROWS)
     }
 }
 
@@ -112,7 +116,7 @@ async fn run_stdin_to_socket(sw: SocketWriter) -> anyhow::Result<()> {
                 };
 
                 // Check for detach key (Ctrl+\, byte 0x1c)
-                if let Some(pos) = raw.iter().position(|&b| b == 0x1c) {
+                if let Some(pos) = raw.iter().position(|&b| b == DETACH_KEY) {
                     let mut w = sw.lock().await;
                     if pos > 0 {
                         if let Ok(msg) = protocol::encode(&ClientMsg::Input(raw[..pos].to_vec())) {
@@ -131,9 +135,9 @@ async fn run_stdin_to_socket(sw: SocketWriter) -> anyhow::Result<()> {
                 while i < raw.len() {
                     if raw[i] == 0x1b {
                         if i + 1 < raw.len() {
-                            if raw[i + 1] == 0x5b {
+                            if raw[i + 1] == b'[' {
                                 if i + 2 < raw.len() {
-                                    if raw[i + 2] == 0x49 {
+                                    if raw[i + 2] == FOCUS_IN {
                                         // Focus-in: send refresh instead
                                         if let Ok(msg) = protocol::encode(&ClientMsg::RefreshScreen) {
                                             let mut w = sw.lock().await;
@@ -141,7 +145,7 @@ async fn run_stdin_to_socket(sw: SocketWriter) -> anyhow::Result<()> {
                                         }
                                         i += 3;
                                         continue;
-                                    } else if raw[i + 2] == 0x4f {
+                                    } else if raw[i + 2] == FOCUS_OUT {
                                         // Focus-out: drop silently
                                         i += 3;
                                         continue;

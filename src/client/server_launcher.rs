@@ -1,5 +1,10 @@
 use tokio::net::UnixStream;
 
+/// How often to poll for the server socket during startup.
+const SERVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Maximum number of polls before giving up.
+const SERVER_POLL_MAX: usize = 50;
+
 /// Spawn the daemon server process if it is not already listening, then wait for it to be ready.
 ///
 /// Uses a lockfile with `flock(LOCK_EX | LOCK_NB)` to prevent two clients from
@@ -21,8 +26,8 @@ pub async fn ensure_server_running() -> anyhow::Result<()> {
         Ok(guard) => guard, // we hold the lock (released on drop)
         Err((_, nix::errno::Errno::EWOULDBLOCK)) => {
             // Another client is already spawning the server — wait for it to appear.
-            for _ in 0..50 {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            for _ in 0..SERVER_POLL_MAX {
+                tokio::time::sleep(SERVER_POLL_INTERVAL).await;
                 if UnixStream::connect(&path).await.is_ok() {
                     return Ok(());
                 }
