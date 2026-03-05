@@ -97,6 +97,23 @@ pub async fn run_server() -> anyhow::Result<()> {
         }
     }
 
+    // Explicitly drop all sessions on a blocking thread with a timeout,
+    // so server shutdown doesn't hang if child processes are unresponsive.
+    let all_sessions: Vec<crate::session::Session> = {
+        let mut mgr = manager.lock().await;
+        mgr.drain_all()
+    };
+    if !all_sessions.is_empty() {
+        info!(count = all_sessions.len(), "cleaning up sessions on shutdown");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || drop(all_sessions)),
+        ).await;
+        if result.is_err() {
+            warn!("timed out waiting for sessions to clean up");
+        }
+    }
+
     Ok(())
     // _socket_guard drops here, removing socket file
 }

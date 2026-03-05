@@ -51,7 +51,7 @@ retach kill work
 
 **Detach:** press `Ctrl+\` inside any session.
 
-**Custom scrollback size** (default 10,000 lines):
+**Custom scrollback size** (default 10,000 lines, max 1,000,000):
 
 ```bash
 retach open work --history 50000
@@ -66,9 +66,9 @@ Client (retach)            Daemon                     Shell
     |                        |                          |
     |--- Input(keys) ------->|--- write to PTY -------->|
     |                        |                          |
-    |<-- ScrollbackLine -----|    Persistent PTY Reader |
-    |<-- ScreenUpdate -------|<-- PTY output -----------|
-    |                        |    (VTE parsed, always)  |
+    |<-- ScreenUpdate -------|    Persistent PTY Reader |
+    |    (grid + scrollback) |<-- PTY output -----------|
+    |<-- History (reattach) -|    (VTE parsed, always)  |
     |                        |                          |
   stdout                  Grid + Scrollback          bash/zsh
 (native terminal)         (in memory, always live)

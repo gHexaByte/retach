@@ -201,12 +201,15 @@ impl SessionManager {
     }
 
     /// Create a new session with the given name, failing if it already exists.
+    /// Zero dimensions are clamped to defaults.
     pub fn create(&mut self, name: String, cols: u16, rows: u16, history: usize) -> anyhow::Result<()> {
         validate_session_name(&name)?;
         if self.sessions.contains_key(&name) {
             anyhow::bail!("session '{}' already exists", name);
         }
-        let session = Session::new(name.clone(), cols, rows, history)?;
+        let c = if cols > 0 { cols } else { DEFAULT_COLS };
+        let r = if rows > 0 { rows } else { DEFAULT_ROWS };
+        let session = Session::new(name.clone(), c, r, history)?;
         self.sessions.insert(name, session);
         Ok(())
     }
@@ -255,6 +258,11 @@ impl SessionManager {
                 rows,
             }
         }).collect()
+    }
+
+    /// Remove and return all sessions (for graceful shutdown).
+    pub fn drain_all(&mut self) -> Vec<Session> {
+        self.sessions.drain().map(|(_, s)| s).collect()
     }
 
     /// Remove dead sessions and return them for cleanup outside the lock.

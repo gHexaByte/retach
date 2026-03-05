@@ -32,6 +32,13 @@ impl RenderCache {
     }
 }
 
+/// Index (inclusive) of the last cell with visible content or non-default style.
+/// Returns `None` if the entire row is blank with default style.
+fn last_content_position(row: &[Cell]) -> Option<usize> {
+    row.iter()
+        .rposition(|c| (c.c != ' ' && c.c != '\0') || !c.style.is_default())
+}
+
 fn hash_row(row: &[Cell]) -> u64 {
     let mut hasher = DefaultHasher::new();
     row.hash(&mut hasher);
@@ -41,10 +48,7 @@ fn hash_row(row: &[Cell]) -> u64 {
 /// Render a single row of cells as ANSI bytes with SGR codes.
 /// Returns empty Vec for fully blank lines.
 pub fn render_line(row: &[Cell]) -> Vec<u8> {
-    let last_non_space = row.iter()
-        .rposition(|c| (c.c != ' ' && c.c != '\0') || !c.style.is_default());
-
-    let last_non_space = match last_non_space {
+    let last_non_space = match last_content_position(row) {
         Some(pos) => pos,
         None => {
             return Vec::new();
@@ -297,8 +301,7 @@ fn render_screen_impl(
         write_u16(&mut out, y as u16 + 1);
         out.extend_from_slice(b";1H");
 
-        let write_len = row.iter()
-            .rposition(|c| (c.c != ' ' && c.c != '\0') || !c.style.is_default())
+        let write_len = last_content_position(row)
             .map(|p| p + 1)
             .unwrap_or(0);
 

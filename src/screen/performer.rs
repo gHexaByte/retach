@@ -136,6 +136,16 @@ impl<'a> ScreenPerformer<'a> {
             }
             let cols_usize = self.grid.cols as usize;
             for row in self.grid.visible_rows_mut() {
+                // Clean up orphaned wide chars at the new right edge (same as Grid::resize)
+                if row.len() > cols_usize && cols_usize > 0 {
+                    let last = cols_usize - 1;
+                    if row[last].width == 2 {
+                        row[last] = Cell::default();
+                    } else if last > 0 && row[last].width == 0 {
+                        row[last] = Cell::default();
+                        row[last - 1] = Cell::default();
+                    }
+                }
                 row.resize(cols_usize, Cell::default());
             }
         }
@@ -401,13 +411,13 @@ impl<'a> ScreenPerformer<'a> {
     fn csi_set_scrolling_region(&mut self, top: u16, bottom: u16) {
         let top = top.saturating_sub(1);
         let bottom = bottom.saturating_sub(1).min(self.grid.rows - 1);
-        if top < bottom {
+        if top <= bottom {
             self.grid.scroll_top = top;
             self.grid.scroll_bottom = bottom;
+            self.grid.cursor_x = 0;
+            self.grid.cursor_y = 0;
+            self.grid.wrap_pending = false;
         }
-        self.grid.cursor_x = 0;
-        self.grid.cursor_y = 0;
-        self.grid.wrap_pending = false;
     }
 
     fn csi_set_dec_private_mode(&mut self, ps: &[Vec<u16>], enable: bool) {
@@ -709,6 +719,14 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 for row in self.grid.visible_rows_mut() {
                     for cell in row.iter_mut() { *cell = blank.clone(); }
                 }
+                // Clear scrollback (real terminals do this on RIS)
+                self.grid.cells.drain(..self.grid.scrollback_len);
+                self.grid.scrollback_len = 0;
+                self.grid.pending_start = 0;
+                // Forward \e[3J to clear outer terminal's native scrollback.
+                // We don't forward \ec itself — that would reset the outer
+                // terminal's state and interfere with retach's rendering.
+                self.state.pending_passthrough.push(b"\x1b[3J".to_vec());
             }
             ([], b'=') => { // DECKPAM — Keypad Application Mode
                 self.grid.modes.keypad_app_mode = true;
@@ -724,7 +742,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         if params.is_empty() {
             return;
         }
@@ -753,7 +771,11 @@ impl<'a> Perform for ScreenPerformer<'a> {
             }
             buf.extend_from_slice(param);
         }
-        buf.push(0x07); // BEL terminator
+        if bell_terminated {
+            buf.push(0x07); // BEL terminator
+        } else {
+            buf.extend_from_slice(b"\x1b\\"); // ST terminator
+        }
         self.state.pending_passthrough.push(buf);
     }
 

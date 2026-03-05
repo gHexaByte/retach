@@ -1,6 +1,15 @@
 use clap::{Parser, Subcommand};
 
 const DEFAULT_HISTORY: usize = 10000;
+const MAX_HISTORY: usize = 1_000_000;
+
+fn parse_history(s: &str) -> Result<usize, String> {
+    let val: usize = s.parse().map_err(|e| format!("{e}"))?;
+    if val > MAX_HISTORY {
+        return Err(format!("history size must be at most {MAX_HISTORY}"));
+    }
+    Ok(val)
+}
 
 #[derive(Parser)]
 #[command(name = "retach", version, about = "Terminal multiplexer with native scrollback")]
@@ -16,7 +25,7 @@ pub enum Command {
         /// Session name
         name: String,
         /// Scrollback history size (used when creating)
-        #[arg(long, default_value_t = DEFAULT_HISTORY)]
+        #[arg(long, default_value_t = DEFAULT_HISTORY, value_parser = parse_history)]
         history: usize,
     },
     /// Create a new session
@@ -24,7 +33,7 @@ pub enum Command {
         /// Session name (auto-generated if omitted)
         name: Option<String>,
         /// Scrollback history size
-        #[arg(long, default_value_t = DEFAULT_HISTORY)]
+        #[arg(long, default_value_t = DEFAULT_HISTORY, value_parser = parse_history)]
         history: usize,
     },
     /// Attach to an existing session

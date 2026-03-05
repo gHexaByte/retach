@@ -12,12 +12,36 @@ use tracing::{debug, warn};
 /// Minimum interval between consecutive screen renders to the client.
 const RENDER_THROTTLE: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// Estimated per-line bincode overhead: 8 bytes for Vec length prefix +
+/// ~8 bytes for enum variant tag and alignment padding.
+const BINCODE_LINE_OVERHEAD: usize = 16;
+
+/// Prepend passthrough escape sequences to the rendered screen data so they
+/// are sent as a single `ScreenUpdate` write.  This avoids the intermediate
+/// `flush()` that `Passthrough` messages trigger on the client, which can cause
+/// rendering glitches in terminals like Blink (e.g. `\e[3J` clearing the
+/// viewport before the new screen content arrives).
+fn prepend_passthrough(passthrough: Vec<Vec<u8>>, render_data: Vec<u8>) -> Vec<u8> {
+    if passthrough.is_empty() {
+        return render_data;
+    }
+    let total: usize = passthrough.iter().map(|c| c.len()).sum::<usize>() + render_data.len();
+    let mut combined = Vec::with_capacity(total);
+    for chunk in passthrough {
+        combined.extend_from_slice(&chunk);
+    }
+    combined.extend_from_slice(&render_data);
+    combined
+}
+
 /// Lock a `StdMutex` and convert poisoning into `anyhow::Error`.
 fn lock_mutex<'a, T>(mutex: &'a StdMutex<T>, label: &str) -> anyhow::Result<std::sync::MutexGuard<'a, T>> {
     mutex.lock().map_err(|e| anyhow::anyhow!("{} mutex poisoned: {}", label, e))
 }
 
 /// Resize the PTY master and the virtual screen to the given dimensions.
+/// Acquires the screen lock first (cheaper, no side effects) so that if
+/// it fails, the PTY master is not left at a mismatched size.
 fn resize_pty(
     master: &Arc<StdMutex<Box<dyn portable_pty::MasterPty + Send>>>,
     screen: &Arc<StdMutex<Screen>>,
@@ -25,6 +49,7 @@ fn resize_pty(
     rows: u16,
 ) -> anyhow::Result<()> {
     let (cols, rows) = crate::screen::grid::sanitize_dimensions(cols, rows);
+    let mut scr = lock_mutex(screen, "screen")?;
     let m = lock_mutex(master, "master")?;
     m.resize(portable_pty::PtySize {
         rows,
@@ -32,7 +57,7 @@ fn resize_pty(
         pixel_width: 0,
         pixel_height: 0,
     })?;
-    lock_mutex(screen, "screen")?.resize(cols, rows);
+    scr.resize(cols, rows);
     Ok(())
 }
 
@@ -115,7 +140,14 @@ async fn setup_session(
                 stream.write_all(&resp).await?;
                 return Err(e);
             }
-            (mgr.get(name).unwrap(), true)
+            match mgr.get(name) {
+                Some(s) => (s, true),
+                None => {
+                    let resp = protocol::encode(&ServerMsg::Error("session disappeared after creation".into()))?;
+                    stream.write_all(&resp).await?;
+                    anyhow::bail!("session '{}' disappeared after creation", name);
+                }
+            }
         }
         ConnectMode::AttachOnly => {
             match mgr.get(name) {
@@ -154,6 +186,8 @@ async fn setup_session(
     if !is_new {
         let master = session.pty.master_arc();
         let screen = session.screen.clone();
+        let dims_clone = session.dims.clone();
+        let name_owned = name.to_string();
         if cur_cols != cols || cur_rows != rows {
             debug!(
                 session = %name,
@@ -161,13 +195,16 @@ async fn setup_session(
                 new_cols = cols, new_rows = rows,
                 "resizing session for reattach"
             );
-            if let Err(e) = resize_pty(&master, &screen, cols, rows) {
-                warn!(session = %name, error = %e, "failed to resize on reattach");
-            } else {
-                match session.dims.lock() {
+            let resize_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                resize_pty(&master, &screen, cols, rows)?;
+                match dims_clone.lock() {
                     Ok(mut dims) => *dims = crate::screen::grid::sanitize_dimensions(cols, rows),
-                    Err(e) => warn!(session = %name, error = %e, "dims mutex poisoned during resize"),
+                    Err(e) => warn!(session = %name_owned, error = %e, "dims mutex poisoned during resize"),
                 }
+                Ok(())
+            }).await?;
+            if let Err(e) = resize_result {
+                warn!(session = %name, error = %e, "failed to resize on reattach");
             }
         } else {
             // Same dimensions: send SIGWINCH as a safety net.  The persistent
@@ -175,15 +212,17 @@ async fn setup_session(
             // apps that cache display state internally (e.g. htop) to do a
             // full redraw.
             debug!(session = %name, "sending SIGWINCH for reattach (same dimensions)");
-            let (cols, rows) = crate::screen::grid::sanitize_dimensions(cols, rows);
-            if let Err(e) = lock_mutex(&master, "master").and_then(|m| {
+            let sigwinch_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let (cols, rows) = crate::screen::grid::sanitize_dimensions(cols, rows);
+                let m = lock_mutex(&master, "master")?;
                 m.resize(portable_pty::PtySize {
                     rows,
                     cols,
                     pixel_width: 0,
                     pixel_height: 0,
                 }).map_err(|e| anyhow::anyhow!("{}", e))
-            }) {
+            }).await?;
+            if let Err(e) = sigwinch_result {
                 warn!(session = %name, error = %e, "failed to send SIGWINCH on reattach");
             }
         }
@@ -251,9 +290,7 @@ async fn send_initial_state(
         let size_limit = protocol::codec::MAX_FRAME_SIZE / 2;
 
         for line in hist_chunks {
-            // Estimate per-line bincode overhead: 8 bytes for Vec length prefix +
-            // ~8 bytes for enum variant tag and alignment padding.
-            let line_size = line.len() + 16;
+            let line_size = line.len() + BINCODE_LINE_OVERHEAD;
             if chunk_size + line_size > size_limit && !chunk.is_empty() {
                 let msg = protocol::encode(&ServerMsg::History(std::mem::take(&mut chunk)))?;
                 writer.write_all(&msg).await?;
@@ -314,18 +351,15 @@ async fn screen_to_client(
                         let mut scr = lock_mutex(&h.screen, "screen")?;
                         (scr.take_pending_scrollback(), scr.take_passthrough())
                     };
-                    for chunk in passthrough {
-                        let msg = protocol::encode(&ServerMsg::Passthrough(chunk))?;
-                        writer.write_all(&msg).await?;
-                    }
-                    if !scrollback_lines.is_empty() {
-                        let update = lock_mutex(&h.screen, "screen")?
-                            .render_with_scrollback(&scrollback_lines, &mut render_cache);
-                        let msg = protocol::encode(&ServerMsg::ScreenUpdate(update))?;
-                        writer.write_all(&msg).await?;
+                    let render_data = if !scrollback_lines.is_empty() {
+                        lock_mutex(&h.screen, "screen")?
+                            .render_with_scrollback(&scrollback_lines, &mut render_cache)
                     } else {
-                        render_and_send(&h.screen, &mut render_cache, &mut writer, false).await?;
-                    }
+                        lock_mutex(&h.screen, "screen")?.render(false, &mut render_cache)
+                    };
+                    let update = prepend_passthrough(passthrough, render_data);
+                    let msg = protocol::encode(&ServerMsg::ScreenUpdate(update))?;
+                    writer.write_all(&msg).await?;
                     let msg = protocol::encode(&ServerMsg::SessionEnded)?;
                     writer.write_all(&msg).await?;
                     break;
@@ -339,19 +373,20 @@ async fn screen_to_client(
                     (scr.take_pending_scrollback(), scr.take_passthrough())
                 };
 
-                for chunk in passthrough {
-                    let msg = protocol::encode(&ServerMsg::Passthrough(chunk))?;
-                    writer.write_all(&msg).await?;
-                }
-
-                if !scrollback_lines.is_empty() {
-                    let update = lock_mutex(&h.screen, "screen")?
-                        .render_with_scrollback(&scrollback_lines, &mut render_cache);
-                    let msg = protocol::encode(&ServerMsg::ScreenUpdate(update))?;
-                    writer.write_all(&msg).await?;
+                let render_data = if !scrollback_lines.is_empty() {
+                    lock_mutex(&h.screen, "screen")?
+                        .render_with_scrollback(&scrollback_lines, &mut render_cache)
                 } else {
-                    render_and_send(&h.screen, &mut render_cache, &mut writer, false).await?;
-                }
+                    lock_mutex(&h.screen, "screen")?.render(false, &mut render_cache)
+                };
+                // Prepend passthrough sequences (e.g. \e[3J) to the screen
+                // update so the terminal processes them in a single write.
+                // Sending \e[3J as a separate Passthrough message with flush()
+                // before ScreenUpdate causes rendering glitches in Blink — the
+                // terminal clears the viewport before the new content arrives.
+                let update = prepend_passthrough(passthrough, render_data);
+                let msg = protocol::encode(&ServerMsg::ScreenUpdate(update))?;
+                writer.write_all(&msg).await?;
                 pending_render = false;
             }
             _ = refresh_notify.notified() => {
@@ -421,9 +456,9 @@ async fn client_to_pty(
                     debug!(session = %h.name, "client detached");
                     return Ok(());
                 }
-                other => {
-                    debug!(session = %h.name, "ignoring unexpected client message: {:?}", std::mem::discriminant(&other));
-                }
+                // Connect, ListSessions, KillSession are handled in client_handler
+                // before the session bridge loop — they never reach here.
+                ClientMsg::Connect { .. } | ClientMsg::ListSessions | ClientMsg::KillSession { .. } => {}
             }
         }
     }
@@ -472,6 +507,11 @@ pub async fn handle_session(
         r = &mut screen_to_client_task => {
             debug!("screen_to_client finished: {:?}", r.as_ref().map(|r| r.as_ref().map(|_| "ok")));
             client_to_pty_task.abort();
+            // Clear has_client if not evicted — screen_to_client does this on
+            // normal exit, but on error the `?` skips its cleanup code.
+            if *evict_rx_local.borrow() {
+                has_client.store(false, Ordering::Release);
+            }
             r??;
         }
         r = &mut client_to_pty_task => {
@@ -488,4 +528,54 @@ pub async fn handle_session(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::screen::{Screen, RenderCache};
+
+    #[test]
+    fn prepend_passthrough_empty() {
+        let render = b"render-data".to_vec();
+        let result = prepend_passthrough(vec![], render.clone());
+        assert_eq!(result, render);
+    }
+
+    #[test]
+    fn prepend_passthrough_single() {
+        let pt = vec![b"\x1b[3J".to_vec()];
+        let render = b"\x1b[?2026hcontent\x1b[?2026l".to_vec();
+        let result = prepend_passthrough(pt, render);
+        assert_eq!(&result[..4], b"\x1b[3J");
+        assert_eq!(&result[4..], b"\x1b[?2026hcontent\x1b[?2026l");
+    }
+
+    #[test]
+    fn prepend_passthrough_multiple() {
+        let pt = vec![vec![0x07], b"\x1b[3J".to_vec()];
+        let render = b"screen".to_vec();
+        let result = prepend_passthrough(pt, render);
+        assert_eq!(result, b"\x07\x1b[3Jscreen");
+    }
+
+    /// ED mode 3 passthrough is prepended to the render buffer,
+    /// ensuring the terminal processes clear + redraw atomically.
+    #[test]
+    fn ed3_included_in_screen_update() {
+        let mut screen = Screen::new(80, 24, 100);
+        screen.process(b"hello world");
+        screen.process(b"\x1b[3J");
+
+        let passthrough = screen.take_passthrough();
+        assert_eq!(passthrough.len(), 1);
+        assert_eq!(passthrough[0], b"\x1b[3J");
+
+        let mut cache = RenderCache::new();
+        let render_data = screen.render(true, &mut cache);
+
+        let combined = prepend_passthrough(passthrough, render_data.clone());
+        assert!(combined.starts_with(b"\x1b[3J"), "passthrough should prefix screen data");
+        assert_eq!(&combined[4..], &render_data[..]);
+    }
 }

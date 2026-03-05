@@ -2335,18 +2335,15 @@ fn csi_r_reset_restores_full_screen_scroll() {
 
 #[test]
 fn scroll_single_row_region() {
-    // CSI n;nr where top == bottom — should NOT change scroll region.
-    // (Spec: top must be < bottom for valid region.)
+    // CSI n;nr where top == bottom — single-row scroll region is valid per spec.
     let mut screen = Screen::new(10, 6, 100);
-    let old_top = screen.grid.scroll_top;
-    let old_bottom = screen.grid.scroll_bottom;
 
-    screen.process(b"\x1b[3;3r"); // top == bottom
+    screen.process(b"\x1b[3;3r"); // top == bottom (row 3, 0-based: 2)
 
-    // Region should stay at old values (full screen)
-    assert_eq!(screen.grid.scroll_top, old_top, "invalid region not applied");
-    assert_eq!(screen.grid.scroll_bottom, old_bottom, "invalid region not applied");
-    // But cursor still resets to home
+    // Region should be set to single row
+    assert_eq!(screen.grid.scroll_top, 2, "single-row region applied");
+    assert_eq!(screen.grid.scroll_bottom, 2, "single-row region applied");
+    // Cursor resets to home
     assert_eq!(screen.grid.cursor_x, 0);
     assert_eq!(screen.grid.cursor_y, 0);
 }
@@ -3027,12 +3024,11 @@ fn tbc_clear_all_tab_stops() {
 }
 
 #[test]
-fn scroll_region_top_equals_bottom_rejected() {
+fn scroll_region_top_equals_bottom_accepted() {
     let mut screen = Screen::new(80, 24, 100);
-    screen.process(b"\x1b[5;5r"); // top == bottom → should be ignored
-    // Scroll region should remain full screen
-    assert_eq!(screen.grid.scroll_top, 0);
-    assert_eq!(screen.grid.scroll_bottom, 23);
+    screen.process(b"\x1b[5;5r"); // top == bottom → single-row region is valid
+    assert_eq!(screen.grid.scroll_top, 4);
+    assert_eq!(screen.grid.scroll_bottom, 4);
 }
 
 #[test]
@@ -3154,17 +3150,29 @@ fn el_1_cursor_on_wide_char_continuation() {
 }
 
 #[test]
-fn ris_preserves_scrollback() {
-    // ESC c (full reset) should NOT clear scrollback (unlike CSI 3 J)
+fn ris_clears_scrollback() {
+    // ESC c (full reset) should clear scrollback, matching xterm/kitty/iTerm2 behaviour
     let mut screen = Screen::new(10, 3, 100);
     screen.process(b"A\r\nB\r\nC\r\nD\r\nE");
     let _ = screen.take_pending_scrollback();
     let hist_before = screen.get_history().len();
     assert!(hist_before > 0);
     screen.process(b"\x1bc"); // RIS
-    let hist_after = screen.get_history().len();
-    assert_eq!(hist_after, hist_before,
-        "ESC c should not clear scrollback history");
+    assert_eq!(screen.get_history().len(), 0,
+        "ESC c should clear scrollback history");
+    assert_eq!(screen.grid.scrollback_len, 0);
+    assert_eq!(screen.grid.pending_start, 0);
+}
+
+#[test]
+fn ris_forwards_clear_scrollback_passthrough() {
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process(b"A\r\nB\r\nC\r\nD\r\nE");
+    let _ = screen.take_passthrough(); // drain
+    screen.process(b"\x1bc"); // RIS
+    let pt = screen.take_passthrough();
+    assert_eq!(pt.len(), 1, "RIS should produce one passthrough entry");
+    assert_eq!(pt[0], b"\x1b[3J", "RIS should forward \\e[3J, not \\ec");
 }
 
 #[test]

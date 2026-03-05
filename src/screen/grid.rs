@@ -104,32 +104,6 @@ pub enum MouseMode {
     Any,    // ?1003
 }
 
-impl MouseMode {
-    /// Convert from a DEC private mode parameter.
-    pub fn from_param(p: u16) -> Option<Self> {
-        match p {
-            1000 => Some(Self::Click),
-            1002 => Some(Self::Button),
-            1003 => Some(Self::Any),
-            _ => None,
-        }
-    }
-
-    /// Convert to a DEC private mode parameter, or 0 if off.
-    pub fn to_param(self) -> u16 {
-        match self {
-            Self::Off => 0,
-            Self::Click => 1000,
-            Self::Button => 1002,
-            Self::Any => 1003,
-        }
-    }
-
-    pub fn is_enabled(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-}
-
 /// Per-mode mouse tracking flags, matching xterm behavior.
 /// Each mode can be independently enabled/disabled. The effective mode
 /// is the highest-priority enabled mode.
@@ -157,11 +131,6 @@ impl MouseModes {
         else if self.button { MouseMode::Button }
         else if self.click { MouseMode::Click }
         else { MouseMode::Off }
-    }
-
-    /// Whether any mouse mode is enabled.
-    pub fn is_enabled(&self) -> bool {
-        self.click || self.button || self.any
     }
 }
 
@@ -281,7 +250,7 @@ impl Grid {
 
     /// Remove a visible row by index, returning it.
     pub fn remove_visible_row(&mut self, y: usize) -> Vec<Cell> {
-        self.cells.remove(self.scrollback_len + y).unwrap()
+        self.cells.remove(self.scrollback_len + y).expect("visible row index within bounds")
     }
 
     /// Insert a row at a visible row index.
@@ -316,8 +285,13 @@ impl Grid {
                 self.scrollback_len -= 1;
                 if self.pending_start > 0 { self.pending_start -= 1; }
             }
-            // Push new blank row at bottom of visible area
-            self.cells.push_back(vec![fill; self.cols as usize]);
+            // Insert blank row at the scroll region bottom, not necessarily
+            // the end of cells (partial scroll region must not shift rows below).
+            if bottom >= visible_len - 1 {
+                self.cells.push_back(vec![fill; self.cols as usize]);
+            } else {
+                self.cells.insert(self.scrollback_len + bottom, vec![fill; self.cols as usize]);
+            }
         } else if top <= bottom && bottom < visible_len {
             if top == 0 && bottom == visible_len - 1 {
                 // Full screen, no scrollback: O(1)
@@ -367,6 +341,10 @@ impl Grid {
                 let last = cols_usize - 1;
                 if row[last].width == 2 {
                     row[last] = Cell::default();
+                } else if last > 0 && row[last].width == 0 {
+                    // Orphaned continuation cell: clear it and its base wide char
+                    row[last] = Cell::default();
+                    row[last - 1] = Cell::default();
                 }
             }
             row.resize(cols_usize, Cell::default());
@@ -473,6 +451,59 @@ mod tests {
         }
         let pending_count = grid.scrollback_len - grid.pending_start;
         assert_eq!(pending_count, 5, "pending scrollback should be exactly at limit, got {}", pending_count);
+    }
+
+    /// scroll_up with partial scroll region (top=0, bottom < last row) and scrollback enabled
+    /// should NOT corrupt rows below the scroll region.
+    #[test]
+    fn scroll_up_partial_region_with_scrollback_preserves_rows_below() {
+        // 5 visible rows, scrollback enabled, scroll region = rows 0..2
+        let mut grid = Grid::new(5, 5, 100);
+        // Label rows: A=0, B=1, C=2, D=3, E=4
+        for (r, ch) in ['A', 'B', 'C', 'D', 'E'].iter().enumerate() {
+            grid.visible_row_mut(r)[0].c = *ch;
+        }
+        grid.scroll_top = 0;
+        grid.scroll_bottom = 2; // partial: rows 0-2 scroll, rows 3-4 fixed
+
+        grid.scroll_up(false, Cell::default());
+
+        // Row 'A' should go to scrollback
+        assert_eq!(grid.scrollback_len, 1);
+        assert_eq!(grid.cells[0][0].c, 'A'); // scrollback row
+
+        // Visible: [B, C, blank, D, E]
+        assert_eq!(grid.visible_row(0)[0].c, 'B', "row 0 should be B");
+        assert_eq!(grid.visible_row(1)[0].c, 'C', "row 1 should be C");
+        assert_eq!(grid.visible_row(2)[0].c, ' ', "row 2 should be blank (new)");
+        assert_eq!(grid.visible_row(3)[0].c, 'D', "row 3 should be D (untouched)");
+        assert_eq!(grid.visible_row(4)[0].c, 'E', "row 4 should be E (untouched)");
+
+        // Total visible rows should still be 5
+        assert_eq!(grid.visible_row_count(), 5);
+    }
+
+    /// scroll_up with full scroll region + scrollback should still work (regression guard)
+    #[test]
+    fn scroll_up_full_region_with_scrollback_still_works() {
+        let mut grid = Grid::new(5, 5, 100);
+        for (r, ch) in ['A', 'B', 'C', 'D', 'E'].iter().enumerate() {
+            grid.visible_row_mut(r)[0].c = *ch;
+        }
+        // Full screen scroll region (default)
+        assert_eq!(grid.scroll_top, 0);
+        assert_eq!(grid.scroll_bottom, 4);
+
+        grid.scroll_up(false, Cell::default());
+
+        assert_eq!(grid.scrollback_len, 1);
+        assert_eq!(grid.cells[0][0].c, 'A');
+        assert_eq!(grid.visible_row(0)[0].c, 'B');
+        assert_eq!(grid.visible_row(1)[0].c, 'C');
+        assert_eq!(grid.visible_row(2)[0].c, 'D');
+        assert_eq!(grid.visible_row(3)[0].c, 'E');
+        assert_eq!(grid.visible_row(4)[0].c, ' ');
+        assert_eq!(grid.visible_row_count(), 5);
     }
 
     #[test]

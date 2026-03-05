@@ -235,8 +235,7 @@ pub async fn connect(name: &str, history: usize, mode: crate::protocol::ConnectM
     let mut frames = FrameReader::new();
     loop {
         if !frames.fill_from(&mut stream).await? {
-            eprintln!("[retach: server closed connection]");
-            return Ok(());
+            anyhow::bail!("server closed connection before handshake completed");
         }
         if let Some(msg) = frames.decode_next::<ServerMsg>()? {
             match msg {
@@ -249,12 +248,10 @@ pub async fn connect(name: &str, history: usize, mode: crate::protocol::ConnectM
                     break;
                 }
                 ServerMsg::Error(e) => {
-                    eprintln!("[retach error: {}]", e);
-                    return Ok(());
+                    anyhow::bail!("{}", e);
                 }
                 _ => {
-                    eprintln!("[retach: unexpected response from server]");
-                    return Ok(());
+                    anyhow::bail!("unexpected response from server");
                 }
             }
         }
@@ -363,24 +360,29 @@ fn cleanup_terminal() {
 /// Query the server for active sessions and print them to stdout.
 pub async fn list_sessions() -> anyhow::Result<()> {
     let path = crate::server::socket_path()?;
-    if !path.exists() {
-        println!("No active sessions");
-        return Ok(());
-    }
-
-    let mut stream = UnixStream::connect(&path).await?;
+    let mut stream = match UnixStream::connect(&path).await {
+        Ok(s) => s,
+        Err(_) => {
+            println!("No active sessions");
+            return Ok(());
+        }
+    };
     let msg = protocol::encode(&ClientMsg::ListSessions)?;
     stream.write_all(&msg).await?;
 
     let resp: ServerMsg = read_one_message(&mut stream).await?;
-    if let ServerMsg::SessionList(sessions) = resp {
-        if sessions.is_empty() {
-            println!("No active sessions");
-        } else {
-            for s in sessions {
-                println!("{} ({}x{})", s.name, s.cols, s.rows);
+    match resp {
+        ServerMsg::SessionList(sessions) => {
+            if sessions.is_empty() {
+                println!("No active sessions");
+            } else {
+                for s in sessions {
+                    println!("{} ({}x{})", s.name, s.cols, s.rows);
+                }
             }
         }
+        ServerMsg::Error(e) => anyhow::bail!("{}", e),
+        other => anyhow::bail!("unexpected server response: {:?}", std::mem::discriminant(&other)),
     }
     Ok(())
 }
@@ -388,11 +390,10 @@ pub async fn list_sessions() -> anyhow::Result<()> {
 /// Ask the server to terminate the named session.
 pub async fn kill_session(name: &str) -> anyhow::Result<()> {
     let path = crate::server::socket_path()?;
-    if !path.exists() {
-        anyhow::bail!("server not running");
-    }
-
-    let mut stream = UnixStream::connect(&path).await?;
+    let mut stream = match UnixStream::connect(&path).await {
+        Ok(s) => s,
+        Err(_) => anyhow::bail!("server not running"),
+    };
     let msg = protocol::encode(&ClientMsg::KillSession {
         name: name.to_string(),
     })?;
@@ -401,8 +402,38 @@ pub async fn kill_session(name: &str) -> anyhow::Result<()> {
     let resp: ServerMsg = read_one_message(&mut stream).await?;
     match resp {
         ServerMsg::SessionKilled { name } => println!("killed session '{}'", name),
-        ServerMsg::Error(e) => println!("error: {}", e),
-        _ => {}
+        ServerMsg::Error(e) => anyhow::bail!("{}", e),
+        other => anyhow::bail!("unexpected server response: {:?}", std::mem::discriminant(&other)),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_server_msg_error_returns_done() {
+        let msg = ServerMsg::Error("test error".into());
+        let mut buf = Vec::new();
+        let result = dispatch_server_msg(&msg, &mut buf).unwrap();
+        assert!(matches!(result, DispatchResult::Done));
+    }
+
+    #[test]
+    fn dispatch_server_msg_session_ended_returns_done() {
+        let msg = ServerMsg::SessionEnded;
+        let mut buf = Vec::new();
+        let result = dispatch_server_msg(&msg, &mut buf).unwrap();
+        assert!(matches!(result, DispatchResult::Done));
+    }
+
+    #[test]
+    fn dispatch_server_msg_screen_update_continues() {
+        let msg = ServerMsg::ScreenUpdate(b"hello".to_vec());
+        let mut buf = Vec::new();
+        let result = dispatch_server_msg(&msg, &mut buf).unwrap();
+        assert!(matches!(result, DispatchResult::Continue));
+        assert_eq!(buf, b"hello");
+    }
 }
