@@ -1,5 +1,17 @@
+/// Interned style identifier. Wraps a `u16` table index.
+/// ID 0 is always the default (reset) style.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct StyleId(pub(super) u16);
+
+impl StyleId {
+    /// Table index.
+    pub fn index(self) -> usize { self.0 as usize }
+    /// True when this is the default style (index 0).
+    pub fn is_default(self) -> bool { self.0 == 0 }
+}
+
 /// Underline style variant.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum UnderlineStyle {
     #[default]
     None,
@@ -38,7 +50,7 @@ impl UnderlineStyle {
 }
 
 /// SGR text attributes and foreground/background colors for a cell.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Style {
     pub bold: bool,
     pub dim: bool,
@@ -50,10 +62,11 @@ pub struct Style {
     pub hidden: bool,
     pub fg: Option<Color>,
     pub bg: Option<Color>,
+    pub underline_color: Option<Color>,
 }
 
 /// Terminal color, either a 256-color palette index or direct RGB.
-#[derive(Copy, Clone, Debug, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Color {
     /// 256-color palette index (0-255).
     Indexed(u8),
@@ -111,6 +124,24 @@ impl Style {
         if self.strikethrough { sep!(out, need_sep); out.push(b'9'); }
         Self::write_color_to(out, self.fg, 30, 90, b"38", need_sep);
         Self::write_color_to(out, self.bg, 40, 100, b"48", need_sep);
+        // Underline color (SGR 58)
+        if let Some(ref color) = self.underline_color {
+            sep!(out, need_sep);
+            match color {
+                Color::Indexed(c) => {
+                    out.extend_from_slice(b"58;5;");
+                    write_u8(out, *c);
+                }
+                Color::Rgb(r, g, b) => {
+                    out.extend_from_slice(b"58;2;");
+                    write_u8(out, *r);
+                    out.push(b';');
+                    write_u8(out, *g);
+                    out.push(b';');
+                    write_u8(out, *b);
+                }
+            }
+        }
     }
 
     /// Write SGR color parameters directly as bytes.
@@ -167,15 +198,22 @@ impl Style {
     /// separate `\x1b[0m` + `\x1b[31m`. Always includes reset (param 0).
     /// For default style returns just `\x1b[0m`.
     pub fn to_sgr_with_reset(self) -> Vec<u8> {
-        if self.is_default() {
-            return b"\x1b[0m".to_vec();
-        }
         let mut out = Vec::with_capacity(24);
+        self.write_sgr_with_reset_to(&mut out);
+        out
+    }
+
+    /// Write combined reset+set SGR directly into `out`, avoiding intermediate allocation.
+    /// For default style writes just `\x1b[0m`.
+    pub fn write_sgr_with_reset_to(self, out: &mut Vec<u8>) {
+        if self.is_default() {
+            out.extend_from_slice(b"\x1b[0m");
+            return;
+        }
         out.extend_from_slice(b"\x1b[0");
         let mut need_sep = true;
-        self.write_sgr_to(&mut out, &mut need_sep);
+        self.write_sgr_to(out, &mut need_sep);
         out.push(b'm');
-        out
     }
 
     /// Apply SGR parameters to this style (accumulates)
@@ -226,6 +264,12 @@ impl Style {
                     }
                 }
                 49 => self.bg = None,
+                58 => {
+                    if let Some(color) = parse_extended_color(params, &mut i) {
+                        self.underline_color = Some(color);
+                    }
+                }
+                59 => self.underline_color = None,
                 90..=97 => self.fg = Some(Color::Indexed((p - 90 + 8) as u8)),
                 100..=107 => self.bg = Some(Color::Indexed((p - 100 + 8) as u8)),
                 _ => {}
@@ -236,7 +280,7 @@ impl Style {
 }
 
 /// Parse extended color (38;5;N or 38;2;R;G;B) from SGR params
-pub fn parse_extended_color(params: &[Vec<u16>], i: &mut usize) -> Option<Color> {
+fn parse_extended_color(params: &[Vec<u16>], i: &mut usize) -> Option<Color> {
     // Check for colon-separated subparams first (e.g., 38:5:N or 38:2:R:G:B)
     if params[*i].len() > 1 {
         let sub = &params[*i];
@@ -271,6 +315,96 @@ pub fn parse_extended_color(params: &[Vec<u16>], i: &mut usize) -> Option<Color>
         }
     }
     None
+}
+
+/// Interning table for cell styles. Index 0 is always the default style.
+/// Dead slots are tracked in a free list and reused by `intern()` after GC.
+#[derive(Clone, Debug)]
+pub struct StyleTable {
+    styles: Vec<Style>,
+    index: std::collections::HashMap<Style, u16>,
+    free_slots: Vec<u16>,
+}
+
+impl StyleTable {
+    pub fn new() -> Self {
+        Self {
+            styles: vec![Style::default()],
+            index: std::collections::HashMap::new(),
+            free_slots: Vec::new(),
+        }
+    }
+
+    /// Intern a style, returning its ID. Default style always returns `StyleId(0)`.
+    /// Reuses free slots from GC before growing. If the table is full
+    /// (65536 entries) and no free slots remain, returns `StyleId(0)` (degradation).
+    pub fn intern(&mut self, style: Style) -> StyleId {
+        if style.is_default() { return StyleId(0); }
+        if let Some(&id) = self.index.get(&style) {
+            return StyleId(id);
+        }
+        if let Some(id) = self.free_slots.pop() {
+            self.styles[id as usize] = style;
+            self.index.insert(style, id);
+            return StyleId(id);
+        }
+        if self.styles.len() > u16::MAX as usize {
+            return StyleId(0); // table full — fall back to default style
+        }
+        let id = self.styles.len() as u16;
+        self.styles.push(style);
+        self.index.insert(style, id);
+        StyleId(id)
+    }
+
+    /// Look up a style by ID.
+    #[inline]
+    pub fn get(&self, id: StyleId) -> Style {
+        self.styles.get(id.index()).copied().unwrap_or_default()
+    }
+
+    /// Number of occupied (live) slots, excluding free slots.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.styles.len() - self.free_slots.len()
+    }
+
+    /// Total number of allocated slots (including free slots).
+    pub fn capacity(&self) -> usize {
+        self.styles.len()
+    }
+
+    /// True if the table has reached maximum capacity and no free slots remain.
+    pub fn is_full(&self) -> bool {
+        self.styles.len() > u16::MAX as usize && self.free_slots.is_empty()
+    }
+
+    /// Reclaim dead slots: any style ID not marked as live in the bitvec
+    /// is removed from the index and added to the free list.
+    pub fn reclaim(&mut self, live: &[bool]) {
+        self.free_slots.clear();
+        for id in 1..self.styles.len() {
+            if id < live.len() && !live[id] {
+                self.index.remove(&self.styles[id]);
+                self.free_slots.push(id as u16);
+            }
+        }
+    }
+
+    /// Reset the table to its initial state (only the default style).
+    /// Called on RIS (full terminal reset) to reclaim memory from
+    /// accumulated styles. Existing cells referencing old style IDs
+    /// will be blanked by the RIS handler anyway.
+    pub fn reset(&mut self) {
+        self.styles.clear();
+        self.styles.push(Style::default());
+        self.index.clear();
+        self.free_slots.clear();
+    }
+}
+
+impl Default for StyleTable {
+    fn default() -> Self { Self::new() }
 }
 
 #[cfg(test)]
@@ -406,6 +540,7 @@ mod tests {
             hidden: true,
             fg: Some(Color::Indexed(1)),
             bg: Some(Color::Indexed(4)),
+            underline_color: None,
         };
         let sgr = s.to_sgr();
         let text = String::from_utf8_lossy(&sgr);
@@ -463,5 +598,147 @@ mod tests {
         s.fg = Some(Color::Indexed(1)); // red
         let sgr = s.to_sgr_with_reset();
         assert_eq!(sgr, b"\x1b[0;1;31m", "reset+bold+red");
+    }
+
+    // --- StyleTable GC tests ---
+
+    #[test]
+    fn style_table_len_and_capacity() {
+        let mut table = StyleTable::new();
+        assert_eq!(table.len(), 1); // default style
+        assert_eq!(table.capacity(), 1);
+
+        let s1 = Style { bold: true, ..Style::default() };
+        table.intern(s1);
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.capacity(), 2);
+    }
+
+    #[test]
+    fn style_table_reclaim_frees_dead_slots() {
+        let mut table = StyleTable::new();
+        let s1 = Style { bold: true, ..Style::default() };
+        let s2 = Style { italic: true, ..Style::default() };
+        let s3 = Style { dim: true, ..Style::default() };
+        let id1 = table.intern(s1);
+        let id2 = table.intern(s2);
+        let id3 = table.intern(s3);
+        assert_eq!(table.len(), 4); // default + 3
+        assert_eq!(table.capacity(), 4);
+
+        // Mark s1 and s3 as live, s2 as dead
+        let mut live = vec![false; table.capacity()];
+        live[0] = true;
+        live[id1.index()] = true;
+        live[id3.index()] = true;
+        table.reclaim(&live);
+
+        assert_eq!(table.len(), 3); // default + s1 + s3
+        assert_eq!(table.capacity(), 4); // Vec didn't shrink
+
+        // New intern should reuse s2's slot
+        let s4 = Style { blink: true, ..Style::default() };
+        let id4 = table.intern(s4);
+        assert_eq!(id4, id2, "should reuse freed slot");
+        assert_eq!(table.get(id4), s4);
+        assert_eq!(table.len(), 4);
+    }
+
+    #[test]
+    fn style_table_reclaim_all_dead() {
+        let mut table = StyleTable::new();
+        for i in 0..10u8 {
+            table.intern(Style { fg: Some(Color::Indexed(i)), ..Style::default() });
+        }
+        assert_eq!(table.len(), 11); // default + 10
+
+        // Only default is live
+        let mut live = vec![false; table.capacity()];
+        live[0] = true;
+        table.reclaim(&live);
+
+        assert_eq!(table.len(), 1); // only default
+        // All 10 slots are free for reuse
+        let s = Style { bold: true, ..Style::default() };
+        let id = table.intern(s);
+        let raw = id.index();
+        assert!(raw >= 1 && raw <= 10, "should reuse a freed slot, got {}", raw);
+    }
+
+    #[test]
+    fn style_table_reclaim_none_dead() {
+        let mut table = StyleTable::new();
+        let s1 = Style { bold: true, ..Style::default() };
+        table.intern(s1);
+
+        let live = vec![true; table.capacity()];
+        table.reclaim(&live);
+
+        assert_eq!(table.len(), 2); // nothing reclaimed
+    }
+
+    #[test]
+    fn style_table_is_full() {
+        let table = StyleTable::new();
+        assert!(!table.is_full());
+        // Can't practically fill 65536 entries in a unit test,
+        // but we can verify the logic by checking the condition
+    }
+
+    #[test]
+    fn style_table_reset_clears_free_slots() {
+        let mut table = StyleTable::new();
+        let s1 = Style { bold: true, ..Style::default() };
+        table.intern(s1);
+
+        let mut live = vec![false; table.capacity()];
+        live[0] = true;
+        table.reclaim(&live);
+        assert_eq!(table.len(), 1);
+
+        table.reset();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.capacity(), 1);
+    }
+
+    // --- Underline color (SGR 58/59) tests ---
+
+    #[test]
+    fn underline_color_indexed() {
+        let mut style = Style::default();
+        style.apply_sgr(&[vec![58], vec![5], vec![196]]);
+        assert_eq!(style.underline_color, Some(Color::Indexed(196)));
+    }
+
+    #[test]
+    fn underline_color_rgb() {
+        let mut style = Style::default();
+        style.apply_sgr(&[vec![58], vec![2], vec![255], vec![128], vec![0]]);
+        assert_eq!(style.underline_color, Some(Color::Rgb(255, 128, 0)));
+    }
+
+    #[test]
+    fn underline_color_reset() {
+        let mut style = Style::default();
+        style.apply_sgr(&[vec![58], vec![5], vec![196]]);
+        assert!(style.underline_color.is_some());
+        style.apply_sgr(&[vec![59]]);
+        assert_eq!(style.underline_color, None);
+    }
+
+    #[test]
+    fn underline_color_colon_separated() {
+        let mut style = Style::default();
+        style.apply_sgr(&[vec![58, 5, 196]]);
+        assert_eq!(style.underline_color, Some(Color::Indexed(196)));
+    }
+
+    #[test]
+    fn underline_color_emitted_in_sgr() {
+        let mut style = Style::default();
+        style.underline_color = Some(Color::Indexed(196));
+        let sgr = style.to_sgr();
+        let s = String::from_utf8_lossy(&sgr);
+        assert!(s.contains("58;5;196"), "SGR should contain underline color, got: {}", s);
     }
 }

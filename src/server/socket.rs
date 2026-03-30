@@ -4,9 +4,17 @@ use std::os::unix::fs::DirBuilderExt;
 /// Prefers `$XDG_RUNTIME_DIR/retach` (per-user, mode 0700, managed by systemd)
 /// and falls back to `/tmp/retach-{uid}`.
 pub fn socket_dir() -> anyhow::Result<std::path::PathBuf> {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok().map(std::path::PathBuf::from);
+    socket_dir_impl(runtime_dir.as_deref())
+}
+
+/// Internal implementation that accepts an optional runtime directory override.
+/// Used by tests to avoid mutating the process environment (which is unsound
+/// in multi-threaded test runners).
+fn socket_dir_impl(runtime_dir: Option<&std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
     let uid = nix::unistd::getuid();
-    let dir = if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        std::path::PathBuf::from(xdg).join("retach")
+    let dir = if let Some(xdg) = runtime_dir {
+        xdg.join("retach")
     } else {
         std::path::PathBuf::from(format!("/tmp/retach-{}", uid))
     };
@@ -127,24 +135,17 @@ mod tests {
         );
     }
 
-    use std::sync::Mutex;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
     #[test]
     fn socket_dir_rejects_symlink() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let real_dir = tmp.path().join("real");
         let sym_dir = tmp.path().join("retach");
         std::fs::create_dir(&real_dir).unwrap();
         std::os::unix::fs::symlink(&real_dir, &sym_dir).unwrap();
 
-        // Point XDG_RUNTIME_DIR at the parent so socket_dir() computes sym_dir
-        std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
-        let result = socket_dir();
-        // Restore env
-        std::env::remove_var("XDG_RUNTIME_DIR");
+        // Use socket_dir_impl with an explicit override instead of mutating
+        // the process environment, which is unsound in multi-threaded test runners.
+        let result = socket_dir_impl(Some(tmp.path()));
 
         assert!(result.is_err(), "should reject symlink socket directory");
         let err = result.unwrap_err().to_string();
@@ -153,14 +154,13 @@ mod tests {
 
     #[test]
     fn socket_dir_repairs_wrong_permissions() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("retach");
         std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
 
-        std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
-        let result = socket_dir();
-        std::env::remove_var("XDG_RUNTIME_DIR");
+        // Use socket_dir_impl with an explicit override instead of mutating
+        // the process environment, which is unsound in multi-threaded test runners.
+        let result = socket_dir_impl(Some(tmp.path()));
 
         assert!(result.is_ok(), "should succeed and repair permissions");
         use std::os::unix::fs::PermissionsExt;

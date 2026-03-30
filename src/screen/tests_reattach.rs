@@ -9,17 +9,16 @@ fn reattach_render(screen: &Screen) -> String {
 
 /// Helper: extract the CUP sequence (ESC[row;colH) that sets cursor position
 /// in the render output. Returns (row, col) as 1-indexed values.
-/// Finds the *last* CUP before the mode block (identified by DECSCUSR " q").
+/// Finds the *last* CUP in the render output — cursor position CUP is emitted
+/// after all mode sequences so it is always the last CUP in the buffer.
 fn extract_cursor_cup(rendered: &str) -> (u16, u16) {
-    // The cursor position CUP is emitted after all row content and before
-    // mode sequences. Find the last ESC[r;cH before the DECSCUSR sequence.
-    let mode_pos = rendered.find(" q").unwrap_or(rendered.len());
-    let region = &rendered[..mode_pos];
-    // Find all CUP sequences (ESC[digits;digitsH)
+    // Cursor position CUP is emitted after all mode sequences (DECSCUSR, DECOM,
+    // etc.) so that mode-induced cursor homing (e.g. DECOM set/reset) is
+    // overridden by the final CUP. The last ESC[r;cH in the output is the one.
     let mut last_row = 0u16;
     let mut last_col = 0u16;
     let mut i = 0;
-    let bytes = region.as_bytes();
+    let bytes = rendered.as_bytes();
     while i + 2 < bytes.len() {
         if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
             let start = i + 2;
@@ -28,7 +27,7 @@ fn extract_cursor_cup(rendered: &str) -> (u16, u16) {
                 j += 1;
             }
             if j < bytes.len() && bytes[j] == b'H' {
-                let params = &region[start..j];
+                let params = &rendered[start..j];
                 let parts: Vec<&str> = params.split(';').collect();
                 if parts.len() == 2 {
                     if let (Ok(r), Ok(c)) = (parts[0].parse::<u16>(), parts[1].parse::<u16>()) {
@@ -57,8 +56,8 @@ fn reattach_cursor_after_text_input() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"Hello");
     // Cursor should be at column 5 (0-based), row 0
-    assert_eq!(screen.grid.cursor_x, 5);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_x(), 5);
+    assert_eq!(screen.grid.cursor_y(), 0);
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
     assert_eq!((row, col), (1, 6),
@@ -80,8 +79,8 @@ fn reattach_cursor_after_newlines() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"line1\r\nline2\r\nline3");
     // Cursor should be at row 2 (0-based), col 5
-    assert_eq!(screen.grid.cursor_y, 2);
-    assert_eq!(screen.grid.cursor_x, 5);
+    assert_eq!(screen.grid.cursor_y(), 2);
+    assert_eq!(screen.grid.cursor_x(), 5);
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
     assert_eq!((row, col), (3, 6),
@@ -146,8 +145,8 @@ fn reattach_cursor_after_save_restore() {
     screen.process(b"\x1b[1;1H");    // move home
     screen.process(b"\x1b8");        // restore cursor
     // Cursor should be back at (10, 20) → 0-based (9, 19)
-    assert_eq!(screen.grid.cursor_y, 9);
-    assert_eq!(screen.grid.cursor_x, 19);
+    assert_eq!(screen.grid.cursor_y(), 9);
+    assert_eq!(screen.grid.cursor_x(), 19);
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
     assert_eq!((row, col), (10, 20),
@@ -160,8 +159,8 @@ fn reattach_cursor_after_resize_clamp() {
     screen.process(b"\x1b[24;80H"); // bottom-right
     // Simulate reattach with smaller terminal
     screen.resize(40, 12);
-    assert_eq!(screen.grid.cursor_x, 39);
-    assert_eq!(screen.grid.cursor_y, 11);
+    assert_eq!(screen.grid.cursor_x(), 39);
+    assert_eq!(screen.grid.cursor_y(), 11);
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
     assert_eq!((row, col), (12, 40),
@@ -174,8 +173,8 @@ fn reattach_cursor_after_resize_within_bounds() {
     screen.process(b"\x1b[5;10H"); // well within bounds
     screen.resize(40, 12);
     // Position (5,10) is within (40,12), should stay unchanged
-    assert_eq!(screen.grid.cursor_x, 9);
-    assert_eq!(screen.grid.cursor_y, 4);
+    assert_eq!(screen.grid.cursor_x(), 9);
+    assert_eq!(screen.grid.cursor_y(), 4);
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
     assert_eq!((row, col), (5, 10),
@@ -188,7 +187,7 @@ fn reattach_cursor_after_scroll() {
     // Fill 5 rows and scroll by writing a 6th line
     screen.process(b"row1\r\nrow2\r\nrow3\r\nrow4\r\nrow5\r\nrow6");
     // After scroll, cursor should be on last row (row 4, 0-based)
-    assert_eq!(screen.grid.cursor_y, 4);
+    assert_eq!(screen.grid.cursor_y(), 4);
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
     assert_eq!(row, 5, "reattach: cursor row after scroll should be last row (5, 1-indexed)");
@@ -203,8 +202,8 @@ fn reattach_cursor_after_alt_screen_exit() {
     screen.process(b"\x1b[5;5H");     // move on alt screen
     screen.process(b"\x1b[?1049l");   // exit alt screen (restores cursor)
     // Cursor should be restored to (10,20) → 0-based (9,19)
-    assert_eq!(screen.grid.cursor_y, 9);
-    assert_eq!(screen.grid.cursor_x, 19);
+    assert_eq!(screen.grid.cursor_y(), 9);
+    assert_eq!(screen.grid.cursor_x(), 19);
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
     assert_eq!((row, col), (10, 20),
@@ -290,10 +289,10 @@ fn reattach_cell_content_preserved() {
 fn reattach_wrap_pending_cursor_at_right_margin() {
     let mut screen = Screen::new(5, 3, 100);
     screen.process(b"ABCDE"); // fill line, triggers wrap_pending
-    assert!(screen.grid.wrap_pending);
+    assert!(screen.grid.wrap_pending());
     // Cursor x is at 4 (0-based) with wrap pending — next char wraps
-    assert_eq!(screen.grid.cursor_x, 4);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_x(), 4);
+    assert_eq!(screen.grid.cursor_y(), 0);
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
     assert_eq!((row, col), (1, 5),
@@ -312,8 +311,8 @@ fn reattach_with_scrollback_preserves_cursor() {
 
     // Position cursor precisely
     screen.process(b"\x1b[3;15H");
-    assert_eq!(screen.grid.cursor_y, 2);
-    assert_eq!(screen.grid.cursor_x, 14);
+    assert_eq!(screen.grid.cursor_y(), 2);
+    assert_eq!(screen.grid.cursor_x(), 14);
 
     // Render with scrollback (as reattach would)
     let mut cache = RenderCache::new();
@@ -321,8 +320,8 @@ fn reattach_with_scrollback_preserves_cursor() {
     let rendered = String::from_utf8_lossy(&output).into_owned();
 
     // Find the cursor position CUP after screen clear
-    let clear_pos = rendered.find("\x1b[2J").expect("screen clear missing");
-    let after_clear = &rendered[clear_pos..];
+    let pos_clear = rendered.find("\x1b[2J").expect("screen clear missing");
+    let after_clear = &rendered[pos_clear..];
     // The cursor CUP after content should be at row 3, col 15
     assert!(after_clear.contains("\x1b[3;15H"),
         "reattach with scrollback: cursor should be at (3,15), rendered: {:?}",
@@ -380,14 +379,14 @@ fn reattach_after_multiple_resizes() {
 
     // Resize down
     screen.resize(40, 12);
-    assert_eq!(screen.grid.cursor_x, 39); // clamped
-    assert_eq!(screen.grid.cursor_y, 11); // clamped
+    assert_eq!(screen.grid.cursor_x(), 39); // clamped
+    assert_eq!(screen.grid.cursor_y(), 11); // clamped
 
     // Resize back up
     screen.resize(100, 30);
     // Cursor stays at (39, 11), not reset
-    assert_eq!(screen.grid.cursor_x, 39);
-    assert_eq!(screen.grid.cursor_y, 11);
+    assert_eq!(screen.grid.cursor_x(), 39);
+    assert_eq!(screen.grid.cursor_y(), 11);
 
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
@@ -402,8 +401,8 @@ fn reattach_cursor_after_clear_screen() {
     screen.process(b"\x1b[10;25H"); // position cursor
     screen.process(b"\x1b[2J");      // clear screen
     // Clear screen does NOT move cursor
-    assert_eq!(screen.grid.cursor_y, 9);
-    assert_eq!(screen.grid.cursor_x, 24);
+    assert_eq!(screen.grid.cursor_y(), 9);
+    assert_eq!(screen.grid.cursor_x(), 24);
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
     assert_eq!((row, col), (10, 25),
@@ -416,8 +415,8 @@ fn reattach_cursor_after_erase_in_display() {
     screen.process(b"\x1b[15;30H");
     screen.process(b"\x1b[0J"); // erase below
     // Cursor stays at (15,30)
-    assert_eq!(screen.grid.cursor_y, 14);
-    assert_eq!(screen.grid.cursor_x, 29);
+    assert_eq!(screen.grid.cursor_y(), 14);
+    assert_eq!(screen.grid.cursor_x(), 29);
     let rendered = reattach_render(&screen);
     let (row, col) = extract_cursor_cup(&rendered);
     assert_eq!((row, col), (15, 30),
@@ -432,12 +431,23 @@ fn reattach_second_render_uses_cache() {
 
     let mut cache = RenderCache::new();
     // First render (full reattach)
-    let _render1 = screen.render(true, &mut cache);
-    // Second render (incremental) — should still have cursor position
+    let render1 = screen.render(true, &mut cache);
+    let text1 = String::from_utf8_lossy(&render1);
+    assert!(text1.contains("\x1b[5;10H"),
+        "full render should set cursor position");
+
+    // Second render (incremental, nothing changed) — cursor position cached,
+    // no output needed (avoids flicker on terminals without DEC 2026)
     let render2 = screen.render(false, &mut cache);
-    let text2 = String::from_utf8_lossy(&render2);
-    assert!(text2.contains("\x1b[5;10H"),
-        "incremental render should still set cursor position");
+    assert!(render2.is_empty(),
+        "no-op incremental render should produce empty output");
+
+    // Move cursor — next render should emit the new position
+    screen.process(b"\x1b[3;5H");
+    let render3 = screen.render(false, &mut cache);
+    let text3 = String::from_utf8_lossy(&render3);
+    assert!(text3.contains("\x1b[3;5H"),
+        "incremental render should emit changed cursor position");
 }
 
 #[test]
@@ -453,8 +463,8 @@ fn reattach_fresh_cache_always_full_render() {
     let rendered = String::from_utf8_lossy(&screen.render(true, &mut cache)).into_owned();
 
     // Full render includes screen clear
-    assert!(rendered.contains("\x1b[2J\x1b[H"),
-        "reattach with fresh cache should clear screen");
+    assert!(rendered.contains("\x1b[2J"),
+        "reattach with fresh cache should screen clear");
     // Cell content present
     assert!(rendered.contains("data on row 1"),
         "reattach should include row 1 content");
@@ -835,7 +845,7 @@ fn reattach_background_color_erase() {
     screen.process(b"\x1b[41m"); // red background
     screen.process(b"\x1b[2K");  // erase entire line
     // Cells on row 0 should have red background
-    assert_eq!(screen.grid.visible_row(0)[0].style.bg,
+    assert_eq!(screen.cell_style(0, 0).bg,
         Some(super::style::Color::Indexed(1)),
         "BCE: erased cells should have red background");
     // Verify render includes the background color
@@ -867,7 +877,7 @@ fn reattach_empty_screen() {
     // Should still have the structural elements
     assert!(rendered.contains("\x1b[?2026h"), "reattach: sync begin on empty screen");
     assert!(rendered.contains("\x1b[?2026l"), "reattach: sync end on empty screen");
-    assert!(rendered.contains("\x1b[2J"), "reattach: clear screen on empty screen");
+    assert!(rendered.contains("\x1b[2J"), "reattach: screen clear on empty screen");
 }
 
 #[test]
@@ -878,18 +888,18 @@ fn reattach_render_structure_order() {
     screen.process(b"\x1b[3;10H"); // cursor at row 3, col 10
     let rendered = reattach_render(&screen);
 
-    // Verify order: sync_begin < hide_cursor < clear < content < cursor_pos < modes < title < show_cursor < sync_end
+    // Verify order: sync_begin < hide_cursor < pos_clear < content < cursor_pos < modes < title < show_cursor < sync_end
     let sync_begin = rendered.find("\x1b[?2026h").expect("sync begin");
     let hide_cursor = rendered.find("\x1b[?25l").expect("hide cursor");
-    let clear = rendered.find("\x1b[2J").expect("clear screen");
+    let pos_clear = rendered.find("\x1b[2J").expect("screen clear");
     let content = rendered.find("Content").expect("content");
     let title = rendered.find("\x1b]2;TestTitle").expect("title");
     let show_cursor = rendered.rfind("\x1b[?25h").expect("show cursor");
     let sync_end = rendered.rfind("\x1b[?2026l").expect("sync end");
 
     assert!(sync_begin < hide_cursor, "sync begin before hide cursor");
-    assert!(hide_cursor < clear, "hide cursor before clear");
-    assert!(clear < content, "clear before content");
+    assert!(hide_cursor < pos_clear, "hide cursor before screen clear");
+    assert!(pos_clear < content, "screen clear before content");
     assert!(content < title, "content before title");
     assert!(title < show_cursor, "title before show cursor");
     assert!(show_cursor < sync_end, "show cursor before sync end");
@@ -1033,7 +1043,7 @@ fn reattach_hidden_text_attribute() {
     let mut screen = Screen::new(20, 3, 100);
     screen.process(b"\x1b[8mSECRET\x1b[0m");
     // Cell content should be there, just with hidden attribute
-    assert!(screen.grid.visible_row(0)[0].style.hidden);
+    assert!(screen.cell_style(0, 0).hidden);
     let rendered = reattach_render(&screen);
     // Content should still be in render (hidden is an SGR attribute, terminal handles display)
     assert!(rendered.contains("SECRET"),
@@ -1071,7 +1081,7 @@ fn reattach_preserves_all_rows_after_partial_scroll() {
 fn reattach_restores_autowrap_disabled() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[?7l"); // disable autowrap
-    assert!(!screen.grid.modes.autowrap_mode);
+    assert!(!screen.grid.modes().autowrap_mode);
     let rendered = reattach_render(&screen);
     assert!(rendered.contains("\x1b[?7l"),
         "reattach: disabled autowrap (DECAWM) should be emitted in render output");
@@ -1082,7 +1092,7 @@ fn reattach_restores_autowrap_disabled() {
 #[test]
 fn reattach_restores_autowrap_enabled() {
     let screen = Screen::new(80, 24, 100);
-    assert!(screen.grid.modes.autowrap_mode);
+    assert!(screen.grid.modes().autowrap_mode);
     let rendered = reattach_render(&screen);
     assert!(rendered.contains("\x1b[?7h"),
         "reattach: enabled autowrap (DECAWM) should be emitted in render output");
@@ -1096,7 +1106,7 @@ fn reattach_restores_autowrap_enabled() {
 fn reattach_restores_g0_line_drawing_charset() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b(0"); // G0 = DEC line drawing
-    assert_eq!(screen.grid.modes.g0_charset, super::grid::Charset::LineDrawing);
+    assert_eq!(screen.grid.modes().g0_charset, super::grid::Charset::LineDrawing);
     let rendered = reattach_render(&screen);
     // ESC ( 0 designates G0 as line drawing
     assert!(rendered.contains("\x1b(0"),
@@ -1108,7 +1118,7 @@ fn reattach_restores_g0_line_drawing_charset() {
 #[test]
 fn reattach_restores_g0_ascii_charset() {
     let screen = Screen::new(80, 24, 100);
-    assert_eq!(screen.grid.modes.g0_charset, super::grid::Charset::Ascii);
+    assert_eq!(screen.grid.modes().g0_charset, super::grid::Charset::Ascii);
     let rendered = reattach_render(&screen);
     // ESC ( B designates G0 as ASCII
     assert!(rendered.contains("\x1b(B"),
@@ -1120,7 +1130,7 @@ fn reattach_restores_g0_ascii_charset() {
 fn reattach_restores_g1_line_drawing_charset() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b)0"); // G1 = DEC line drawing
-    assert_eq!(screen.grid.modes.g1_charset, super::grid::Charset::LineDrawing);
+    assert_eq!(screen.grid.modes().g1_charset, super::grid::Charset::LineDrawing);
     let rendered = reattach_render(&screen);
     assert!(rendered.contains("\x1b)0"),
         "reattach: G1 line drawing charset should be restored");
@@ -1133,7 +1143,7 @@ fn reattach_restores_g1_line_drawing_charset() {
 fn reattach_restores_active_charset_g1() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x0e"); // SO — activate G1
-    assert_eq!(screen.grid.modes.active_charset, super::grid::ActiveCharset::G1);
+    assert_eq!(screen.grid.modes().active_charset, super::grid::ActiveCharset::G1);
     let rendered = reattach_render(&screen);
     // The render output should contain SO (0x0E) to activate G1
     assert!(rendered.as_bytes().contains(&0x0E),
@@ -1145,7 +1155,7 @@ fn reattach_restores_active_charset_g1() {
 #[test]
 fn reattach_restores_active_charset_g0() {
     let screen = Screen::new(80, 24, 100);
-    assert_eq!(screen.grid.modes.active_charset, super::grid::ActiveCharset::G0);
+    assert_eq!(screen.grid.modes().active_charset, super::grid::ActiveCharset::G0);
     let rendered = reattach_render(&screen);
     // The render output should contain SI (0x0F) to ensure G0 is active
     assert!(rendered.as_bytes().contains(&0x0F),
@@ -1161,7 +1171,7 @@ fn mode_delta_detects_autowrap_change() {
     let _ = super::render::render_screen(&grid, "", true, &mut cache);
 
     // Disable autowrap
-    grid.modes.autowrap_mode = false;
+    grid.modes_mut().autowrap_mode = false;
     let result = super::render::render_screen(&grid, "", false, &mut cache);
     let text = String::from_utf8_lossy(&result);
     assert!(text.contains("\x1b[?7l"),
@@ -1176,7 +1186,7 @@ fn mode_delta_detects_charset_change() {
     let _ = super::render::render_screen(&grid, "", true, &mut cache);
 
     // Switch G0 to line drawing
-    grid.modes.g0_charset = super::grid::Charset::LineDrawing;
+    grid.modes_mut().g0_charset = super::grid::Charset::LineDrawing;
     let result = super::render::render_screen(&grid, "", false, &mut cache);
     let text = String::from_utf8_lossy(&result);
     assert!(text.contains("\x1b(0"),
@@ -1280,7 +1290,7 @@ fn vte_parser_sgr_correct_after_partial_sequence() {
                 // Check subsequent cells spell "Green"
                 let word: String = row[i..].iter().take(5).map(|c| c.c).collect();
                 if word == "Green" {
-                    assert_eq!(cell.style.fg, Some(super::style::Color::Indexed(2)),
+                    assert_eq!(screen.grid.style_table().get(cell.style_id).fg, Some(style::Color::Indexed(2)),
                         "Green text should have green foreground after parser recovery");
                     found_green = true;
                     break;
@@ -1476,8 +1486,8 @@ fn reattach_restores_custom_scroll_region() {
     let mut screen = Screen::new(80, 24, 100);
     // Set scroll region to rows 2-23 (like htop: header at row 1, footer at row 24)
     screen.process(b"\x1b[2;23r");
-    assert_eq!(screen.grid.scroll_top, 1);    // 0-based
-    assert_eq!(screen.grid.scroll_bottom, 22); // 0-based
+    assert_eq!(screen.grid.scroll_top(), 1);    // 0-based
+    assert_eq!(screen.grid.scroll_bottom(), 22); // 0-based
 
     let rendered = reattach_render(&screen);
     let decstbm = extract_decstbm(&rendered);
@@ -1605,9 +1615,9 @@ fn data_loss_corrupts_scroll_region() {
     screen_with_loss.process(b"\x1b[24;1HF1Help");
 
     // Without the DECSTBM, scroll region defaults to full screen
-    assert_eq!(screen_with_loss.grid.scroll_top, 0,
+    assert_eq!(screen_with_loss.grid.scroll_top(), 0,
         "lost DECSTBM leaves scroll region at default");
-    assert_eq!(screen_with_loss.grid.scroll_bottom, 23,
+    assert_eq!(screen_with_loss.grid.scroll_bottom(), 23,
         "lost DECSTBM leaves scroll region at default");
 
     // Now when htop scrolls at the bottom of its expected scroll region,
@@ -1620,7 +1630,7 @@ fn data_loss_corrupts_scroll_region() {
     // because cursor_y (21) != scroll_bottom (23)
     // The real corruption happens over many cycles as htop's operations
     // assume a different scroll region than what the grid has.
-    assert_ne!(screen.grid.scroll_top, screen_with_loss.grid.scroll_top,
+    assert_ne!(screen.grid.scroll_top(), screen_with_loss.grid.scroll_top(),
         "data loss should cause scroll region mismatch");
 }
 
@@ -1639,8 +1649,8 @@ fn full_data_processing_keeps_grid_in_sync() {
     }
 
     // Verify everything is correct
-    assert_eq!(screen.grid.scroll_top, 3); // 0-based
-    assert_eq!(screen.grid.scroll_bottom, 21); // 0-based
+    assert_eq!(screen.grid.scroll_top(), 3); // 0-based
+    assert_eq!(screen.grid.scroll_bottom(), 21); // 0-based
     assert_eq!(screen.grid.visible_row(0)[0].c, 'C'); // header
     assert_eq!(screen.grid.visible_row(23)[0].c, 'F'); // footer
 
@@ -1650,4 +1660,198 @@ fn full_data_processing_keeps_grid_in_sync() {
     assert_eq!(screen.grid.visible_row(23)[0].c, 'F', "footer must survive scroll");
     // Row 3 (old top of region) should have shifted up
     assert_eq!(screen.grid.visible_row(3)[0].c, 'p', "row 4 content shifted to row 3");
+}
+
+#[test]
+fn notifications_survive_passthrough_drain() {
+    let mut screen = Screen::new(80, 24, 100);
+    // Generate both notifications and regular passthrough
+    screen.process(b"\x1b]777;notify;Title;Body\x1b\\");
+    screen.process(b"\x07"); // BEL passthrough
+    screen.process(b"\x1b]9;Hello\x1b\\");
+
+    // Drain passthrough (simulates what persistent_reader_loop does).
+    // Notifications go to a separate queue, not passthrough.
+    let passthrough = screen.take_passthrough();
+    assert_eq!(passthrough.len(), 1, "only BEL should be in passthrough");
+    assert_eq!(passthrough[0], b"\x07");
+
+    // Notifications should still be available in their own queue
+    let notifications = screen.take_queued_notifications();
+    assert_eq!(notifications.len(), 2);
+    assert!(String::from_utf8_lossy(&notifications[0]).contains("777"));
+    assert!(String::from_utf8_lossy(&notifications[1]).contains("9"));
+}
+
+#[test]
+fn notifications_replayed_on_simulated_reconnect() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"hello");
+
+    // Generate notifications while "detached"
+    screen.process(b"\x1b]777;notify;Title;Body\x1b\\");
+    screen.process(b"\x1b]9;Alert\x07");
+
+    // Drain passthrough as the reader loop would
+    let _ = screen.take_passthrough();
+    let _ = screen.take_pending_scrollback();
+
+    // Simulate reconnect: take notifications and prepend to render
+    let notifications = screen.take_queued_notifications();
+    assert_eq!(notifications.len(), 2);
+
+    let mut render_data = Vec::new();
+    for notif in &notifications {
+        render_data.extend_from_slice(notif);
+    }
+    let mut cache = RenderCache::new();
+    render_data.extend_from_slice(&screen.render(true, &mut cache));
+
+    let output = String::from_utf8_lossy(&render_data);
+    // Notifications should appear at the start of the output
+    assert!(output.starts_with("\x1b]777;"), "notifications should be prepended to render data");
+    // Screen content should follow
+    assert!(output.contains("hello"));
+}
+
+/// Consumed notifications must not reappear on the next reconnect.
+///
+/// Simulates full reconnect cycle:
+///   1. Notifications arrive while detached
+///   2. Client connects → take_queued_notifications + render + drain pending
+///   3. Client disconnects
+///   4. Client connects again → notifications must be empty
+#[test]
+fn consumed_notifications_not_replayed_on_second_reconnect() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"hello");
+
+    // --- Detached: notifications arrive ---
+    screen.process(b"\x1b]777;notify;Build;Done\x1b\\");
+    screen.process(b"\x1b]9;Alert!\x07");
+    screen.process(b"\x1b]99;kitty notif\x07");
+
+    // Simulate persistent reader draining passthrough while no client
+    let _ = screen.take_passthrough();
+    let _ = screen.take_pending_scrollback();
+
+    // --- First reconnect (client 1): send_initial_state consumes notifications ---
+    let notifications = screen.take_queued_notifications();
+    assert_eq!(notifications.len(), 3, "first reconnect should get all 3 notifications");
+
+    let mut cache = RenderCache::new();
+    let _ = screen.render(true, &mut cache);
+    let _ = screen.take_pending_scrollback();
+    let _ = screen.take_passthrough();
+
+    // --- Client 1 disconnects, no new notifications ---
+
+    // --- Second reconnect (client 2) ---
+    let notifications2 = screen.take_queued_notifications();
+    assert!(
+        notifications2.is_empty(),
+        "consumed notifications must not reappear: got {} items",
+        notifications2.len()
+    );
+
+    // Full render should still work, just without notifications
+    let mut cache2 = RenderCache::new();
+    let render2 = screen.render(true, &mut cache2);
+    let output2 = String::from_utf8_lossy(&render2);
+    assert!(output2.contains("hello"), "screen content must survive multiple reconnects");
+}
+
+/// New notifications between reconnects should not replay old ones.
+///
+/// Simulates:
+///   1. Notification A arrives, client connects and consumes it
+///   2. Client disconnects, notification B arrives
+///   3. Client reconnects → only notification B should appear
+#[test]
+fn only_new_notifications_on_subsequent_reconnect() {
+    let mut screen = Screen::new(80, 24, 100);
+
+    // --- Notification A while detached ---
+    screen.process(b"\x1b]777;notify;Title;msgA\x1b\\");
+
+    // --- First reconnect: send_initial_state consumes ---
+    let notifs1 = screen.take_queued_notifications();
+    assert_eq!(notifs1.len(), 1);
+    assert!(String::from_utf8_lossy(&notifs1[0]).contains("msgA"));
+
+    let mut cache = RenderCache::new();
+    let _ = screen.render(true, &mut cache);
+    let _ = screen.take_pending_scrollback();
+    let _ = screen.take_passthrough();
+
+    // --- Client disconnects, new notification B arrives ---
+    screen.process(b"\x1b]777;notify;Title;msgB\x1b\\");
+    // Persistent reader drains passthrough (notifications go to separate queue)
+    let _ = screen.take_passthrough();
+
+    // --- Second reconnect ---
+    let notifs2 = screen.take_queued_notifications();
+    assert_eq!(notifs2.len(), 1, "should have exactly 1 new notification");
+    let content = String::from_utf8_lossy(&notifs2[0]);
+    assert!(content.contains("msgB"), "should be msgB, got: {}", content);
+    assert!(!content.contains("msgA"), "msgA must not reappear");
+}
+
+/// Notifications during an active session are consumed by the relay via
+/// take_and_render() and don't reappear on reconnect.
+#[test]
+fn notifications_during_active_session_consumed_by_relay() {
+    let mut screen = Screen::new(80, 24, 100);
+
+    // Simulate send_initial_state
+    let _ = screen.take_queued_notifications();
+    let mut cache = RenderCache::new();
+    let _ = screen.render(true, &mut cache);
+    let _ = screen.take_pending_scrollback();
+    let _ = screen.take_passthrough();
+
+    // --- Active session: notifications arrive ---
+    screen.process(b"\x1b]777;notify;Title;active_notif\x1b\\");
+    screen.process(b"\x1b]9;beep\x07");
+
+    // Relay calls take_and_render — consumes notifications
+    let (_, passthrough) = screen.take_and_render(&mut cache);
+    assert!(passthrough.iter().any(|p| String::from_utf8_lossy(p).contains("777")),
+        "notification should be delivered to active client via passthrough");
+    assert!(passthrough.iter().any(|p| String::from_utf8_lossy(p).contains("9;")),
+        "OSC 9 should be delivered to active client via passthrough");
+
+    // --- Client disconnects, reconnects ---
+    let notifs = screen.take_queued_notifications();
+    assert!(notifs.is_empty(),
+        "notifications consumed by relay must not reappear, got {} items",
+        notifs.len());
+}
+
+/// Multiple reconnect cycles with no new notifications should all return empty.
+#[test]
+fn multiple_reconnects_no_stale_notifications() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b]777;notify;Title;once\x1b\\");
+
+    // First reconnect consumes
+    let n1 = screen.take_queued_notifications();
+    assert_eq!(n1.len(), 1);
+    let mut cache = RenderCache::new();
+    let _ = screen.render(true, &mut cache);
+    let _ = screen.take_pending_scrollback();
+    let _ = screen.take_passthrough();
+
+    // Several reconnects with no new activity
+    for i in 0..5 {
+        let notifs = screen.take_queued_notifications();
+        assert!(notifs.is_empty(),
+            "reconnect #{} should have no notifications, got {}",
+            i + 2, notifs.len()
+        );
+        let mut c = RenderCache::new();
+        let _ = screen.render(true, &mut c);
+        let _ = screen.take_pending_scrollback();
+        let _ = screen.take_passthrough();
+    }
 }

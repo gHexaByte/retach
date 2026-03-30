@@ -6,3 +6,6 @@ pub mod codec;
 
 pub use messages::{ClientMsg, ConnectMode, ServerMsg, SessionInfo};
 pub use codec::{encode, read_one_message, FrameReader};
+
+#[cfg(test)]
+mod tests_history_protocol;

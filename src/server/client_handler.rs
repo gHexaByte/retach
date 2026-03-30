@@ -5,9 +5,12 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 use tracing::info;
 
-use super::session_bridge::{handle_session, ConnectRequest};
+use super::session_bridge::handle_session;
+use super::session_setup::ConnectRequest;
 
-/// Read initial message with a timeout to prevent idle connections from leaking resources.
+/// Timeout for reading the initial client message (Connect/List/Kill).
+/// 30s is generous for network latency while preventing leaked connections
+/// from clients that connect but never send anything.
 const INITIAL_MSG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Dispatch a single client connection by reading its first message and routing accordingly.
@@ -59,9 +62,12 @@ pub async fn handle_client(
                         let mut mgr = manager.lock().await;
                         mgr.remove(&name)
                     };
-                    // Session dropped outside the async Mutex via spawn_blocking
-                    if let Some(session) = removed {
-                        tokio::task::spawn_blocking(move || drop(session));
+                    if let Some(mut session) = removed {
+                        // Disconnect before dropping the session so the connected
+                        // client's watch receiver sees RecvError ("session killed")
+                        // instead of the eviction value ("evicted by new client").
+                        session.disconnect();
+                        super::drop_blocking_with_timeout(session, &format!("kill session '{}'", name)).await;
                         info!(session = %name, "session killed");
                         let resp = protocol::encode(&ServerMsg::SessionKilled { name })?;
                         stream.write_all(&resp).await?;

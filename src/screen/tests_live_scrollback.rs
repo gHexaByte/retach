@@ -11,41 +11,10 @@
 //! - Interleaved scrollback / no-scrollback render cycles
 
 use super::*;
+use super::test_helpers::*;
 use render::RenderCache;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-
-/// Strip ANSI escape sequences, returning only printable text.
-fn strip_ansi(bytes: &[u8]) -> String {
-    let s = String::from_utf8_lossy(bytes);
-    let mut out = String::new();
-    let mut in_esc = false;
-    for ch in s.chars() {
-        if in_esc {
-            if ch.is_ascii_alphabetic() || ch == 'm' {
-                in_esc = false;
-            }
-            continue;
-        }
-        if ch == '\x1b' {
-            in_esc = true;
-            continue;
-        }
-        if ch >= ' ' {
-            out.push(ch);
-        }
-    }
-    out.trim_end().to_string()
-}
-
-/// Collect scrollback history as trimmed strings.
-fn history_texts(screen: &Screen) -> Vec<String> {
-    screen
-        .get_history()
-        .iter()
-        .map(|b| strip_ansi(b))
-        .collect()
-}
 
 /// Collect pending scrollback as trimmed strings.
 fn pending_texts(pending: &[Vec<u8>]) -> Vec<String> {
@@ -84,7 +53,7 @@ fn incremental_render_after_scrollback_injection_redraws_all_rows() {
     // render_with_scrollback invalidates the cache
     let output = screen.render_with_scrollback(&pending, &mut cache);
     let text = String::from_utf8_lossy(&output);
-    // Should contain scrollback before clear and screen after clear
+    // Should contain scrollback before screen clear and screen after
     assert!(text.contains("\x1b[2J"), "should have screen clear");
 
     // Now: incremental render with NO changes should skip all rows
@@ -150,9 +119,9 @@ fn sequential_scrollback_batches_no_duplication() {
     let out1 = screen.render_with_scrollback(&pending1, &mut cache);
     let t1 = String::from_utf8_lossy(&out1);
     // Scrollback should have R01-R03, screen should have R04-R06
-    let clear1 = t1.find("\x1b[2J").unwrap();
-    assert!(t1[..clear1].contains("R01"), "batch1: R01 in scrollback");
-    assert!(t1[clear1..].contains("R04"), "batch1: R04 on screen");
+    let pos_clear1 = t1.find("\x1b[2J").unwrap();
+    assert!(t1[..pos_clear1].contains("R01"), "batch1: R01 in scrollback");
+    assert!(t1[pos_clear1..].contains("R04"), "batch1: R04 on screen");
 
     // Batch 2: 2 more lines → 2 scroll off
     screen.process(b"\r\nR07\r\nR08");
@@ -164,17 +133,17 @@ fn sequential_scrollback_batches_no_duplication() {
 
     let out2 = screen.render_with_scrollback(&pending2, &mut cache);
     let t2 = String::from_utf8_lossy(&out2);
-    let clear2 = t2.find("\x1b[2J").unwrap();
+    let pos_clear2 = t2.find("\x1b[2J").unwrap();
     // Only new pending in scrollback portion
-    assert!(t2[..clear2].contains("R04"), "batch2: R04 in scrollback");
-    assert!(t2[..clear2].contains("R05"), "batch2: R05 in scrollback");
+    assert!(t2[..pos_clear2].contains("R04"), "batch2: R04 in scrollback");
+    assert!(t2[..pos_clear2].contains("R05"), "batch2: R05 in scrollback");
     assert!(
-        !t2[..clear2].contains("R01"),
+        !t2[..pos_clear2].contains("R01"),
         "batch2: R01 should NOT be in this scrollback (already sent)"
     );
     // Screen should show R06-R08
-    assert!(t2[clear2..].contains("R06"), "batch2: R06 on screen");
-    assert!(t2[clear2..].contains("R08"), "batch2: R08 on screen");
+    assert!(t2[pos_clear2..].contains("R06"), "batch2: R06 on screen");
+    assert!(t2[pos_clear2..].contains("R08"), "batch2: R08 on screen");
 
     // Total history should have all 5 scrolled lines
     let hist = history_texts(&screen);
@@ -263,7 +232,7 @@ fn alternating_scrollback_and_no_scrollback_cycles() {
     screen.process(b"\r\nnew1\r\nnew2");
     let out1 = do_render_cycle(&mut screen, &mut cache);
     let t1 = String::from_utf8_lossy(&out1);
-    assert!(t1.contains("\x1b[2J"), "scrollback cycle should clear screen");
+    assert!(t1.contains("\x1b[2J"), "scrollback cycle should screen clear");
 
     // Cycle 2: screen-only (cursor move + overwrite)
     screen.process(b"\x1b[1;1H");  // move to top
@@ -278,7 +247,7 @@ fn alternating_scrollback_and_no_scrollback_cycles() {
     screen.process(b"\r\nnew3\r\nnew4\r\nnew5");
     let out3 = do_render_cycle(&mut screen, &mut cache);
     let t3 = String::from_utf8_lossy(&out3);
-    assert!(t3.contains("\x1b[2J"), "scrollback cycle should clear screen again");
+    assert!(t3.contains("\x1b[2J"), "scrollback cycle should screen clear again");
 
     // Cycle 4: no changes at all
     let out4 = do_render_cycle(&mut screen, &mut cache);
@@ -438,8 +407,8 @@ fn cursor_position_correct_after_scrollback_injection() {
     // More output → scrollback
     screen.process(b"\r\nrow5\r\nrow6");
     // Cursor should be at row 3 (0-indexed), col 4 (after "row6")
-    assert_eq!(screen.grid.cursor_y, 3);
-    assert_eq!(screen.grid.cursor_x, 4);
+    assert_eq!(screen.grid.cursor_y(), 3);
+    assert_eq!(screen.grid.cursor_x(), 4);
 
     let pending = screen.take_pending_scrollback();
     let output = screen.render_with_scrollback(&pending, &mut cache);
@@ -480,15 +449,15 @@ fn large_pending_scrollback_renders_all_lines() {
     let output = screen.render_with_scrollback(&pending, &mut cache);
     let text = String::from_utf8_lossy(&output);
 
-    // All scrollback lines should be present before the clear
-    let clear_pos = text.find("\x1b[2J").expect("should have screen clear");
-    let scrollback_portion = &text[..clear_pos];
+    // All scrollback lines should be present before screen clear
+    let pos_clear = text.find("\x1b[2J").expect("should have screen clear");
+    let scrollback_portion = &text[..pos_clear];
     assert!(scrollback_portion.contains("R0001"), "first line should be in scrollback");
     assert!(scrollback_portion.contains("R0250"), "middle line should be in scrollback");
     assert!(scrollback_portion.contains("R0497"), "last scrolled-off line should be in scrollback");
 
     // Screen should show the last 3 lines (R0498, R0499, R0500)
-    let screen_portion = &text[clear_pos..];
+    let screen_portion = &text[pos_clear..];
     assert!(screen_portion.contains("R0498"), "R0498 on screen");
     assert!(screen_portion.contains("R0500"), "R0500 on screen");
 }
@@ -609,32 +578,32 @@ fn scrollback_content_before_clear_screen_content_after() {
 
     let output = screen.render_with_scrollback(&pending, &mut cache);
     let text = String::from_utf8_lossy(&output);
-    let clear_pos = text.find("\x1b[2J").unwrap();
+    let pos_clear = text.find("\x1b[2J").unwrap();
 
-    let before_clear = &text[..clear_pos];
-    let after_clear = &text[clear_pos..];
+    let before_screen = &text[..pos_clear];
+    let after_screen = &text[pos_clear..];
 
-    // All 5 scrollback lines should be before the clear
+    // All 5 scrollback lines should be before screen clear
     for i in 1..=5 {
         let label = format!("LINE{:02}", i);
         assert!(
-            before_clear.contains(&label),
-            "{} should be in scrollback (before clear)",
+            before_screen.contains(&label),
+            "{} should be in scrollback (before screen clear)",
             label
         );
         assert!(
-            !after_clear.contains(&label),
-            "{} should NOT be in screen portion (after clear)",
+            !after_screen.contains(&label),
+            "{} should NOT be in screen portion (after screen clear)",
             label
         );
     }
 
-    // Last 3 lines should be on screen (after clear)
+    // Last 3 lines should be on screen (after screen clear)
     for i in 6..=8 {
         let label = format!("LINE{:02}", i);
         assert!(
-            after_clear.contains(&label),
-            "{} should be on screen (after clear)",
+            after_screen.contains(&label),
+            "{} should be on screen (after screen clear)",
             label
         );
     }
@@ -661,10 +630,10 @@ fn full_relay_cycle_scrollback_then_incremental_then_scrollback() {
     screen.process(b"\r\nB005\r\nB006\r\nB007");
     let out1 = do_render_cycle(&mut screen, &mut cache);
     let t1 = String::from_utf8_lossy(&out1);
-    assert!(t1.contains("\x1b[2J"), "cycle 1 should clear (scrollback)");
-    let c1 = t1.find("\x1b[2J").unwrap();
-    assert!(t1[..c1].contains("A001"), "cycle 1: A001 in scrollback");
-    assert!(t1[c1..].contains("B007"), "cycle 1: B007 on screen");
+    assert!(t1.contains("\x1b[2J"), "cycle 1 should screen clear (scrollback)");
+    let pos_clear1 = t1.find("\x1b[2J").unwrap();
+    assert!(t1[..pos_clear1].contains("A001"), "cycle 1: A001 in scrollback");
+    assert!(t1[pos_clear1..].contains("B007"), "cycle 1: B007 on screen");
 
     // --- Cycle 2: cursor move only ---
     screen.process(b"\x1b[1;1H");  // cursor to top-left
@@ -679,14 +648,14 @@ fn full_relay_cycle_scrollback_then_incremental_then_scrollback() {
     screen.process(b"\r\nC008\r\nC009");
     let out3 = do_render_cycle(&mut screen, &mut cache);
     let t3 = String::from_utf8_lossy(&out3);
-    assert!(t3.contains("\x1b[2J"), "cycle 3 should clear (scrollback)");
-    let c3 = t3.find("\x1b[2J").unwrap();
+    assert!(t3.contains("\x1b[2J"), "cycle 3 should screen clear (scrollback)");
+    let pos_clear3 = t3.find("\x1b[2J").unwrap();
     // Only newly scrolled lines in this batch's scrollback
     assert!(
-        !t3[..c3].contains("A001"),
+        !t3[..pos_clear3].contains("A001"),
         "cycle 3: A001 already sent, should not be in this batch"
     );
-    assert!(t3[c3..].contains("C009"), "cycle 3: C009 on screen");
+    assert!(t3[pos_clear3..].contains("C009"), "cycle 3: C009 on screen");
 }
 
 // ─── Edge case: single-line scrollback ──────────────────────────────────────
@@ -708,12 +677,12 @@ fn single_line_scrollback_injection() {
     let text = String::from_utf8_lossy(&output);
 
     assert!(text.contains("\x1b[2J"), "should have screen clear");
-    let clear_pos = text.find("\x1b[2J").unwrap();
+    let pos_clear = text.find("\x1b[2J").unwrap();
     assert!(
-        text[..clear_pos].contains("line1"),
+        text[..pos_clear].contains("line1"),
         "single scrollback line should be present"
     );
-    assert!(text[clear_pos..].contains("line4"), "line4 on screen");
+    assert!(text[pos_clear..].contains("line4"), "line4 on screen");
 }
 
 // ─── Edge case: scrollback with styled content ──────────────────────────────
@@ -1343,8 +1312,8 @@ fn scrollback_byte_ordering_end_to_end() {
     assert!(last_content < sync_begin, "content before sync");
 
     // 5. Screen clear inside sync block
-    let clear_pos = text.find("\x1b[2J").expect("clear missing");
-    assert!(sync_begin < clear_pos, "clear inside sync block");
+    let pos_clear = text.find("\x1b[2J").expect("screen clear missing");
+    assert!(sync_begin < pos_clear, "screen clear inside sync block");
 
     // 6. Ends with sync end
     assert!(text.ends_with("\x1b[?2026l"), "should end with sync end");
@@ -1386,7 +1355,7 @@ fn scrollback_large_burst_chunked_correctly() {
     let el2_count = text.matches("\x1b[2K").count();
     assert_eq!(el2_count, 0, "full chunks should not erase rows");
 
-    // Visible lines after clear
+    // Visible lines after screen clear
     let after_clear = &text[text.find("\x1b[2J").unwrap()..];
     assert!(after_clear.contains("LINE051"), "LINE051 should be visible");
     assert!(after_clear.contains("LINE054"), "LINE054 should be visible");

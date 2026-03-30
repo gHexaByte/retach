@@ -18,6 +18,8 @@ pub fn emergency_restore() {
     let lock = get_or_init_global();
     if let Ok(guard) = lock.lock() {
         if let Some((fd, ref original)) = *guard {
+            // SAFETY: fd is stdin (fd 0), which remains valid for the process
+            // lifetime. The global is only populated while RawMode is active.
             let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
             let _ = termios::tcsetattr(borrowed, termios::SetArg::TCSANOW, original);
         }

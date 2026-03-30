@@ -33,8 +33,6 @@ pub enum ClientMsg {
 /// Message sent from the server to a client.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum ServerMsg {
-    /// Scrollback line (passthrough to terminal)
-    ScrollbackLine(Vec<u8>),
     /// Full screen redraw (ANSI bytes)
     ScreenUpdate(Vec<u8>),
     /// Scrollback history on reattach

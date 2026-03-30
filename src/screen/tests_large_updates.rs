@@ -9,53 +9,8 @@
 //! - Render stability after many scroll cycles
 
 use super::*;
+use super::test_helpers::*;
 use render::RenderCache;
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-/// Strip ANSI escape sequences, returning only printable text.
-fn strip_ansi(bytes: &[u8]) -> String {
-    let s = String::from_utf8_lossy(bytes);
-    let mut out = String::new();
-    let mut in_esc = false;
-    for ch in s.chars() {
-        if in_esc {
-            if ch.is_ascii_alphabetic() || ch == 'm' {
-                in_esc = false;
-            }
-            continue;
-        }
-        if ch == '\x1b' {
-            in_esc = true;
-            continue;
-        }
-        if ch >= ' ' {
-            out.push(ch);
-        }
-    }
-    out.trim_end().to_string()
-}
-
-/// Collect visible grid rows as trimmed strings.
-fn screen_lines(screen: &Screen) -> Vec<String> {
-    screen
-        .grid
-        .visible_rows()
-        .map(|row| {
-            let s: String = row.iter().map(|c| c.c).collect();
-            s.trim_end().to_string()
-        })
-        .collect()
-}
-
-/// Collect scrollback history as trimmed strings.
-fn history_texts(screen: &Screen) -> Vec<String> {
-    screen
-        .get_history()
-        .iter()
-        .map(|b| strip_ansi(b))
-        .collect()
-}
 
 /// Write N labeled lines ("L001\r\n", ..., "LNNN") to the screen.
 fn write_many_lines(screen: &mut Screen, count: usize) {
@@ -261,10 +216,10 @@ fn render_with_large_pending_scrollback() {
     let pos_clear = text.find("\x1b[2J").expect("screen clear should be present");
     assert!(pos_l001 < pos_clear, "scrollback should precede screen clear");
 
-    // Screen content after clear
+    // Screen content after screen clear
     let after_clear = &text[pos_clear..];
-    assert!(after_clear.contains("L096"), "visible L096 should be after clear");
-    assert!(after_clear.contains("L100"), "visible L100 should be after clear");
+    assert!(after_clear.contains("L096"), "visible L096 should be after screen clear");
+    assert!(after_clear.contains("L100"), "visible L100 should be after screen clear");
 
     // No scrollback lines in the screen portion
     assert!(!after_clear.contains("L001"), "L001 should not be in screen portion");
@@ -332,8 +287,8 @@ fn cursor_position_after_bulk_output() {
     write_many_lines(&mut screen, 100);
 
     // Cursor should be at column 4 (after "L100"), row 4 (last row, 0-indexed)
-    assert_eq!(screen.grid.cursor_y, 4, "cursor_y should be at bottom row");
-    assert_eq!(screen.grid.cursor_x, 4, "cursor_x should be after 'L100'");
+    assert_eq!(screen.grid.cursor_y(), 4, "cursor_y should be at bottom row");
+    assert_eq!(screen.grid.cursor_x(), 4, "cursor_x should be after 'L100'");
 
     let mut cache = RenderCache::new();
     let output = screen.render(true, &mut cache);
@@ -347,13 +302,13 @@ fn cursor_stays_on_bottom_row_during_continuous_scroll() {
     let mut screen = Screen::new(20, 3, 100);
     // Fill the screen first so cursor reaches the bottom
     screen.process(b"a\r\nb\r\nc");
-    assert_eq!(screen.grid.cursor_y, 2);
+    assert_eq!(screen.grid.cursor_y(), 2);
 
     // Now every \r\n should scroll, keeping cursor at bottom row
     for i in 1..=50 {
         screen.process(format!("\r\nline{}", i).as_bytes());
         assert_eq!(
-            screen.grid.cursor_y, 2,
+            screen.grid.cursor_y(), 2,
             "cursor_y should stay at bottom row (2) after scroll, iteration {}",
             i
         );
@@ -381,8 +336,8 @@ fn reattach_after_1000_lines() {
     assert!(text.contains("\x1b[2J"));
 
     // Screen portion should have last 5 lines
-    let clear_pos = text.find("\x1b[2J").unwrap();
-    let after_clear = &text[clear_pos..];
+    let pos_clear = text.find("\x1b[2J").unwrap();
+    let after_clear = &text[pos_clear..];
     assert!(after_clear.contains("L996"), "screen should show L996");
     assert!(after_clear.contains("L1000"), "screen should show L1000");
 }

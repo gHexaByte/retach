@@ -19,6 +19,10 @@ Traditional terminal multiplexers (tmux, screen, zellij) intercept your terminal
 
 retach passes completed scrollback lines directly to your terminal's stdout as plain text. Your terminal app handles scrolling natively: touchscreen swipe, trackpad gesture, scroll wheel — whatever works on your device. The daemon keeps a virtual screen (VTE-parsed grid) and a scrollback buffer. On reattach, it replays stored history so you see the full context.
 
+## SSH sessions
+
+retach is especially useful over SSH. If your connection drops, the session keeps running on the remote host. Reconnect with `ssh` and run `retach open work` to pick up right where you left off — full scrollback history and screen state are restored instantly.
+
 ## Install
 
 ```

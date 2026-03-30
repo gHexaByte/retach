@@ -64,6 +64,21 @@ pub async fn ensure_server_running() -> anyhow::Result<()> {
                 if nix::libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // Mark inherited file descriptors (3..max) as close-on-exec
+                // to prevent leaking client sockets and lockfiles into the
+                // daemon.  We use FD_CLOEXEC instead of close() to avoid
+                // closing Command's internal error-reporting pipe (which
+                // would silently swallow exec failures).
+                // FDs 0-2 are already redirected above.
+                // Cap at 4096 to avoid iterating millions of fds on systems
+                // with high RLIMIT_NOFILE. A daemon inherits <20 fds typically.
+                let max_fd = match nix::libc::sysconf(nix::libc::_SC_OPEN_MAX) {
+                    n if n > 0 => (n as i32).min(4096),
+                    _ => 1024,
+                };
+                for fd in 3..max_fd {
+                    nix::libc::fcntl(fd, nix::libc::F_SETFD, nix::libc::FD_CLOEXEC);
+                }
                 Ok(())
             })
             .spawn()?;
@@ -71,8 +86,8 @@ pub async fn ensure_server_running() -> anyhow::Result<()> {
         std::thread::spawn(move || { let _ = child.wait(); });
     }
 
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for _ in 0..SERVER_POLL_MAX {
+        tokio::time::sleep(SERVER_POLL_INTERVAL).await;
         if UnixStream::connect(&path).await.is_ok() {
             // _lock_guard drops here, releasing the flock
             return Ok(());

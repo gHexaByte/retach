@@ -1,9 +1,9 @@
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 
-use super::cell::Cell;
+use super::cell::{Cell, Row};
 use super::grid::{ActiveCharset, Charset, Grid, MouseEncoding, TerminalModes};
-use super::style::{Style, write_u16};
+use super::style::{StyleId, StyleTable, write_u16};
 
 /// Per-connection render cache for dirty tracking and mode delta.
 pub struct RenderCache {
@@ -11,6 +11,14 @@ pub struct RenderCache {
     last_modes: Option<TerminalModes>,
     last_scroll_region: Option<(u16, u16)>,
     last_title: String,
+    last_cursor: Option<(u16, u16)>,
+    last_cursor_visible: Option<bool>,
+}
+
+impl Default for RenderCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RenderCache {
@@ -20,6 +28,8 @@ impl RenderCache {
             last_modes: None,
             last_scroll_region: None,
             last_title: String::new(),
+            last_cursor: None,
+            last_cursor_visible: None,
         }
     }
 
@@ -29,6 +39,8 @@ impl RenderCache {
         self.last_modes = None;
         self.last_scroll_region = None;
         self.last_title.clear();
+        self.last_cursor = None;
+        self.last_cursor_visible = None;
     }
 }
 
@@ -36,10 +48,10 @@ impl RenderCache {
 /// Returns `None` if the entire row is blank with default style.
 fn last_content_position(row: &[Cell]) -> Option<usize> {
     row.iter()
-        .rposition(|c| (c.c != ' ' && c.c != '\0') || !c.style.is_default())
+        .rposition(|c| (c.c != ' ' && c.c != '\0') || !c.style_id.is_default())
 }
 
-fn hash_row(row: &[Cell]) -> u64 {
+fn hash_row(row: &Row) -> u64 {
     let mut hasher = DefaultHasher::new();
     row.hash(&mut hasher);
     hasher.finish()
@@ -47,7 +59,7 @@ fn hash_row(row: &[Cell]) -> u64 {
 
 /// Render a single row of cells as ANSI bytes with SGR codes.
 /// Returns empty Vec for fully blank lines.
-pub fn render_line(row: &[Cell]) -> Vec<u8> {
+pub(super) fn render_line(row: &Row, styles: &StyleTable) -> Vec<u8> {
     let last_non_space = match last_content_position(row) {
         Some(pos) => pos,
         None => {
@@ -56,22 +68,22 @@ pub fn render_line(row: &[Cell]) -> Vec<u8> {
     };
 
     let mut out = Vec::new();
-    let mut current = Style::default();
+    let mut current_id = StyleId::default();
     for (i, cell) in row.iter().enumerate() {
         if i > last_non_space { break; }
         // Skip wide char continuation cells
         if cell.width == 0 { continue; }
-        if cell.style != current {
-            out.extend_from_slice(&cell.style.to_sgr_with_reset());
-            current = cell.style;
+        if cell.style_id != current_id {
+            styles.get(cell.style_id).write_sgr_with_reset_to(&mut out);
+            current_id = cell.style_id;
         }
         let mut buf = [0u8; 4];
         out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
-        for &mark in &cell.combining {
+        for &mark in row.combining(i as u16) {
             out.extend_from_slice(mark.encode_utf8(&mut buf).as_bytes());
         }
     }
-    if !current.is_default() {
+    if !current_id.is_default() {
         out.extend_from_slice(b"\x1b[0m");
     }
     out
@@ -99,11 +111,12 @@ fn emit_charset(out: &mut Vec<u8>, slot: u8, charset: Charset) {
 fn emit_mode(out: &mut Vec<u8>, modes: &TerminalModes) {
     // Cursor shape (DECSCUSR)
     out.extend_from_slice(b"\x1b[");
-        out.push(b'0' + modes.cursor_shape.to_param());
-        out.extend_from_slice(b" q");
+    out.push(b'0' + modes.cursor_shape.to_param());
+    out.extend_from_slice(b" q");
 
     // Boolean DEC private modes
     emit_dec_mode(out, 1, modes.cursor_key_mode);
+    emit_dec_mode(out, 6, modes.origin_mode);
     emit_dec_mode(out, 7, modes.autowrap_mode);
     emit_dec_mode(out, 2004, modes.bracketed_paste);
 
@@ -151,6 +164,9 @@ fn emit_mode_delta(out: &mut Vec<u8>, modes: &TerminalModes, prev: &TerminalMode
     if modes.cursor_key_mode != prev.cursor_key_mode {
         emit_dec_mode(out, 1, modes.cursor_key_mode);
     }
+    if modes.origin_mode != prev.origin_mode {
+        emit_dec_mode(out, 6, modes.origin_mode);
+    }
     if modes.autowrap_mode != prev.autowrap_mode {
         emit_dec_mode(out, 7, modes.autowrap_mode);
     }
@@ -192,7 +208,7 @@ fn emit_mode_delta(out: &mut Vec<u8>, modes: &TerminalModes, prev: &TerminalMode
 /// Render the full screen grid as ANSI bytes.
 /// If `full` is true, clears screen first (used on initial attach).
 /// Otherwise uses dirty tracking to skip unchanged rows.
-pub fn render_screen(grid: &Grid, title: &str, full: bool, cache: &mut RenderCache) -> Vec<u8> {
+pub(super) fn render_screen(grid: &Grid, title: &str, full: bool, cache: &mut RenderCache) -> Vec<u8> {
     render_screen_impl(grid, title, &[], full, cache)
 }
 
@@ -203,13 +219,102 @@ pub fn render_screen(grid: &Grid, title: &str, full: bool, cache: &mut RenderCac
 /// a single synchronized-output block to prevent flicker.  Scrollback lines
 /// are emitted first (cursor positioned at the bottom so `\r\n` triggers real
 /// terminal scrolling), followed by a full screen clear and redraw.
-pub fn render_screen_with_scrollback(
+pub(super) fn render_screen_with_scrollback(
     grid: &Grid,
     title: &str,
     scrollback: &[Vec<u8>],
     cache: &mut RenderCache,
 ) -> Vec<u8> {
     render_screen_impl(grid, title, scrollback, true, cache)
+}
+
+/// Inject scrollback lines into the terminal's native scrollback buffer.
+/// Emitted OUTSIDE the synchronized output block — some terminals (Blink/hterm)
+/// buffer all sync'd output atomically, preventing intermediate scroll operations
+/// from pushing content into native scrollback.
+fn render_scrollback(out: &mut Vec<u8>, grid: &Grid, scrollback: &[Vec<u8>]) {
+    let rows = grid.rows() as usize;
+    out.extend_from_slice(b"\x1b[?25l\x1b[r");
+
+    for chunk in scrollback.chunks(rows) {
+        for (i, line) in chunk.iter().enumerate() {
+            out.extend_from_slice(b"\x1b[");
+            write_u16(out, (i + 1) as u16);
+            out.extend_from_slice(b";1H\x1b[0m");
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\x1b[K");
+        }
+        if chunk.len() < rows {
+            for i in chunk.len()..rows {
+                out.extend_from_slice(b"\x1b[");
+                write_u16(out, (i + 1) as u16);
+                out.extend_from_slice(b";1H\x1b[2K");
+            }
+        }
+        out.extend_from_slice(b"\x1b[");
+        write_u16(out, grid.rows());
+        out.extend_from_slice(b";1H");
+        out.extend(std::iter::repeat_n(b'\n', chunk.len()));
+    }
+}
+
+/// Emit scroll region, cursor position, terminal modes, and window title.
+/// Cursor visibility is handled separately after no-op detection because
+/// the sync block unconditionally hides the cursor at the start.
+fn render_modes_title_cursor(
+    out: &mut Vec<u8>,
+    grid: &Grid,
+    title: &str,
+    full: bool,
+    cache: &mut RenderCache,
+) {
+    // Scroll region (DECSTBM): must be emitted BEFORE cursor position because
+    // setting the scroll region resets the cursor to home.
+    let scroll_region = grid.scroll_region();
+    if full || cache.last_scroll_region != Some(scroll_region) {
+        out.extend_from_slice(b"\x1b[");
+        write_u16(out, scroll_region.0 + 1);
+        out.push(b';');
+        write_u16(out, scroll_region.1 + 1);
+        out.push(b'r');
+        cache.last_scroll_region = Some(scroll_region);
+    }
+
+    // Mode sequences before cursor position: emit_mode emits \x1b[?6h/l (DECOM)
+    // which homes the cursor on xterm/VTE. CUP must come AFTER modes so it is
+    // not overridden by cursor-homing side effects of DECOM state changes.
+    let modes = grid.modes();
+    match &cache.last_modes {
+        Some(prev) if !full => emit_mode_delta(out, modes, prev),
+        _ => emit_mode(out, modes),
+    }
+    cache.last_modes = Some(modes.clone());
+
+    // Cursor position: emitted AFTER modes so it overrides any cursor-homing
+    // caused by DECOM (?6) or other mode changes.
+    let cursor_pos = grid.cursor_pos();
+    if full || cache.last_cursor != Some(cursor_pos) {
+        out.extend_from_slice(b"\x1b[");
+        write_u16(out, cursor_pos.1 + 1);
+        out.push(b';');
+        write_u16(out, cursor_pos.0 + 1);
+        out.push(b'H');
+        cache.last_cursor = Some(cursor_pos);
+    }
+
+    // Window title: emit on full render (client may have stale title) or when changed.
+    // Sanitized to prevent OSC injection.
+    if full || title != cache.last_title {
+        out.extend_from_slice(b"\x1b]2;");
+        for &b in title.as_bytes() {
+            if b >= 0x20 && b != 0x7f {
+                out.push(b);
+            }
+        }
+        out.push(0x07);
+        cache.last_title = title.to_string();
+    }
+
 }
 
 fn render_screen_impl(
@@ -219,84 +324,45 @@ fn render_screen_impl(
     full: bool,
     cache: &mut RenderCache,
 ) -> Vec<u8> {
-    let mut out = Vec::new();
+    let capacity = if full || !scrollback.is_empty() {
+        grid.cols() as usize * grid.rows() as usize * 4
+    } else {
+        1024
+    };
+    let mut out = Vec::with_capacity(capacity);
 
-    // Scrollback injection: emitted OUTSIDE the synchronized output block.
-    //
-    // Some terminals (notably Blink/hterm on iOS) buffer all output during
-    // a sync block and apply it atomically, which means intermediate scroll
-    // operations (\r\n at the bottom row) don't push content into the native
-    // scrollback buffer.
-    //
-    // Algorithm: overwrite visible rows with scrollback content, then scroll
-    // them off via \n at the bottom row.  Processed in chunks of `rows` so
-    // that any amount of scrollback is handled correctly.
     if !scrollback.is_empty() {
-        let rows = grid.rows as usize;
-        // Hide cursor and reset scroll region to full screen so \n at the
-        // bottom scrolls the entire display (not just a scroll region).
-        out.extend_from_slice(b"\x1b[?25l\x1b[r");
-
-        for chunk in scrollback.chunks(rows) {
-            // Overwrite visible rows 1..chunk.len() with scrollback content.
-            for (i, line) in chunk.iter().enumerate() {
-                out.extend_from_slice(b"\x1b[");
-                write_u16(&mut out, (i + 1) as u16);
-                out.extend_from_slice(b";1H\x1b[0m");
-                out.extend_from_slice(line);
-                out.extend_from_slice(b"\x1b[K");
-            }
-            // Erase remaining rows below the chunk to prevent stale content
-            // from leaking into native scrollback on the next pass.
-            if chunk.len() < rows {
-                for i in chunk.len()..rows {
-                    out.extend_from_slice(b"\x1b[");
-                    write_u16(&mut out, (i + 1) as u16);
-                    out.extend_from_slice(b";1H\x1b[2K");
-                }
-            }
-            // Position at the bottom row and scroll chunk.len() lines off
-            // the top into native scrollback.
-            out.extend_from_slice(b"\x1b[");
-            write_u16(&mut out, grid.rows);
-            out.extend_from_slice(b";1H");
-            for _ in 0..chunk.len() {
-                out.push(b'\n');
-            }
-        }
+        render_scrollback(&mut out, grid, scrollback);
         cache.invalidate();
     }
 
-    // Synchronized output: begin (screen redraw only)
-    out.extend_from_slice(b"\x1b[?2026h");
-    // Hide cursor during redraw
-    out.extend_from_slice(b"\x1b[?25l");
-
     let full = full || !scrollback.is_empty();
 
+    // Remember length before render payload to detect no-op.
+    let pre_render_len = out.len();
+
+    // Synchronized output block: begin
+    out.extend_from_slice(b"\x1b[?2026h");
+    out.extend_from_slice(b"\x1b[?25l");
+
     if full {
-        // Reset SGR before clearing to prevent leftover background color from
-        // filling the screen (e.g. after history output with styled lines).
         out.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
         cache.invalidate();
     }
 
-    // Ensure cache row_hashes is the right length
     let num_rows = grid.visible_row_count();
     if cache.row_hashes.len() != num_rows {
-        cache.row_hashes.resize(num_rows, u64::MAX); // sentinel: won't match any real hash
+        cache.row_hashes.resize(num_rows, u64::MAX);
     }
 
     for (y, row) in grid.visible_rows().enumerate() {
         let row_hash = hash_row(row);
 
-        // Skip unchanged rows on incremental renders
         if !full && cache.row_hashes[y] == row_hash {
             continue;
         }
         cache.row_hashes[y] = row_hash;
 
-        // Write-then-erase: position cursor, write content, then clear remainder
         out.extend_from_slice(b"\x1b[");
         write_u16(&mut out, y as u16 + 1);
         out.extend_from_slice(b";1H");
@@ -305,105 +371,270 @@ fn render_screen_impl(
             .map(|p| p + 1)
             .unwrap_or(0);
 
-        let mut last_style = Style::default();
+        let mut last_sid = StyleId::default();
         for (x, cell) in row.iter().enumerate() {
             if x >= write_len { break; }
             if cell.width == 0 { continue; }
-            if cell.style != last_style {
-                // Combined reset+set SGR in one escape
-                out.extend_from_slice(&cell.style.to_sgr_with_reset());
-                last_style = cell.style;
+            if cell.style_id != last_sid {
+                grid.style_table().get(cell.style_id).write_sgr_with_reset_to(&mut out);
+                last_sid = cell.style_id;
             }
             let mut buf = [0u8; 4];
             out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
-            for &mark in &cell.combining {
+            for &mark in row.combining(x as u16) {
                 out.extend_from_slice(mark.encode_utf8(&mut buf).as_bytes());
             }
         }
 
-        // Reset style + erase to end of line (clears any leftover from previous content)
-        out.extend_from_slice(b"\x1b[0m\x1b[K");
+        // Reset SGR; erase to EOL only for incremental (full already cleared via \x1b[2J)
+        out.extend_from_slice(if full { b"\x1b[0m" as &[u8] } else { b"\x1b[0m\x1b[K" });
     }
 
-    // Scroll region (DECSTBM): must be emitted BEFORE cursor position because
-    // setting the scroll region resets the cursor to home.
-    let scroll_region = (grid.scroll_top, grid.scroll_bottom);
-    if full || cache.last_scroll_region != Some(scroll_region) {
-        out.extend_from_slice(b"\x1b[");
-        write_u16(&mut out, grid.scroll_top + 1);
-        out.push(b';');
-        write_u16(&mut out, grid.scroll_bottom + 1);
-        out.push(b'r');
-        cache.last_scroll_region = Some(scroll_region);
+    render_modes_title_cursor(&mut out, grid, title, full, cache);
+
+    // Cursor visibility is handled AFTER no-op detection because the sync
+    // block unconditionally hides the cursor (\x1b[?25l) at the start.
+    // If we send any output, we must restore cursor visibility at the end.
+    // Caching cursor visibility would cause the cursor to stay hidden on
+    // subsequent renders where only rows changed.
+    let cursor_visible = grid.cursor_visible();
+
+    // No-op detection: nothing emitted besides sync header AND cursor
+    // visibility unchanged — safe to skip the entire frame.
+    let header_len = pre_render_len + b"\x1b[?2026h\x1b[?25l".len();
+    if out.len() == header_len && cache.last_cursor_visible == Some(cursor_visible) {
+        out.truncate(pre_render_len);
+        return out;
     }
+    cache.last_cursor_visible = Some(cursor_visible);
 
-    // Cursor position (after scroll region, since DECSTBM resets cursor)
-    out.extend_from_slice(b"\x1b[");
-    write_u16(&mut out, grid.cursor_y + 1);
-    out.push(b';');
-    write_u16(&mut out, grid.cursor_x + 1);
-    out.push(b'H');
-
-    // Mode sequences: full sends all, incremental sends delta only
-    let modes = &grid.modes;
-    match &cache.last_modes {
-        Some(prev) if !full => emit_mode_delta(&mut out, modes, prev),
-        _ => emit_mode(&mut out, modes),
-    }
-    cache.last_modes = Some(modes.clone());
-
-    // Window title: only send if changed (sanitized to prevent OSC injection)
-    if title != cache.last_title {
-        out.extend_from_slice(b"\x1b]2;");
-        for &b in title.as_bytes() {
-            // Filter control chars that could break or inject escape sequences
-            if b >= 0x20 && b != 0x7f {
-                out.push(b);
-            }
-        }
-        out.push(0x07);
-        cache.last_title = title.to_string();
-    }
-
-    // Cursor visibility: always restore since we hide it at the top for redraw
-    if grid.cursor_visible {
+    // Restore cursor visibility (we always hide at sync start).
+    // When cursor should be hidden, the sync-start \x1b[?25l suffices.
+    if cursor_visible {
         out.extend_from_slice(b"\x1b[?25h");
     }
-    // (if !cursor_visible, already hidden from the top — no need to re-emit)
 
-    // End synchronized output
+    // Close synchronized output block.
     out.extend_from_slice(b"\x1b[?2026l");
     out
+}
+
+/// ANSI escape sequence renderer.
+///
+/// Renders terminal emulator state as ANSI escape sequences suitable
+/// for output to a real terminal. Uses dirty-tracking for incremental updates.
+pub struct AnsiRenderer {
+    cache: RenderCache,
+}
+
+impl Default for AnsiRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AnsiRenderer {
+    /// Create a new ANSI renderer.
+    pub fn new() -> Self {
+        Self { cache: RenderCache::new() }
+    }
+
+    /// Render a Screen directly (optimized path using Grid internals).
+    ///
+    /// This is the fast path used by retach's server, with row-hash dirty
+    /// tracking and mode delta encoding.
+    pub fn render_screen(&mut self, grid: &super::grid::Grid, title: &str, full: bool) -> Vec<u8> {
+        render_screen(grid, title, full, &mut self.cache)
+    }
+
+    /// Render with scrollback lines prepended in a synchronized block.
+    pub fn render_screen_with_scrollback(
+        &mut self,
+        grid: &super::grid::Grid,
+        title: &str,
+        scrollback: &[Vec<u8>],
+    ) -> Vec<u8> {
+        render_screen_with_scrollback(grid, title, scrollback, &mut self.cache)
+    }
+
+    /// Invalidate the cache, forcing a full redraw on next render.
+    pub fn invalidate(&mut self) {
+        self.cache.invalidate();
+    }
+}
+
+impl super::traits::TerminalRenderer for AnsiRenderer {
+    type Output = Vec<u8>;
+
+    fn render(&mut self, emulator: &dyn super::traits::TerminalEmulator, full: bool) -> Vec<u8> {
+        use super::style::Style;
+
+        let capacity = if full {
+            emulator.cols() as usize * emulator.rows() as usize * 4
+        } else {
+            1024
+        };
+        let mut out = Vec::with_capacity(capacity);
+
+        // Synchronized output block: begin
+        out.extend_from_slice(b"\x1b[?2026h");
+        out.extend_from_slice(b"\x1b[?25l");
+
+        if full {
+            out.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
+            self.cache.invalidate();
+        }
+
+        // Ensure row_hashes cache matches current row count
+        let num_rows = emulator.rows() as usize;
+        if self.cache.row_hashes.len() != num_rows {
+            self.cache.row_hashes.resize(num_rows, u64::MAX);
+        }
+
+        let header_len = out.len();
+
+        for (y, row) in emulator.visible_rows().enumerate() {
+            let row_hash = hash_row(row);
+            if !full && self.cache.row_hashes[y] == row_hash {
+                continue;
+            }
+            self.cache.row_hashes[y] = row_hash;
+
+            // Move cursor to start of row
+            out.extend_from_slice(b"\x1b[");
+            write_u16(&mut out, (y as u16) + 1);
+            out.extend_from_slice(b";1H");
+
+            let write_len = last_content_position(row)
+                .map(|p| p + 1)
+                .unwrap_or(0);
+
+            let mut prev_style = Style::default();
+
+            for (x, cell) in row.iter().enumerate() {
+                if x >= write_len { break; }
+                if cell.width == 0 {
+                    continue;
+                }
+                let style = emulator.resolve_style(cell.style_id);
+                if style != prev_style {
+                    style.write_sgr_with_reset_to(&mut out);
+                    prev_style = style;
+                }
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+                for &mark in row.combining(x as u16) {
+                    out.extend_from_slice(mark.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+
+            // Reset SGR; erase to EOL only for incremental (full already cleared via \x1b[2J)
+            out.extend_from_slice(if full { b"\x1b[0m" as &[u8] } else { b"\x1b[0m\x1b[K" });
+        }
+
+        // Scroll region (DECSTBM) — emit before cursor position (DECSTBM resets cursor)
+        let scroll_region = emulator.scroll_region();
+        if full || self.cache.last_scroll_region != Some(scroll_region) {
+            out.extend_from_slice(b"\x1b[");
+            write_u16(&mut out, scroll_region.0 + 1);
+            out.push(b';');
+            write_u16(&mut out, scroll_region.1 + 1);
+            out.push(b'r');
+            self.cache.last_scroll_region = Some(scroll_region);
+        }
+
+        // Terminal modes: full on first render, delta afterwards
+        let modes = emulator.modes();
+        match &self.cache.last_modes {
+            Some(prev) if !full => emit_mode_delta(&mut out, modes, prev),
+            _ => emit_mode(&mut out, modes),
+        }
+        self.cache.last_modes = Some(modes.clone());
+
+        // Cursor position: emit only when changed (after modes — DECOM can home cursor)
+        let (cx, cy) = emulator.cursor_position();
+        let cursor_pos = (cx, cy);
+        if full || self.cache.last_cursor != Some(cursor_pos) {
+            out.extend_from_slice(b"\x1b[");
+            write_u16(&mut out, cy + 1);
+            out.push(b';');
+            write_u16(&mut out, cx + 1);
+            out.push(b'H');
+            self.cache.last_cursor = Some(cursor_pos);
+        }
+
+        // Window title — emit on full render or when changed
+        let title = emulator.title();
+        if full || title != self.cache.last_title {
+            out.extend_from_slice(b"\x1b]2;");
+            for &b in title.as_bytes() {
+                if b >= 0x20 && b != 0x7f {
+                    out.push(b);
+                }
+            }
+            out.push(0x07);
+            self.cache.last_title = title.to_string();
+        }
+
+        // Cursor visibility: handled after no-op detection because the sync
+        // block unconditionally hides cursor at the start.
+        let cursor_visible = emulator.cursor_visible();
+
+        // No-op detection: nothing emitted AND cursor visibility unchanged
+        if out.len() == header_len && self.cache.last_cursor_visible == Some(cursor_visible) {
+            out.clear();
+            return out;
+        }
+        self.cache.last_cursor_visible = Some(cursor_visible);
+
+        // Restore cursor visibility (we always hide at sync start)
+        if cursor_visible {
+            out.extend_from_slice(b"\x1b[?25h");
+        }
+
+        // Close synchronized output block
+        out.extend_from_slice(b"\x1b[?2026l");
+
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::grid::{CursorShape, MouseEncoding};
-    use super::super::style::Color;
+    use super::super::style::{Color, Style, StyleTable};
+
+    /// Helper: intern a style and assign it to a cell in tests.
+    fn set_style(cell: &mut Cell, style: Style, st: &mut StyleTable) {
+        cell.style_id = st.intern(style);
+    }
 
     #[test]
     fn render_line_blank() {
-        let row = vec![Cell::default(); 80];
-        let result = render_line(&row);
+        let row = Row::new(80);
+        let st = StyleTable::new();
+        let result = render_line(&row, &st);
         assert!(result.is_empty(), "blank line should produce empty vec");
     }
 
     #[test]
     fn render_line_with_text() {
-        let mut row = vec![Cell::default(); 10];
+        let mut row = Row::new(10);
         row[0].c = 'H';
         row[1].c = 'i';
-        let result = render_line(&row);
+        let st = StyleTable::new();
+        let result = render_line(&row, &st);
         assert_eq!(result, b"Hi");
     }
 
     #[test]
     fn render_line_with_style() {
-        let mut row = vec![Cell::default(); 10];
+        let mut st = StyleTable::new();
+        let mut row = Row::new(10);
         row[0].c = 'R';
-        row[0].style.fg = Some(Color::Indexed(1));
-        let result = render_line(&row);
+        set_style(&mut row[0], Style { fg: Some(Color::Indexed(1)), ..Style::default() }, &mut st);
+        let result = render_line(&row, &st);
         // Should have combined reset+set SGR, then 'R', then reset
         assert!(result.starts_with(b"\x1b[0;31mR"),
             "expected combined reset+set, got: {:?}", String::from_utf8_lossy(&result));
@@ -416,8 +647,8 @@ mod tests {
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);
-        // Should contain clear screen sequence
-        assert!(text.contains("\x1b[2J\x1b[H"));
+        // Full render must clear the screen and home cursor
+        assert!(text.contains("\x1b[2J\x1b[H"), "full render must emit screen clear");
         // Should contain cursor position
         assert!(text.contains("\x1b[1;1H"));
     }
@@ -434,11 +665,12 @@ mod tests {
 
     #[test]
     fn render_line_skips_wide_char_continuation() {
-        let mut row = vec![Cell::default(); 10];
-        row[0] = Cell { c: '你', combining: Vec::new(), style: Style::default(), width: 2 };
-        row[1] = Cell { c: '\0', combining: Vec::new(), style: Style::default(), width: 0 };
+        let mut row = Row::new(10);
+        row[0] = Cell::new('你', StyleId::default(), 2);
+        row[1] = Cell::new('\0', StyleId::default(), 0);
         row[2].c = 'A';
-        let result = render_line(&row);
+        let st = StyleTable::new();
+        let result = render_line(&row, &st);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains('你'));
         assert!(text.contains('A'));
@@ -467,7 +699,7 @@ mod tests {
     #[test]
     fn render_screen_hidden_cursor() {
         let mut grid = Grid::new(10, 3, 0);
-        grid.cursor_visible = false;
+        grid.set_cursor_visible(false);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -482,8 +714,8 @@ mod tests {
         let mut grid = Grid::new(10, 5, 0);
         // Move cursor to a unique position so cursor-position output doesn't
         // collide with row-position sequences we're checking.
-        grid.cursor_x = 3;
-        grid.cursor_y = 4;
+        grid.set_cursor_x_unclamped(3);
+        grid.set_cursor_y_unclamped(4);
         let mut cache = RenderCache::new();
         // First render: all rows are drawn
         let result1 = render_screen(&grid, "", false, &mut cache);
@@ -533,8 +765,8 @@ mod tests {
     #[test]
     fn render_screen_cursor_position() {
         let mut grid = Grid::new(10, 5, 0);
-        grid.cursor_x = 4;
-        grid.cursor_y = 2;
+        grid.set_cursor_x_unclamped(4);
+        grid.set_cursor_y_unclamped(2);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -578,13 +810,14 @@ mod tests {
 
     #[test]
     fn render_line_multiple_style_changes() {
-        let mut row = vec![Cell::default(); 10];
+        let mut st = StyleTable::new();
+        let mut row = Row::new(10);
         row[0].c = 'R';
-        row[0].style.fg = Some(Color::Indexed(1)); // red
+        set_style(&mut row[0], Style { fg: Some(Color::Indexed(1)), ..Style::default() }, &mut st);
         row[1].c = 'G';
-        row[1].style.fg = Some(Color::Indexed(2)); // green
+        set_style(&mut row[1], Style { fg: Some(Color::Indexed(2)), ..Style::default() }, &mut st);
         row[2].c = 'N'; // default style
-        let result = render_line(&row);
+        let result = render_line(&row, &st);
         let text = String::from_utf8_lossy(&result);
         // Should have red, then reset+green, then reset
         assert!(text.contains("R"), "should contain 'R'");
@@ -600,7 +833,7 @@ mod tests {
     #[test]
     fn render_screen_full_mode_emits_mouse_modes() {
         let mut grid = Grid::new(10, 3, 0);
-        grid.modes.mouse_modes.any = true;
+        grid.modes_mut().mouse_modes.any = true;
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -616,14 +849,14 @@ mod tests {
     #[test]
     fn render_screen_mode_delta_mouse_switch() {
         let mut grid = Grid::new(10, 3, 0);
-        grid.modes.mouse_modes.click = true;
+        grid.modes_mut().mouse_modes.click = true;
         let mut cache = RenderCache::new();
         // Initial render (full)
         let _ = render_screen(&grid, "", true, &mut cache);
 
         // Switch: disable click, enable any
-        grid.modes.mouse_modes.click = false;
-        grid.modes.mouse_modes.any = true;
+        grid.modes_mut().mouse_modes.click = false;
+        grid.modes_mut().mouse_modes.any = true;
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
         // Should disable old mode
@@ -641,7 +874,7 @@ mod tests {
         let _ = render_screen(&grid, "", true, &mut cache);
 
         // Enable bracketed paste
-        grid.modes.bracketed_paste = true;
+        grid.modes_mut().bracketed_paste = true;
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("\x1b[?2004h"),
@@ -676,12 +909,14 @@ mod tests {
     #[test]
     fn render_line_styled_spaces_not_blank() {
         // Row of spaces with colored bg should render SGR, not b" "
-        let mut row = vec![Cell::default(); 10];
+        let mut st = StyleTable::new();
+        let mut row = Row::new(10);
+        let red_bg = st.intern(Style { bg: Some(Color::Indexed(1)), ..Style::default() });
         for cell in row.iter_mut() {
             cell.c = ' ';
-            cell.style.bg = Some(Color::Indexed(1)); // red bg
+            cell.style_id = red_bg;
         }
-        let result = render_line(&row);
+        let result = render_line(&row, &st);
         // Should contain SGR for the background color, not just a plain space
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("\x1b["), "styled spaces should produce SGR sequences");
@@ -691,11 +926,12 @@ mod tests {
     #[test]
     fn render_line_styled_trailing_space() {
         // Trailing styled space should be included in output
-        let mut row = vec![Cell::default(); 5];
+        let mut st = StyleTable::new();
+        let mut row = Row::new(5);
         row[0].c = 'A';
         row[4].c = ' ';
-        row[4].style.bg = Some(Color::Indexed(4)); // blue bg
-        let result = render_line(&row);
+        set_style(&mut row[4], Style { bg: Some(Color::Indexed(4)), ..Style::default() }, &mut st);
+        let result = render_line(&row, &st);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("44m"), "trailing styled space should include blue bg SGR");
     }
@@ -703,10 +939,11 @@ mod tests {
     #[test]
     fn render_line_wide_char_at_end() {
         // Wide char at last two positions renders correctly
-        let mut row = vec![Cell::default(); 10];
-        row[8] = Cell { c: '\u{4e16}', combining: Vec::new(), style: Style::default(), width: 2 }; // 世
-        row[9] = Cell { c: '\0', combining: Vec::new(), style: Style::default(), width: 0 }; // continuation
-        let result = render_line(&row);
+        let mut row = Row::new(10);
+        row[8] = Cell::new('\u{4e16}', StyleId::default(), 2); // 世
+        row[9] = Cell::new('\0', StyleId::default(), 0); // continuation
+        let st = StyleTable::new();
+        let result = render_line(&row, &st);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains('\u{4e16}'), "wide char at end should be rendered");
         assert!(!text.contains('\0'), "continuation cell should not produce output");
@@ -714,24 +951,29 @@ mod tests {
 
     #[test]
     fn render_line_rgb_color() {
-        let mut row = vec![Cell::default(); 5];
+        let mut st = StyleTable::new();
+        let mut row = Row::new(5);
         row[0].c = 'X';
-        row[0].style.fg = Some(Color::Rgb(100, 150, 200));
-        let result = render_line(&row);
+        set_style(&mut row[0], Style { fg: Some(Color::Rgb(100, 150, 200)), ..Style::default() }, &mut st);
+        let result = render_line(&row, &st);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("38;2;100;150;200m"), "RGB color should produce 38;2;R;G;B");
     }
 
     #[test]
     fn render_line_combined_attributes() {
-        let mut row = vec![Cell::default(); 5];
+        let mut st = StyleTable::new();
+        let mut row = Row::new(5);
         row[0].c = 'Z';
-        row[0].style.bold = true;
-        row[0].style.italic = true;
-        row[0].style.underline = super::super::style::UnderlineStyle::Single;
-        row[0].style.fg = Some(Color::Indexed(3)); // yellow
-        row[0].style.bg = Some(Color::Indexed(4)); // blue
-        let result = render_line(&row);
+        set_style(&mut row[0], Style {
+            bold: true,
+            italic: true,
+            underline: super::super::style::UnderlineStyle::Single,
+            fg: Some(Color::Indexed(3)),
+            bg: Some(Color::Indexed(4)),
+            ..Style::default()
+        }, &mut st);
+        let result = render_line(&row, &st);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("1;"), "bold should be present");
         assert!(text.contains("3;"), "italic should be present");
@@ -742,10 +984,11 @@ mod tests {
 
     #[test]
     fn render_line_256_color() {
-        let mut row = vec![Cell::default(); 5];
+        let mut st = StyleTable::new();
+        let mut row = Row::new(5);
         row[0].c = 'P';
-        row[0].style.fg = Some(Color::Indexed(200));
-        let result = render_line(&row);
+        set_style(&mut row[0], Style { fg: Some(Color::Indexed(200)), ..Style::default() }, &mut st);
+        let result = render_line(&row, &st);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("38;5;200m"), "palette index 200 should produce 38;5;200");
     }
@@ -775,10 +1018,12 @@ mod tests {
         let grid2 = Grid::new(10, 5, 0);
         let result = render_screen(&grid2, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
-        // Cache had 3 rows, now 5 — row_hashes resized with sentinels, all should redraw
-        assert!(text.contains("\x1b[1;1H"), "row 1 should be redrawn after resize");
-        assert!(text.contains("\x1b[4;1H"), "row 4 should be redrawn after resize");
-        assert!(text.contains("\x1b[5;1H"), "row 5 should be redrawn after resize");
+        // Cache had 3 rows, now 5 — row_hashes resized with sentinels for new rows.
+        // Rows 1-3 are still blank (same hash), so dirty tracking skips them.
+        // Rows 4-5 have sentinel u64::MAX so they get redrawn.
+        assert!(!text.contains("\x1b[1;1H"), "unchanged row 1 should be skipped after resize");
+        assert!(text.contains("\x1b[4;1H"), "new row 4 should be redrawn after resize");
+        assert!(text.contains("\x1b[5;1H"), "new row 5 should be redrawn after resize");
     }
 
     #[test]
@@ -789,7 +1034,8 @@ mod tests {
         let _ = render_screen(&grid, "", false, &mut cache);
 
         // Change style of a cell without changing the char
-        grid.visible_row_mut(1)[0].style.fg = Some(Color::Indexed(1));
+        let sid = grid.style_table_mut().intern(Style { fg: Some(Color::Indexed(1)), ..Style::default() });
+        grid.visible_row_mut(1)[0].style_id = sid;
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("\x1b[2;1H"),
@@ -809,8 +1055,8 @@ mod tests {
     #[test]
     fn render_screen_cursor_bottom_right() {
         let mut grid = Grid::new(80, 24, 0);
-        grid.cursor_x = 79;
-        grid.cursor_y = 23;
+        grid.set_cursor_x_unclamped(79);
+        grid.set_cursor_y_unclamped(23);
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -821,7 +1067,7 @@ mod tests {
     #[test]
     fn render_screen_mouse_encoding_1006() {
         let mut grid = Grid::new(10, 3, 0);
-        grid.modes.mouse_encoding = MouseEncoding::Sgr;
+        grid.modes_mut().mouse_encoding = MouseEncoding::Sgr;
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -831,7 +1077,7 @@ mod tests {
     #[test]
     fn render_screen_mouse_encoding_1005() {
         let mut grid = Grid::new(10, 3, 0);
-        grid.modes.mouse_encoding = MouseEncoding::Utf8;
+        grid.modes_mut().mouse_encoding = MouseEncoding::Utf8;
         let mut cache = RenderCache::new();
         let result = render_screen(&grid, "", true, &mut cache);
         let text = String::from_utf8_lossy(&result);
@@ -845,7 +1091,7 @@ mod tests {
         let _ = render_screen(&grid, "", true, &mut cache);
 
         // Change cursor shape to blinking bar (5)
-        grid.modes.cursor_shape = CursorShape::BlinkBar;
+        grid.modes_mut().cursor_shape = CursorShape::BlinkBar;
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("\x1b[5 q"), "cursor shape change should emit DECSCUSR");
@@ -858,13 +1104,13 @@ mod tests {
         let _ = render_screen(&grid, "", true, &mut cache);
 
         // Enable keypad app mode
-        grid.modes.keypad_app_mode = true;
+        grid.modes_mut().keypad_app_mode = true;
         let result = render_screen(&grid, "", false, &mut cache);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("\x1b="), "keypad app mode should emit ESC =");
 
         // Disable keypad app mode
-        grid.modes.keypad_app_mode = false;
+        grid.modes_mut().keypad_app_mode = false;
         let result2 = render_screen(&grid, "", false, &mut cache);
         let text2 = String::from_utf8_lossy(&result2);
         assert!(text2.contains("\x1b>"), "keypad normal mode should emit ESC >");
@@ -872,20 +1118,23 @@ mod tests {
 
     #[test]
     fn render_line_combining_mark() {
-        let mut row = vec![Cell::default(); 10];
+        let mut row = Row::new(10);
         row[0].c = 'e';
-        row[0].combining = vec!['\u{0301}']; // combining acute accent → é
-        let result = render_line(&row);
+        row.push_combining(0, '\u{0301}'); // combining acute accent → é
+        let st = StyleTable::new();
+        let result = render_line(&row, &st);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("e\u{0301}"), "combining mark should be rendered after base char");
     }
 
     #[test]
     fn render_line_combining_on_wide_char() {
-        let mut row = vec![Cell::default(); 10];
-        row[0] = Cell { c: '\u{4e16}', combining: vec!['\u{0308}'], style: Style::default(), width: 2 };
-        row[1] = Cell { c: '\0', combining: Vec::new(), style: Style::default(), width: 0 };
-        let result = render_line(&row);
+        let mut row = Row::new(10);
+        row[0] = Cell::new('\u{4e16}', StyleId::default(), 2);
+        row.push_combining(0, '\u{0308}');
+        row[1] = Cell::new('\0', StyleId::default(), 0);
+        let st = StyleTable::new();
+        let result = render_line(&row, &st);
         let text = String::from_utf8_lossy(&result);
         assert!(text.contains("\u{4e16}\u{0308}"), "combining mark on wide char should render");
     }
@@ -1094,5 +1343,489 @@ mod tests {
         let bell_count = result.iter().filter(|&&b| b == 0x07).count();
         assert_eq!(bell_count, 0,
             "cached title should produce zero BEL bytes, got {}", bell_count);
+    }
+
+    // --- AnsiRenderer trait-path dirty tracking tests ---
+
+    #[test]
+    fn trait_render_incremental_skips_unchanged_rows() {
+        use super::super::Screen;
+        use super::super::traits::{TerminalEmulator, TerminalRenderer};
+
+        let mut screen = Screen::new(10, 5, 0);
+        // Write text on row 0
+        screen.process(b"Hello");
+        // Move cursor to row 3 col 3 so CUP doesn't collide with row positions
+        screen.process(b"\x1b[4;4H");
+
+        let mut renderer = AnsiRenderer::new();
+        // First render — all rows drawn
+        let result1 = renderer.render(&screen, false);
+        let text1 = String::from_utf8_lossy(&result1);
+        assert!(text1.contains("\x1b[1;1H"), "first render should draw row 1");
+        assert!(text1.contains("\x1b[2;1H"), "first render should draw row 2");
+        assert!(text1.contains("\x1b[3;1H"), "first render should draw row 3");
+
+        // Second render without changes — content rows should be skipped
+        let result2 = renderer.render(&screen, false);
+        let text2 = String::from_utf8_lossy(&result2);
+        assert!(!text2.contains("\x1b[1;1H"),
+            "unchanged row 1 should be skipped in trait incremental render");
+        assert!(!text2.contains("\x1b[2;1H"),
+            "unchanged row 2 should be skipped in trait incremental render");
+    }
+
+    #[test]
+    fn trait_render_incremental_redraws_changed_row() {
+        use super::super::Screen;
+        use super::super::traits::{TerminalEmulator, TerminalRenderer};
+
+        let mut screen = Screen::new(10, 5, 0);
+        screen.process(b"Hello");
+        screen.process(b"\x1b[4;4H");
+
+        let mut renderer = AnsiRenderer::new();
+        // First render to populate cache
+        let _ = renderer.render(&screen, false);
+
+        // Change row 0 by overwriting
+        screen.process(b"\x1b[1;1HWorld");
+        screen.process(b"\x1b[4;4H");
+
+        let result = renderer.render(&screen, false);
+        let text = String::from_utf8_lossy(&result);
+        // Row 1 changed — should be redrawn
+        assert!(text.contains("\x1b[1;1H"),
+            "changed row should be redrawn via trait path");
+        // Row 3 unchanged — should be skipped
+        assert!(!text.contains("\x1b[3;1H"),
+            "unchanged row 3 should be skipped via trait path");
+    }
+
+    #[test]
+    fn trait_render_full_redraws_all_rows() {
+        use super::super::Screen;
+        use super::super::traits::{TerminalEmulator, TerminalRenderer};
+
+        let mut screen = Screen::new(10, 3, 0);
+        screen.process(b"Hi");
+
+        let mut renderer = AnsiRenderer::new();
+        // Populate cache
+        let _ = renderer.render(&screen, false);
+
+        // Full render should redraw everything regardless of cache
+        let result = renderer.render(&screen, true);
+        let text = String::from_utf8_lossy(&result);
+        assert!(text.contains("\x1b[1;1H"), "full render should draw row 1");
+        assert!(text.contains("\x1b[2;1H"), "full render should draw row 2");
+        assert!(text.contains("\x1b[3;1H"), "full render should draw row 3");
+    }
+
+    // ====================================================================
+    // Rendering optimality tests
+    //
+    // These tests verify that the renderer avoids unnecessary work:
+    // redundant escape sequences, no-op renders, and re-rendering of
+    // unchanged state. They catch regressions that waste bandwidth
+    // or cause visual artifacts (flicker).
+    // ====================================================================
+
+    /// Helper: count occurrences of a byte pattern in a byte slice.
+    fn count_pattern(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
+    // --- No-op render detection ---
+
+    #[test]
+    fn noop_render_returns_empty() {
+        let grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        // First render populates the cache
+        let _ = render_screen(&grid, "", false, &mut cache);
+        // Second render with nothing changed: must return empty
+        let result = render_screen(&grid, "", false, &mut cache);
+        assert!(result.is_empty(),
+            "no-op render should return empty, got {} bytes: {:?}",
+            result.len(), String::from_utf8_lossy(&result));
+    }
+
+    #[test]
+    fn noop_render_trait_returns_empty() {
+        use super::super::Screen;
+        use super::super::traits::{TerminalEmulator, TerminalRenderer};
+
+        let mut screen = Screen::new(10, 3, 0);
+        screen.process(b"Test");
+        screen.process(b"\x1b[2;3H");
+
+        let mut renderer = AnsiRenderer::new();
+        let _ = renderer.render(&screen, false);
+        // Second render — nothing changed
+        let result = renderer.render(&screen, false);
+        assert!(result.is_empty(),
+            "trait path no-op render should return empty, got {} bytes",
+            result.len());
+    }
+
+    #[test]
+    fn noop_render_after_cursor_only_change() {
+        let mut grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "", false, &mut cache);
+        // Move cursor — this should produce output (CUP)
+        grid.set_cursor_x_unclamped(5);
+        let result = render_screen(&grid, "", false, &mut cache);
+        assert!(!result.is_empty(), "cursor move should produce output");
+        // Render again without change — should be no-op
+        let result2 = render_screen(&grid, "", false, &mut cache);
+        assert!(result2.is_empty(),
+            "second render after cursor-only change should be no-op");
+    }
+
+    // --- Cursor position caching ---
+
+    #[test]
+    fn cursor_position_cached_across_renders() {
+        let mut grid = Grid::new(10, 5, 0);
+        grid.set_cursor_x_unclamped(3);
+        grid.set_cursor_y_unclamped(2);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "", false, &mut cache);
+        // Same cursor position — CUP should not be re-emitted
+        let result = render_screen(&grid, "", false, &mut cache);
+        assert!(result.is_empty(),
+            "same cursor position should not produce output");
+        // Change cursor position — CUP should be emitted
+        grid.set_cursor_x_unclamped(7);
+        let result = render_screen(&grid, "", false, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+        assert!(text.contains("\x1b[3;8H"),
+            "new cursor position should emit CUP, got: {:?}", text);
+    }
+
+    #[test]
+    fn cursor_position_always_emitted_on_full() {
+        let mut grid = Grid::new(10, 3, 0);
+        grid.set_cursor_x_unclamped(2);
+        grid.set_cursor_y_unclamped(1);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "", false, &mut cache);
+        // Full render with same cursor — CUP must still be emitted
+        let result = render_screen(&grid, "", true, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+        assert!(text.contains("\x1b[2;3H"),
+            "full render must always emit CUP even if cached");
+    }
+
+    // --- Cursor visibility caching ---
+
+    #[test]
+    fn cursor_visibility_cached() {
+        let grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        // First render — cursor visible, emitted
+        let result = render_screen(&grid, "", false, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+        assert!(text.contains("\x1b[?25h"),
+            "first render should emit cursor show");
+        // Second render — same visibility, should be no-op
+        let result2 = render_screen(&grid, "", false, &mut cache);
+        assert!(!String::from_utf8_lossy(&result2).contains("\x1b[?25h"),
+            "cached cursor visibility should not be re-emitted");
+    }
+
+    #[test]
+    fn cursor_visibility_change_detected() {
+        let mut grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "", false, &mut cache);
+        // Hide cursor
+        grid.set_cursor_visible(false);
+        let result = render_screen(&grid, "", false, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+        assert!(text.contains("\x1b[?25l"),
+            "cursor hide should be emitted when visibility changes");
+        // Render again — same state, should not re-emit
+        let result2 = render_screen(&grid, "", false, &mut cache);
+        assert!(result2.is_empty(),
+            "same cursor visibility should produce no-op render");
+    }
+
+    // --- Scroll region caching ---
+
+    #[test]
+    fn scroll_region_cached() {
+        let grid = Grid::new(10, 5, 0);
+        let mut cache = RenderCache::new();
+        let result1 = render_screen(&grid, "", false, &mut cache);
+        let text1 = String::from_utf8_lossy(&result1);
+        assert!(text1.contains("r"), "first render should emit DECSTBM");
+        // Second render — same scroll region
+        let result2 = render_screen(&grid, "", false, &mut cache);
+        assert!(result2.is_empty(),
+            "same scroll region should produce no-op render");
+    }
+
+    #[test]
+    fn scroll_region_change_emitted() {
+        let mut grid = Grid::new(10, 10, 0);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "", false, &mut cache);
+        // Change scroll region to rows 2-8 (0-indexed: 1-7)
+        grid.set_scroll_region(1, 7);
+        let result = render_screen(&grid, "", false, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+        assert!(text.contains("\x1b[2;8r"),
+            "changed scroll region should emit DECSTBM");
+    }
+
+    // --- Mode delta encoding ---
+
+    #[test]
+    fn modes_delta_skips_unchanged() {
+        let mut grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        // First render establishes baseline modes
+        let _ = render_screen(&grid, "", false, &mut cache);
+        // Change only bracketed paste
+        grid.modes_mut().bracketed_paste = true;
+        let result = render_screen(&grid, "", false, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+        // Should have bracketed paste enable
+        assert!(text.contains("\x1b[?2004h"),
+            "changed mode should be emitted");
+        // Should NOT re-emit unchanged modes like cursor shape, autowrap, etc.
+        assert!(!text.contains(" q"),
+            "unchanged cursor shape should not be re-emitted in delta");
+        assert!(!text.contains("\x1b[?7"),
+            "unchanged autowrap should not be re-emitted in delta");
+    }
+
+    #[test]
+    fn modes_full_always_emitted() {
+        let grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "", false, &mut cache);
+        // Full render with no mode changes — all modes must still be emitted
+        let result = render_screen(&grid, "", true, &mut cache);
+        let text = String::from_utf8_lossy(&result);
+        assert!(text.contains(" q"), "full render must emit cursor shape");
+        assert!(text.contains("\x1b[?7"), "full render must emit autowrap");
+    }
+
+    // --- Title caching ---
+
+    #[test]
+    fn title_not_reemitted_when_unchanged() {
+        let grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "MyApp", false, &mut cache);
+        // Same title — should not be in output
+        let result = render_screen(&grid, "MyApp", false, &mut cache);
+        assert_eq!(count_pattern(&result, b"\x1b]2;"), 0,
+            "unchanged title should not produce OSC");
+    }
+
+    #[test]
+    fn title_emitted_when_changed() {
+        let grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "OldTitle", false, &mut cache);
+        let result = render_screen(&grid, "NewTitle", false, &mut cache);
+        assert_eq!(count_pattern(&result, b"\x1b]2;"), 1,
+            "changed title should emit exactly one OSC");
+        assert!(result.windows(8).any(|w| w == b"NewTitle"),
+            "new title should be in output");
+    }
+
+    // --- Incremental render byte efficiency ---
+
+    #[test]
+    fn incremental_render_smaller_than_full() {
+        let mut grid = Grid::new(80, 24, 0);
+        // Fill several rows with text
+        for i in 0..24 {
+            grid.visible_row_mut(i)[0].c = 'A';
+        }
+        let mut cache = RenderCache::new();
+        // Full render
+        let full = render_screen(&grid, "Title", true, &mut cache);
+        // Change only one row
+        grid.visible_row_mut(5)[1].c = 'B';
+        let incr = render_screen(&grid, "Title", false, &mut cache);
+        assert!(incr.len() < full.len(),
+            "incremental single-row change ({} bytes) should be smaller than full ({} bytes)",
+            incr.len(), full.len());
+    }
+
+    #[test]
+    fn incremental_no_screen_clear() {
+        let grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "", false, &mut cache);
+        // Change one cell
+        let mut grid2 = grid;
+        grid2.visible_row_mut(0)[0].c = 'X';
+        let result = render_screen(&grid2, "", false, &mut cache);
+        assert_eq!(count_pattern(&result, b"\x1b[2J"), 0,
+            "incremental render must never emit screen clear");
+    }
+
+    // --- Sync block structure ---
+
+    #[test]
+    fn noop_render_no_sync_block() {
+        let grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "", false, &mut cache);
+        let result = render_screen(&grid, "", false, &mut cache);
+        // No-op should not even start a sync block
+        assert_eq!(count_pattern(&result, b"\x1b[?2026h"), 0,
+            "no-op render should not emit sync begin");
+        assert_eq!(count_pattern(&result, b"\x1b[?2026l"), 0,
+            "no-op render should not emit sync end");
+    }
+
+    #[test]
+    fn non_noop_render_has_sync_block() {
+        let mut grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "", false, &mut cache);
+        grid.visible_row_mut(0)[0].c = 'X';
+        let result = render_screen(&grid, "", false, &mut cache);
+        assert_eq!(count_pattern(&result, b"\x1b[?2026h"), 1,
+            "non-noop render must have exactly one sync begin");
+        assert_eq!(count_pattern(&result, b"\x1b[?2026l"), 1,
+            "non-noop render must have exactly one sync end");
+    }
+
+    // --- Full redraw does NOT emit per-row EL ---
+
+    #[test]
+    fn full_render_no_erase_line() {
+        let mut grid = Grid::new(10, 3, 0);
+        grid.visible_row_mut(0)[0].c = 'A';
+        let mut cache = RenderCache::new();
+        let result = render_screen(&grid, "", true, &mut cache);
+        // Full render clears screen with \x1b[2J so per-row \x1b[K is redundant
+        assert_eq!(count_pattern(&result, b"\x1b[K"), 0,
+            "full render should not emit per-row erase (screen already cleared)");
+    }
+
+    #[test]
+    fn incremental_render_uses_erase_line() {
+        let mut grid = Grid::new(10, 3, 0);
+        let mut cache = RenderCache::new();
+        let _ = render_screen(&grid, "", false, &mut cache);
+        grid.visible_row_mut(0)[0].c = 'A';
+        let result = render_screen(&grid, "", false, &mut cache);
+        assert!(count_pattern(&result, b"\x1b[K") >= 1,
+            "incremental render should use erase-to-EOL for changed rows");
+    }
+
+    // --- Trait path optimality parity ---
+
+    #[test]
+    fn trait_noop_render_no_sync_block() {
+        use super::super::Screen;
+        use super::super::traits::{TerminalEmulator, TerminalRenderer};
+
+        let mut screen = Screen::new(10, 3, 0);
+        screen.process(b"Hi");
+
+        let mut renderer = AnsiRenderer::new();
+        let _ = renderer.render(&screen, false);
+        let result = renderer.render(&screen, false);
+        assert!(result.is_empty(), "trait no-op should be empty");
+        assert_eq!(count_pattern(&result, b"\x1b[?2026h"), 0,
+            "trait no-op should not emit sync begin");
+    }
+
+    #[test]
+    fn trait_cursor_position_cached() {
+        use super::super::Screen;
+        use super::super::traits::{TerminalEmulator, TerminalRenderer};
+
+        let mut screen = Screen::new(10, 5, 0);
+        screen.process(b"\x1b[3;4H"); // cursor at row 3, col 4
+
+        let mut renderer = AnsiRenderer::new();
+        let result1 = renderer.render(&screen, false);
+        let text1 = String::from_utf8_lossy(&result1);
+        assert!(text1.contains("\x1b[3;4H"), "first render should emit CUP");
+
+        // Same position — no CUP
+        let result2 = renderer.render(&screen, false);
+        assert!(result2.is_empty(),
+            "trait path: same cursor position should produce no-op");
+
+        // Move cursor — CUP emitted
+        screen.process(b"\x1b[1;1H");
+        let result3 = renderer.render(&screen, false);
+        let text3 = String::from_utf8_lossy(&result3);
+        assert!(text3.contains("\x1b[1;1H"),
+            "trait path: new cursor position should emit CUP");
+    }
+
+    #[test]
+    fn trait_mode_delta_only_changed() {
+        use super::super::Screen;
+        use super::super::traits::{TerminalEmulator, TerminalRenderer};
+
+        let mut screen = Screen::new(10, 3, 0);
+        let mut renderer = AnsiRenderer::new();
+        let _ = renderer.render(&screen, false);
+
+        // Enable bracketed paste
+        screen.process(b"\x1b[?2004h");
+        let result = renderer.render(&screen, false);
+        let text = String::from_utf8_lossy(&result);
+        assert!(text.contains("\x1b[?2004h"), "changed mode should be emitted");
+        // Should not re-emit all modes
+        assert!(!text.contains(" q"), "unchanged cursor shape should be skipped");
+    }
+
+    #[test]
+    fn trait_title_cached() {
+        use super::super::Screen;
+        use super::super::traits::{TerminalEmulator, TerminalRenderer};
+
+        let mut screen = Screen::new(10, 3, 0);
+        screen.process(b"\x1b]2;AppTitle\x07");
+
+        let mut renderer = AnsiRenderer::new();
+        let result1 = renderer.render(&screen, false);
+        assert!(count_pattern(&result1, b"\x1b]2;") == 1, "first render emits title");
+
+        let result2 = renderer.render(&screen, false);
+        assert!(result2.is_empty(), "same title should produce no-op");
+
+        // Change title
+        screen.process(b"\x1b]2;NewTitle\x07");
+        let result3 = renderer.render(&screen, false);
+        assert!(count_pattern(&result3, b"\x1b]2;") == 1, "changed title emitted");
+    }
+
+    #[test]
+    fn trait_incremental_smaller_than_full() {
+        use super::super::Screen;
+        use super::super::traits::{TerminalEmulator, TerminalRenderer};
+
+        let mut screen = Screen::new(80, 24, 0);
+        for i in 0..24u8 {
+            screen.process(format!("\x1b[{};1H{}", i + 1, (b'A' + i) as char).as_bytes());
+        }
+
+        let mut renderer = AnsiRenderer::new();
+        let full = renderer.render(&screen, true);
+
+        // Change one row
+        screen.process(b"\x1b[5;1HCHANGED");
+        let incr = renderer.render(&screen, false);
+        assert!(incr.len() < full.len(),
+            "trait incremental ({} bytes) should be smaller than full ({} bytes)",
+            incr.len(), full.len());
     }
 }

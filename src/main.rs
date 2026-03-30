@@ -7,7 +7,6 @@ mod cli;
 mod client;
 mod protocol;
 mod pty;
-mod screen;
 mod server;
 mod session;
 

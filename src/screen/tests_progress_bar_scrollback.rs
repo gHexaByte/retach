@@ -13,41 +13,10 @@
 //! - ED (erase display) patterns vs CUU + EL patterns
 
 use super::*;
+use super::test_helpers::*;
 use render::RenderCache;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-
-/// Strip ANSI escape sequences, returning only printable text.
-fn strip_ansi(bytes: &[u8]) -> String {
-    let s = String::from_utf8_lossy(bytes);
-    let mut out = String::new();
-    let mut in_esc = false;
-    for ch in s.chars() {
-        if in_esc {
-            if ch.is_ascii_alphabetic() || ch == 'm' {
-                in_esc = false;
-            }
-            continue;
-        }
-        if ch == '\x1b' {
-            in_esc = true;
-            continue;
-        }
-        if ch >= ' ' {
-            out.push(ch);
-        }
-    }
-    out.trim_end().to_string()
-}
-
-/// Collect scrollback history as trimmed strings.
-fn history_texts(screen: &Screen) -> Vec<String> {
-    screen
-        .get_history()
-        .iter()
-        .map(|b| strip_ansi(b))
-        .collect()
-}
 
 /// Collect pending scrollback as trimmed strings.
 fn pending_texts(pending: &[Vec<u8>]) -> Vec<String> {
@@ -283,7 +252,7 @@ fn cuu_cannot_reach_scrollback() {
 
     // Cursor is at row 2 (bottom). CUU 100 — should stop at row 0.
     screen.process(b"\x1b[100A");
-    assert_eq!(screen.grid.cursor_y, 0, "CUU should stop at row 0");
+    assert_eq!(screen.grid.cursor_y(), 0, "CUU should stop at row 0");
 
     // Erase entire line at row 0 — this erases "VIS1" on screen, NOT scrollback
     // Use EL 2 (erase entire line) since CUU doesn't reset cursor_x

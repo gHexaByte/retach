@@ -34,9 +34,9 @@ fn collect_full_history(screen: &Screen) -> Vec<String> {
 fn resize_clears_wrap_pending() {
     let mut screen = Screen::new(5, 3, 100);
     screen.process(b"ABCDE"); // fill line, triggers wrap_pending
-    assert!(screen.grid.wrap_pending);
+    assert!(screen.grid.wrap_pending());
     screen.resize(10, 3);
-    assert!(!screen.grid.wrap_pending,
+    assert!(!screen.grid.wrap_pending(),
         "wrap_pending should be cleared on resize");
 }
 
@@ -179,7 +179,7 @@ fn resize_preserves_styled_content() {
     screen.resize(20, 5); // expand
     // Verify styled cells survived
     assert_cell(&screen, 0, 0, 'S');
-    assert!(screen.grid.visible_row(0)[0].style.bold, "bold should survive resize");
+    assert!(screen.cell_style(0, 0).bold, "bold should survive resize");
     let rendered = reattach_render(&screen);
     assert!(rendered.contains("STYLED"),
         "styled text should survive resize and render");
@@ -308,12 +308,12 @@ fn resize_pending_scrollback_independent_of_horizontal_resize() {
         screen.process(format!("L{}\r\n", i).as_bytes());
     }
     // Don't drain pending — horizontal-only resize should not affect it
-    let pending_before = screen.grid.scrollback_len - screen.grid.pending_start;
+    let pending_before = screen.grid.scrollback_len() - screen.grid.pending_start();
     assert!(pending_before > 0, "pending scrollback should exist");
 
     screen.resize(20, 3); // same rows, different cols
 
-    let pending_after = screen.grid.scrollback_len - screen.grid.pending_start;
+    let pending_after = screen.grid.scrollback_len() - screen.grid.pending_start();
     assert_eq!(pending_before, pending_after,
         "pending scrollback count should survive horizontal-only resize");
 }
@@ -324,16 +324,16 @@ fn resize_vertical_grow_restores_scrollback_from_pending() {
     for i in 1..=5 {
         screen.process(format!("L{}\r\n", i).as_bytes());
     }
-    let sb_before = screen.grid.scrollback_len;
+    let sb_before = screen.grid.scrollback_len();
     assert!(sb_before > 0, "scrollback should exist");
 
     // Growing vertically restores scrollback rows into visible area
     screen.resize(15, 5);
 
-    let restored = sb_before - screen.grid.scrollback_len;
+    let restored = sb_before - screen.grid.scrollback_len();
     assert!(restored > 0, "some scrollback should have been restored");
     // pending_start clamped to scrollback_len
-    assert!(screen.grid.pending_start <= screen.grid.scrollback_len);
+    assert!(screen.grid.pending_start() <= screen.grid.scrollback_len());
 }
 
 #[test]
@@ -781,16 +781,16 @@ fn resize_preserves_combining_marks() {
     // 'e' followed by combining acute accent U+0301
     screen.process("e\u{0301}".as_bytes());
     assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
-    assert_eq!(screen.grid.visible_row(0)[0].combining, vec!['\u{0301}']);
+    assert_eq!(screen.grid.visible_row(0).combining(0), &['\u{0301}']);
 
     screen.resize(20, 5);
     assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
-    assert_eq!(screen.grid.visible_row(0)[0].combining, vec!['\u{0301}'],
+    assert_eq!(screen.grid.visible_row(0).combining(0), &['\u{0301}'],
         "combining marks should survive resize expand");
 
     screen.resize(5, 2);
     assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
-    assert_eq!(screen.grid.visible_row(0)[0].combining, vec!['\u{0301}'],
+    assert_eq!(screen.grid.visible_row(0).combining(0), &['\u{0301}'],
         "combining marks should survive resize shrink");
 }
 
@@ -801,12 +801,12 @@ fn resize_wide_char_with_combining_survives() {
     screen.process("你\u{0308}".as_bytes()); // 你 + diaeresis
     assert_eq!(screen.grid.visible_row(0)[0].c, '你');
     assert_eq!(screen.grid.visible_row(0)[0].width, 2);
-    assert!(screen.grid.visible_row(0)[0].combining.contains(&'\u{0308}'));
+    assert!(screen.grid.visible_row(0).combining(0).contains(&'\u{0308}'));
 
     screen.resize(15, 3); // expand — should survive
     assert_eq!(screen.grid.visible_row(0)[0].c, '你');
     assert_eq!(screen.grid.visible_row(0)[0].width, 2);
-    assert!(screen.grid.visible_row(0)[0].combining.contains(&'\u{0308}'),
+    assert!(screen.grid.visible_row(0).combining(0).contains(&'\u{0308}'),
         "combining mark on wide char should survive resize");
 }
 
@@ -833,8 +833,8 @@ fn resize_with_scroll_region_preserves_region_content() {
     for (i, ch) in "R5".chars().enumerate() { assert_cell(&screen, 4, i, ch); }
     for (i, ch) in "R6".chars().enumerate() { assert_cell(&screen, 5, i, ch); }
     // Scroll region should be reset to full screen
-    assert_eq!(screen.grid.scroll_top, 0);
-    assert_eq!(screen.grid.scroll_bottom, 5);
+    assert_eq!(screen.grid.scroll_top(), 0);
+    assert_eq!(screen.grid.scroll_bottom(), 5);
 }
 
 #[test]
@@ -859,8 +859,8 @@ fn resize_after_scroll_within_region() {
     // Outside-region row 1 should survive
     for (i, ch) in "OutR1".chars().enumerate() { assert_cell(&screen, 0, i, ch); }
     // Scroll region should be reset
-    assert_eq!(screen.grid.scroll_top, 0);
-    assert_eq!(screen.grid.scroll_bottom, 3);
+    assert_eq!(screen.grid.scroll_top(), 0);
+    assert_eq!(screen.grid.scroll_bottom(), 3);
 }
 
 // ---------------------------------------------------------------
@@ -873,8 +873,8 @@ fn resize_between_decsc_decrc_clamps_cursor() {
     // Save cursor at (79, 23) — bottom-right corner
     screen.process(b"\x1b[24;80H"); // 1-indexed
     screen.process(b"\x1b7");        // DECSC
-    assert_eq!(screen.grid.cursor_x, 79);
-    assert_eq!(screen.grid.cursor_y, 23);
+    assert_eq!(screen.grid.cursor_x(), 79);
+    assert_eq!(screen.grid.cursor_y(), 23);
 
     // Move cursor elsewhere
     screen.process(b"\x1b[1;1H");
@@ -884,9 +884,9 @@ fn resize_between_decsc_decrc_clamps_cursor() {
 
     // Restore cursor — should clamp to (39, 11)
     screen.process(b"\x1b8"); // DECRC
-    assert_eq!(screen.grid.cursor_x, 39,
+    assert_eq!(screen.grid.cursor_x(), 39,
         "restored cursor_x should clamp to cols-1 after resize");
-    assert_eq!(screen.grid.cursor_y, 11,
+    assert_eq!(screen.grid.cursor_y(), 11,
         "restored cursor_y should clamp to rows-1 after resize");
 }
 
@@ -900,9 +900,9 @@ fn resize_between_csi_s_u_clamps_cursor() {
     screen.resize(30, 10);
 
     screen.process(b"\x1b[u");       // CSI u — restore
-    assert_eq!(screen.grid.cursor_x, 29,
+    assert_eq!(screen.grid.cursor_x(), 29,
         "CSI u cursor_x should clamp to cols-1 after resize");
-    assert_eq!(screen.grid.cursor_y, 9,
+    assert_eq!(screen.grid.cursor_y(), 9,
         "CSI u cursor_y should clamp to rows-1 after resize");
 }
 
@@ -916,9 +916,9 @@ fn resize_expand_between_save_restore_preserves_cursor() {
     screen.resize(80, 24); // expand
 
     screen.process(b"\x1b8"); // restore
-    assert_eq!(screen.grid.cursor_x, 9,
+    assert_eq!(screen.grid.cursor_x(), 9,
         "cursor_x within bounds should not change after expand");
-    assert_eq!(screen.grid.cursor_y, 4,
+    assert_eq!(screen.grid.cursor_y(), 4,
         "cursor_y within bounds should not change after expand");
 }
 
@@ -934,7 +934,7 @@ fn resize_saved_cursor_style_preserved() {
     screen.resize(10, 3); // shrink
 
     screen.process(b"\x1b8"); // restore
-    assert!(screen.state.current_style.bold,
+    assert!(screen.current_style().bold,
         "restored style should be bold after resize");
 }
 
@@ -951,7 +951,7 @@ fn resize_in_alt_screen_then_exit_restores_main_resized() {
 
     // Enter alt screen
     screen.process(b"\x1b[?1049h");
-    assert!(screen.state.in_alt_screen);
+    assert!(screen.in_alt_screen());
     screen.process(b"AltText");
 
     // Resize while in alt screen (saved_grid is 20x5, grid becomes 10x3)
@@ -959,7 +959,7 @@ fn resize_in_alt_screen_then_exit_restores_main_resized() {
 
     // Exit alt screen — saved_grid (20x5) must be adjusted to (10x3)
     screen.process(b"\x1b[?1049l");
-    assert!(!screen.state.in_alt_screen);
+    assert!(!screen.in_alt_screen());
 
     // Grid dimensions should match resize
     assert_eq!(screen.grid.visible_row_count(), 3);
@@ -1019,13 +1019,13 @@ fn resize_current_style_persists_for_new_content() {
     // Set bold red
     screen.process(b"\x1b[1;31m");
     screen.process(b"AB"); // write styled text
-    assert!(screen.grid.visible_row(0)[0].style.bold);
+    assert!(screen.cell_style(0, 0).bold);
 
     screen.resize(20, 5);
 
     // Write more text — should inherit the pre-resize style
     screen.process(b"CD");
-    assert!(screen.grid.visible_row(0)[2].style.bold,
+    assert!(screen.cell_style(0, 2).bold,
         "new text after resize should inherit bold from pre-resize style");
     assert_eq!(screen.grid.visible_row(0)[2].c, 'C');
 }
@@ -1037,16 +1037,16 @@ fn resize_does_not_reset_sgr_state() {
     screen.process(b"\x1b[1;3;4;32m");
     screen.process(b"X");
 
-    let style_before = screen.state.current_style;
+    let style_before = screen.current_style();
 
     screen.resize(10, 3);
 
-    assert_eq!(screen.state.current_style, style_before,
+    assert_eq!(screen.current_style(), style_before,
         "current_style should not change on resize");
 
     // Write after resize — same style
     screen.process(b"Y");
-    assert_eq!(screen.grid.visible_row(0)[1].style, style_before,
+    assert_eq!(screen.cell_style(0, 1), style_before,
         "text written after resize should have identical style");
 }
 
@@ -1071,9 +1071,9 @@ fn resize_tab_content_preserved_but_stops_reset() {
     assert_cell(&screen, 0, 16, 'C');
 
     // But tab stops are default for new width
-    assert_eq!(screen.grid.tab_stops.len(), 20);
-    assert!(screen.grid.tab_stops[8]);
-    assert!(screen.grid.tab_stops[16]);
+    assert_eq!(screen.grid.tab_stops_len(), 20);
+    assert!(screen.grid.tab_stop_at(8));
+    assert!(screen.grid.tab_stop_at(16));
 }
 
 #[test]
@@ -1091,7 +1091,7 @@ fn resize_custom_tab_stop_lost() {
     // Content stays, but custom tab stop is gone
     assert_cell(&screen, 0, 5, 'Y');
     // Tab at col 5 should NOT be set (only defaults at 8, 16, 24)
-    assert!(!screen.grid.tab_stops[5],
+    assert!(!screen.grid.tab_stop_at(5),
         "custom tab stop at col 5 should be gone after resize");
 }
 
@@ -1104,28 +1104,28 @@ fn resize_cursor_at_top_left_stays() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[1;1H"); // top-left
     screen.resize(40, 12);
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
 }
 
 #[test]
 fn resize_cursor_at_top_right_clamps() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[1;80H"); // top-right
-    assert_eq!(screen.grid.cursor_x, 79);
+    assert_eq!(screen.grid.cursor_x(), 79);
     screen.resize(40, 12);
-    assert_eq!(screen.grid.cursor_x, 39);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_x(), 39);
+    assert_eq!(screen.grid.cursor_y(), 0);
 }
 
 #[test]
 fn resize_cursor_at_bottom_left_clamps() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[24;1H"); // bottom-left
-    assert_eq!(screen.grid.cursor_y, 23);
+    assert_eq!(screen.grid.cursor_y(), 23);
     screen.resize(40, 12);
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 11);
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 11);
 }
 
 #[test]
@@ -1133,8 +1133,8 @@ fn resize_cursor_at_bottom_right_clamps() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[24;80H"); // bottom-right
     screen.resize(40, 12);
-    assert_eq!(screen.grid.cursor_x, 39);
-    assert_eq!(screen.grid.cursor_y, 11);
+    assert_eq!(screen.grid.cursor_x(), 39);
+    assert_eq!(screen.grid.cursor_y(), 11);
 }
 
 #[test]
@@ -1142,8 +1142,8 @@ fn resize_extreme_shrink_cursor_to_origin() {
     let mut screen = Screen::new(100, 50, 100);
     screen.process(b"\x1b[50;100H"); // very far corner
     screen.resize(1, 1);
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
 }
 
 // ---------------------------------------------------------------
@@ -1216,8 +1216,8 @@ fn resize_mid_csi_sequence_completes_after() {
     // Complete the sequence: "5;3H" = move cursor to row 5, col 3
     // But after resize, rows=3, so row 5 would be clamped
     screen.process(b"3;5H");
-    assert_eq!(screen.grid.cursor_y, 2, "cursor row should be clamped to rows-1");
-    assert_eq!(screen.grid.cursor_x, 4, "cursor col within bounds");
+    assert_eq!(screen.grid.cursor_y(), 2, "cursor row should be clamped to rows-1");
+    assert_eq!(screen.grid.cursor_x(), 4, "cursor col within bounds");
 }
 
 #[test]
@@ -1230,7 +1230,7 @@ fn resize_mid_osc_sequence_completes_after() {
 
     // Complete it
     screen.process(b"tle\x07"); // BEL terminates OSC
-    assert_eq!(screen.state.title, "My Title",
+    assert_eq!(screen.title(), "My Title",
         "title should be set correctly despite resize mid-OSC");
 }
 
@@ -1245,7 +1245,7 @@ fn resize_mid_sgr_sequence_style_applied_after() {
     // Finish: "1m" → complete SGR is [1;31m = bold + red
     screen.process(b"1m");
     screen.process(b"X");
-    assert!(screen.grid.visible_row(0)[0].style.bold,
+    assert!(screen.cell_style(0, 0).bold,
         "bold should be applied despite resize mid-SGR");
 }
 
@@ -1259,27 +1259,27 @@ fn resize_in_alt_screen_modes_restored_correctly() {
     // Set some modes on main screen
     screen.process(b"\x1b[?2004h"); // bracketed paste
     screen.process(b"\x1b[?1000h"); // mouse mode
-    assert!(screen.grid.modes.bracketed_paste);
-    assert!(screen.grid.modes.mouse_modes.click);
+    assert!(screen.grid.modes().bracketed_paste);
+    assert!(screen.grid.modes().mouse_modes.click);
 
     // Enter alt screen (saves modes)
     screen.process(b"\x1b[?1049h");
     // Change modes in alt screen
     screen.process(b"\x1b[?2004l"); // disable bracketed paste
-    assert!(!screen.grid.modes.bracketed_paste);
+    assert!(!screen.grid.modes().bracketed_paste);
 
     // Resize
     screen.resize(10, 3);
 
     // Exit alt screen — modes should be restored from saved state
     screen.process(b"\x1b[?1049l");
-    assert!(screen.grid.modes.bracketed_paste,
+    assert!(screen.grid.modes().bracketed_paste,
         "bracketed paste should be restored from saved modes after resize");
-    assert!(screen.grid.modes.mouse_modes.click,
+    assert!(screen.grid.modes().mouse_modes.click,
         "mouse mode should be restored from saved modes after resize");
     // Scroll region should be reset to new dimensions
-    assert_eq!(screen.grid.scroll_top, 0);
-    assert_eq!(screen.grid.scroll_bottom, 2);
+    assert_eq!(screen.grid.scroll_top(), 0);
+    assert_eq!(screen.grid.scroll_bottom(), 2);
 }
 
 // ---------------------------------------------------------------
@@ -1308,7 +1308,7 @@ fn resize_rapid_with_mixed_content() {
     assert_eq!(screen.grid.visible_row(0).len(), 20);
     // 'A' at col 0 should survive all resizes (always within bounds)
     assert_cell(&screen, 0, 0, 'A');
-    assert!(screen.grid.visible_row(0)[0].style.bold,
+    assert!(screen.cell_style(0, 0).bold,
         "style should survive rapid resizes");
 }
 
@@ -1338,14 +1338,14 @@ fn resize_vertical_expand_restores_scrollback() {
 fn resize_vertical_expand_shifts_cursor() {
     let mut screen = Screen::new(10, 3, 100);
     screen.process(b"Line1\r\nLine2\r\nLine3\r\nLine4\r\nLine5");
-    assert_eq!(screen.grid.cursor_y, 2);
-    let old_x = screen.grid.cursor_x;
+    assert_eq!(screen.grid.cursor_y(), 2);
+    let old_x = screen.grid.cursor_x();
 
     screen.resize(10, 5);
 
     // 2 lines restored → cursor shifted down by 2
-    assert_eq!(screen.grid.cursor_y, 4);
-    assert_eq!(screen.grid.cursor_x, old_x);
+    assert_eq!(screen.grid.cursor_y(), 4);
+    assert_eq!(screen.grid.cursor_x(), old_x);
 }
 
 #[test]
@@ -1367,7 +1367,7 @@ fn resize_vertical_expand_limited_by_scrollback() {
             "row {} should be blank", r);
     }
     // Cursor shifted by 1
-    assert_eq!(screen.grid.cursor_y, 3);
+    assert_eq!(screen.grid.cursor_y(), 3);
 }
 
 #[test]

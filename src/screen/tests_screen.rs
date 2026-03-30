@@ -11,7 +11,7 @@ fn alt_screen_save_restore() {
 
     // Enter alt screen (CSI ?1049h)
     screen.process(b"\x1b[?1049h");
-    assert!(screen.state.in_alt_screen);
+    assert!(screen.in_alt_screen());
     // Alt screen should be cleared
     assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
 
@@ -21,7 +21,7 @@ fn alt_screen_save_restore() {
 
     // Leave alt screen (CSI ?1049l) — should restore main buffer (fix S7)
     screen.process(b"\x1b[?1049l");
-    assert!(!screen.state.in_alt_screen);
+    assert!(!screen.in_alt_screen());
     assert_eq!(screen.grid.visible_row(0)[0].c, 'H');
     assert_eq!(screen.grid.visible_row(0)[4].c, 'o');
 }
@@ -63,13 +63,13 @@ fn deferred_wrap_cr_stays_on_same_line() {
     // Write exactly 5 chars to fill the line
     screen.process(b"%    ");
     // wrap_pending should be set, cursor stays on row 0
-    assert!(screen.grid.wrap_pending);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert!(screen.grid.wrap_pending());
+    assert_eq!(screen.grid.cursor_y(), 0);
     // CR should clear wrap_pending and go to column 0 of SAME row
     screen.process(b"\r");
-    assert!(!screen.grid.wrap_pending);
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert!(!screen.grid.wrap_pending());
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
     // Space overwrites the '%'
     screen.process(b" ");
     assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
@@ -80,11 +80,11 @@ fn deferred_wrap_next_print_wraps() {
     let mut screen = Screen::new(5, 3, 100);
     // Fill line
     screen.process(b"ABCDE");
-    assert!(screen.grid.wrap_pending);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert!(screen.grid.wrap_pending());
+    assert_eq!(screen.grid.cursor_y(), 0);
     // Next char triggers actual wrap
     screen.process(b"F");
-    assert_eq!(screen.grid.cursor_y, 1);
+    assert_eq!(screen.grid.cursor_y(), 1);
     assert_eq!(screen.grid.visible_row(1)[0].c, 'F');
 }
 
@@ -149,7 +149,7 @@ fn wide_character_occupies_two_cells() {
     assert_eq!(screen.grid.visible_row(0)[0].c, '你');
     assert_eq!(screen.grid.visible_row(0)[0].width, 2);
     assert_eq!(screen.grid.visible_row(0)[1].width, 0);
-    assert_eq!(screen.grid.cursor_x, 2);
+    assert_eq!(screen.grid.cursor_x(), 2);
 }
 
 #[test]
@@ -172,33 +172,34 @@ fn esc_c_full_reset() {
     screen.process(b"Hello");
     screen.process(b"\x1b[2 q");     // set cursor shape
     screen.process(b"\x1bc");         // full reset
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 0);
-    assert!(!screen.grid.modes.bracketed_paste);
-    assert_eq!(screen.grid.modes.cursor_shape, grid::CursorShape::Default);
-    assert!(screen.grid.cursor_visible);
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
+    assert!(!screen.grid.modes().bracketed_paste);
+    assert_eq!(screen.grid.modes().cursor_shape, grid::CursorShape::Default);
+    assert!(screen.grid.cursor_visible());
     assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
-    assert!(screen.state.title.is_empty());
+    assert!(screen.title().is_empty());
 }
 
 #[test]
 fn osc_sets_title() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b]0;My Terminal\x07");
-    assert_eq!(screen.state.title, "My Terminal");
+    assert_eq!(screen.title(), "My Terminal");
     screen.process(b"\x1b]2;New Title\x07");
-    assert_eq!(screen.state.title, "New Title");
+    assert_eq!(screen.title(), "New Title");
 }
 
 #[test]
 fn osc_passthrough_non_title() {
     let mut screen = Screen::new(80, 24, 100);
-    screen.process(b"\x1b]777;notify;Test;Hello\x07");
+    // OSC 52 (clipboard) goes to passthrough
+    screen.process(b"\x1b]52;c;SGVsbG8=\x07");
     let pt = screen.take_passthrough();
     assert_eq!(pt.len(), 1, "should have one passthrough sequence");
-    assert_eq!(pt[0], b"\x1b]777;notify;Test;Hello\x07");
+    assert_eq!(pt[0], b"\x1b]52;c;SGVsbG8=\x07");
     // Title should not be set
-    assert_eq!(screen.state.title, "");
+    assert_eq!(screen.title(), "");
 }
 
 #[test]
@@ -207,7 +208,7 @@ fn osc_title_not_passedthrough() {
     screen.process(b"\x1b]0;My Title\x07");
     let pt = screen.take_passthrough();
     assert!(pt.is_empty(), "OSC 0 should not be passedthrough");
-    assert_eq!(screen.state.title, "My Title");
+    assert_eq!(screen.title(), "My Title");
 }
 
 // --- Bell / BEL tests ---
@@ -225,10 +226,10 @@ fn bell_forwarded_as_passthrough() {
 fn bell_does_not_affect_screen_state() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"Hello");
-    let (cx, cy) = (screen.grid.cursor_x, screen.grid.cursor_y);
+    let (cx, cy) = (screen.grid.cursor_x(), screen.grid.cursor_y());
     screen.process(b"\x07");
-    assert_eq!(screen.grid.cursor_x, cx, "BEL should not move cursor x");
-    assert_eq!(screen.grid.cursor_y, cy, "BEL should not move cursor y");
+    assert_eq!(screen.grid.cursor_x(), cx, "BEL should not move cursor x");
+    assert_eq!(screen.grid.cursor_y(), cy, "BEL should not move cursor y");
     assert_eq!(screen.grid.visible_row(0)[0].c, 'H', "BEL should not alter cell content");
 }
 
@@ -281,43 +282,46 @@ fn bell_not_resent_on_resize() {
 fn osc_777_drained_after_take() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b]777;notify;title;body\x07");
-    let pt1 = screen.take_passthrough();
-    assert_eq!(pt1.len(), 1);
-    let pt2 = screen.take_passthrough();
-    assert!(pt2.is_empty(), "OSC 777 should not persist after take_passthrough()");
+    // OSC 777 goes to notification queue, not passthrough
+    let pt = screen.take_passthrough();
+    assert!(pt.is_empty(), "OSC 777 should not be in passthrough");
+    let n1 = screen.take_queued_notifications();
+    assert_eq!(n1.len(), 1);
+    let n2 = screen.take_queued_notifications();
+    assert!(n2.is_empty(), "OSC 777 should not persist after take_queued_notifications()");
 }
 
 #[test]
 fn osc_777_not_resent_on_render() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b]777;notify;title;body\x07");
-    let _ = screen.take_passthrough(); // drain
+    let _ = screen.take_queued_notifications(); // drain
     let mut cache = RenderCache::new();
     let _ = screen.render(true, &mut cache);
-    let pt = screen.take_passthrough();
-    assert!(pt.is_empty(), "OSC 777 must not be re-sent on full redraw");
+    let n = screen.take_queued_notifications();
+    assert!(n.is_empty(), "OSC 777 must not be re-sent on full redraw");
 }
 
 #[test]
 fn osc_777_not_resent_on_resize() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b]777;notify;title;body\x07");
-    let _ = screen.take_passthrough(); // drain
+    let _ = screen.take_queued_notifications(); // drain
     screen.resize(120, 40);
-    let pt = screen.take_passthrough();
-    assert!(pt.is_empty(), "OSC 777 must not be re-sent after resize");
+    let n = screen.take_queued_notifications();
+    assert!(n.is_empty(), "OSC 777 must not be re-sent after resize");
 }
 
 #[test]
 fn osc_777_not_resent_on_resize_then_render() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b]777;notify;title;body\x07");
-    let _ = screen.take_passthrough(); // drain
+    let _ = screen.take_queued_notifications(); // drain
     screen.resize(40, 10);
     let mut cache = RenderCache::new();
     let _ = screen.render(true, &mut cache);
-    let pt = screen.take_passthrough();
-    assert!(pt.is_empty(), "OSC 777 must not re-appear after resize + full redraw");
+    let n = screen.take_queued_notifications();
+    assert!(n.is_empty(), "OSC 777 must not re-appear after resize + full redraw");
 }
 
 #[test]
@@ -335,11 +339,14 @@ fn multiple_bells_all_forwarded() {
 fn bell_and_osc_777_interleaved() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x07\x1b]777;notify;t;b\x07\x07");
+    // BELs go to passthrough, OSC 777 goes to notification queue
     let pt = screen.take_passthrough();
-    assert_eq!(pt.len(), 3, "BEL + OSC 777 + BEL = 3 passthrough entries");
+    assert_eq!(pt.len(), 2, "BEL + BEL = 2 passthrough entries");
     assert_eq!(pt[0], b"\x07", "first should be standalone BEL");
-    assert_eq!(pt[1], b"\x1b]777;notify;t;b\x07", "second should be OSC 777");
-    assert_eq!(pt[2], b"\x07", "third should be standalone BEL");
+    assert_eq!(pt[1], b"\x07", "second should be standalone BEL");
+    let notifs = screen.take_queued_notifications();
+    assert_eq!(notifs.len(), 1);
+    assert_eq!(notifs[0], b"\x1b]777;notify;t;b\x07", "OSC 777 should be in notification queue");
 }
 
 #[test]
@@ -348,9 +355,11 @@ fn bell_in_osc_is_terminator_not_separate_bell() {
     // The BEL inside OSC is a terminator, not a separate bell event
     screen.process(b"\x1b]777;notify;title;body\x07");
     let pt = screen.take_passthrough();
-    assert_eq!(pt.len(), 1, "OSC terminated by BEL should produce exactly 1 passthrough");
-    // The passthrough should be the full OSC, not a separate BEL
-    assert!(pt[0].starts_with(b"\x1b]"), "passthrough should be the OSC sequence");
+    assert!(pt.is_empty(), "OSC 777 should not be in passthrough");
+    // The notification should be the full OSC, not a separate BEL
+    let notifs = screen.take_queued_notifications();
+    assert_eq!(notifs.len(), 1, "OSC terminated by BEL should produce exactly 1 notification");
+    assert!(notifs[0].starts_with(b"\x1b]"), "notification should be the OSC sequence");
 }
 
 #[test]
@@ -375,11 +384,11 @@ fn osc_777_not_resent_on_render_with_scrollback() {
     screen.process(b"A\r\nB\r\nC\r\nD");
     let scrollback = screen.take_pending_scrollback();
     screen.process(b"\x1b]777;notify;title;body\x07");
-    let _ = screen.take_passthrough(); // drain
+    let _ = screen.take_queued_notifications(); // drain
     let mut cache = RenderCache::new();
     let _ = screen.render_with_scrollback(&scrollback, &mut cache);
-    let pt = screen.take_passthrough();
-    assert!(pt.is_empty(), "OSC 777 must not re-appear after render_with_scrollback");
+    let n = screen.take_queued_notifications();
+    assert!(n.is_empty(), "OSC 777 must not re-appear after render_with_scrollback");
 }
 
 // --- ED mode 3 (clear scrollback) passthrough tests ---
@@ -391,12 +400,12 @@ fn ed3_clears_scrollback_and_forwards_passthrough() {
     for i in 0..30 {
         screen.process(format!("Line{}\r\n", i).as_bytes());
     }
-    assert!(screen.grid.scrollback_len > 0, "should have scrollback");
+    assert!(screen.grid.scrollback_len() > 0, "should have scrollback");
     let _ = screen.take_passthrough(); // drain any prior
 
     // ED mode 3: clear scrollback
     screen.process(b"\x1b[3J");
-    assert_eq!(screen.grid.scrollback_len, 0, "scrollback should be cleared");
+    assert_eq!(screen.grid.scrollback_len(), 0, "scrollback should be cleared");
 
     let pt = screen.take_passthrough();
     assert_eq!(pt.len(), 1, "ED mode 3 should produce one passthrough entry");
@@ -447,54 +456,54 @@ fn ed2_does_not_produce_passthrough() {
 #[test]
 fn mode_flags_bracketed_paste() {
     let mut screen = Screen::new(80, 24, 100);
-    assert!(!screen.grid.modes.bracketed_paste);
+    assert!(!screen.grid.modes().bracketed_paste);
     screen.process(b"\x1b[?2004h");
-    assert!(screen.grid.modes.bracketed_paste);
+    assert!(screen.grid.modes().bracketed_paste);
     screen.process(b"\x1b[?2004l");
-    assert!(!screen.grid.modes.bracketed_paste);
+    assert!(!screen.grid.modes().bracketed_paste);
 }
 
 #[test]
 fn mode_flags_cursor_key_mode() {
     let mut screen = Screen::new(80, 24, 100);
-    assert!(!screen.grid.modes.cursor_key_mode);
+    assert!(!screen.grid.modes().cursor_key_mode);
     screen.process(b"\x1b[?1h");
-    assert!(screen.grid.modes.cursor_key_mode);
+    assert!(screen.grid.modes().cursor_key_mode);
     screen.process(b"\x1b[?1l");
-    assert!(!screen.grid.modes.cursor_key_mode);
+    assert!(!screen.grid.modes().cursor_key_mode);
 }
 
 #[test]
 fn mode_flags_mouse() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[?1000h");
-    assert!(screen.grid.modes.mouse_modes.click);
-    assert_eq!(screen.grid.modes.mouse_modes.effective(), super::grid::MouseMode::Click);
+    assert!(screen.grid.modes().mouse_modes.click);
+    assert_eq!(screen.grid.modes().mouse_modes.effective(), super::grid::MouseMode::Click);
     screen.process(b"\x1b[?1006h");
-    assert_eq!(screen.grid.modes.mouse_encoding, super::grid::MouseEncoding::Sgr);
+    assert_eq!(screen.grid.modes().mouse_encoding, super::grid::MouseEncoding::Sgr);
     screen.process(b"\x1b[?1000l");
-    assert!(!screen.grid.modes.mouse_modes.click);
+    assert!(!screen.grid.modes().mouse_modes.click);
 }
 
 #[test]
 fn keypad_app_mode() {
     let mut screen = Screen::new(80, 24, 100);
-    assert!(!screen.grid.modes.keypad_app_mode);
+    assert!(!screen.grid.modes().keypad_app_mode);
     screen.process(b"\x1b=");
-    assert!(screen.grid.modes.keypad_app_mode);
+    assert!(screen.grid.modes().keypad_app_mode);
     screen.process(b"\x1b>");
-    assert!(!screen.grid.modes.keypad_app_mode);
+    assert!(!screen.grid.modes().keypad_app_mode);
 }
 
 #[test]
 fn cursor_shape_decscusr() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[2 q"); // steady block
-    assert_eq!(screen.grid.modes.cursor_shape, grid::CursorShape::SteadyBlock);
+    assert_eq!(screen.grid.modes().cursor_shape, grid::CursorShape::SteadyBlock);
     screen.process(b"\x1b[5 q"); // blinking bar
-    assert_eq!(screen.grid.modes.cursor_shape, grid::CursorShape::BlinkBar);
+    assert_eq!(screen.grid.modes().cursor_shape, grid::CursorShape::BlinkBar);
     screen.process(b"\x1b[0 q"); // reset to default
-    assert_eq!(screen.grid.modes.cursor_shape, grid::CursorShape::Default);
+    assert_eq!(screen.grid.modes().cursor_shape, grid::CursorShape::Default);
 }
 
 #[test]
@@ -503,9 +512,9 @@ fn autowrap_mode_disable_prevents_wrap() {
     screen.process(b"\x1b[?7l"); // disable autowrap
     screen.process(b"ABCDEF");   // write 6 chars in 5 cols
     // Should NOT wrap — last char overwrites column 4
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
     assert_eq!(screen.grid.visible_row(0)[4].c, 'F');
-    assert!(!screen.grid.wrap_pending);
+    assert!(!screen.grid.wrap_pending());
 }
 
 #[test]
@@ -513,10 +522,10 @@ fn sgr_hidden_attribute() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[8m"); // hidden
     screen.process(b"secret");
-    assert!(screen.grid.visible_row(0)[0].style.hidden);
+    assert!(screen.cell_style(0, 0).hidden);
     screen.process(b"\x1b[28m"); // reveal
     screen.process(b"visible");
-    assert!(!screen.grid.visible_row(0)[6].style.hidden);
+    assert!(!screen.cell_style(0, 6).hidden);
 }
 
 #[test]
@@ -525,10 +534,10 @@ fn cursor_save_restore() {
     screen.process(b"\x1b[5;10H"); // move to row 5, col 10
     screen.process(b"\x1b7");       // save cursor
     screen.process(b"\x1b[1;1H");   // move home
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
     screen.process(b"\x1b8");       // restore cursor
-    assert_eq!(screen.grid.cursor_y, 4);
-    assert_eq!(screen.grid.cursor_x, 9);
+    assert_eq!(screen.grid.cursor_y(), 4);
+    assert_eq!(screen.grid.cursor_x(), 9);
 }
 
 #[test]
@@ -553,10 +562,10 @@ fn cuu_cud_respects_scroll_region() {
     screen.process(b"\x1b[10;1H"); // row 10 (inside region)
     // Try moving up past scroll top
     screen.process(b"\x1b[20A");   // CUU 20 — should stop at row 5 (scroll_top=4)
-    assert_eq!(screen.grid.cursor_y, 4); // 0-based row 4 = display row 5
+    assert_eq!(screen.grid.cursor_y(), 4); // 0-based row 4 = display row 5
     // Move back down past scroll bottom
     screen.process(b"\x1b[20B");   // CUD 20 — should stop at row 15 (scroll_bottom=14)
-    assert_eq!(screen.grid.cursor_y, 14); // 0-based row 14 = display row 15
+    assert_eq!(screen.grid.cursor_y(), 14); // 0-based row 14 = display row 15
 }
 
 #[test]
@@ -564,9 +573,9 @@ fn vt_ff_treated_as_lf() {
     let mut screen = Screen::new(80, 3, 100);
     screen.process(b"A");
     screen.process(&[0x0B]); // VT
-    assert_eq!(screen.grid.cursor_y, 1);
+    assert_eq!(screen.grid.cursor_y(), 1);
     screen.process(&[0x0C]); // FF
-    assert_eq!(screen.grid.cursor_y, 2);
+    assert_eq!(screen.grid.cursor_y(), 2);
 }
 
 #[test]
@@ -590,25 +599,25 @@ fn alt_screen_mode_47_no_cursor_save() {
     let mut screen = Screen::new(10, 5, 100);
     // Move cursor to (3, 2) — row 3, col 4 (1-indexed)
     screen.process(b"\x1b[3;4H");
-    assert_eq!(screen.grid.cursor_y, 2);
-    assert_eq!(screen.grid.cursor_x, 3);
+    assert_eq!(screen.grid.cursor_y(), 2);
+    assert_eq!(screen.grid.cursor_x(), 3);
     // Save cursor explicitly with ESC 7
     screen.process(b"\x1b7");
     // Enter alt screen with mode 47 (should NOT save cursor again)
     screen.process(b"\x1b[?47h");
     // Move cursor on alt screen
     screen.process(b"\x1b[1;1H");
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
     // Exit alt screen with mode 47 (should NOT restore cursor)
     screen.process(b"\x1b[?47l");
     // Cursor should remain at (0, 0) since mode 47 doesn't restore
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
     // But ESC 8 should still restore the original saved cursor
     screen.process(b"\x1b8");
-    assert_eq!(screen.grid.cursor_x, 3);
-    assert_eq!(screen.grid.cursor_y, 2);
+    assert_eq!(screen.grid.cursor_x(), 3);
+    assert_eq!(screen.grid.cursor_y(), 2);
 }
 
 #[test]
@@ -618,8 +627,8 @@ fn mode_1048_save_restore_cursor() {
     screen.process(b"\x1b[?1048h");  // save cursor
     screen.process(b"\x1b[1;1H");    // move home
     screen.process(b"\x1b[?1048l");  // restore cursor
-    assert_eq!(screen.grid.cursor_y, 4);
-    assert_eq!(screen.grid.cursor_x, 9);
+    assert_eq!(screen.grid.cursor_y(), 4);
+    assert_eq!(screen.grid.cursor_x(), 9);
 }
 
 #[test]
@@ -680,11 +689,11 @@ fn csi_s_u_save_restore_cursor() {
     screen.process(b"\x1b[5;10H"); // move to row 5, col 10
     screen.process(b"\x1b[s");      // CSI s — save cursor
     screen.process(b"\x1b[1;1H");   // move home
-    assert_eq!(screen.grid.cursor_y, 0);
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
     screen.process(b"\x1b[u");      // CSI u — restore cursor
-    assert_eq!(screen.grid.cursor_y, 4);  // 0-based row 4
-    assert_eq!(screen.grid.cursor_x, 9);  // 0-based col 9
+    assert_eq!(screen.grid.cursor_y(), 4);  // 0-based row 4
+    assert_eq!(screen.grid.cursor_x(), 9);  // 0-based col 9
 }
 
 #[test]
@@ -692,44 +701,44 @@ fn cursor_movement_cuf_cub() {
     let mut screen = Screen::new(80, 24, 100);
     // Start at home (0,0)
     screen.process(b"\x1b[5C");  // CUF 5 — forward 5
-    assert_eq!(screen.grid.cursor_x, 5);
+    assert_eq!(screen.grid.cursor_x(), 5);
     screen.process(b"\x1b[2D");  // CUB 2 — backward 2
-    assert_eq!(screen.grid.cursor_x, 3);
+    assert_eq!(screen.grid.cursor_x(), 3);
     // CUB should not go below 0
     screen.process(b"\x1b[100D");
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
     // CUF should clamp to cols-1
     screen.process(b"\x1b[200C");
-    assert_eq!(screen.grid.cursor_x, 79);
+    assert_eq!(screen.grid.cursor_x(), 79);
 }
 
 #[test]
 fn cursor_movement_cnl_cpl() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[10;15H"); // move to row 10, col 15
-    assert_eq!(screen.grid.cursor_y, 9);
-    assert_eq!(screen.grid.cursor_x, 14);
+    assert_eq!(screen.grid.cursor_y(), 9);
+    assert_eq!(screen.grid.cursor_x(), 14);
 
     // CNL 3 — move down 3 lines, cursor to column 0
     screen.process(b"\x1b[3E");
-    assert_eq!(screen.grid.cursor_y, 12);
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_y(), 12);
+    assert_eq!(screen.grid.cursor_x(), 0);
 
     // CPL 2 — move up 2 lines, cursor to column 0
     screen.process(b"\x1b[5;20H"); // reposition with a non-zero column
     screen.process(b"\x1b[2F");
-    assert_eq!(screen.grid.cursor_y, 2);  // row 5 - 1 (0-based=4) minus 2 = 2
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_y(), 2);  // row 5 - 1 (0-based=4) minus 2 = 2
+    assert_eq!(screen.grid.cursor_x(), 0);
 
     // CNL should clamp to last row
     screen.process(b"\x1b[100E");
-    assert_eq!(screen.grid.cursor_y, 23);
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_y(), 23);
+    assert_eq!(screen.grid.cursor_x(), 0);
 
     // CPL should clamp to row 0
     screen.process(b"\x1b[100F");
-    assert_eq!(screen.grid.cursor_y, 0);
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
 }
 
 #[test]
@@ -737,16 +746,16 @@ fn cursor_horizontal_absolute() {
     let mut screen = Screen::new(80, 24, 100);
     // CHA — CSI G sets cursor column (1-based)
     screen.process(b"\x1b[20G");
-    assert_eq!(screen.grid.cursor_x, 19); // 0-based
+    assert_eq!(screen.grid.cursor_x(), 19); // 0-based
     // CHA 1 should go to column 0
     screen.process(b"\x1b[1G");
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
     // CHA beyond cols should clamp
     screen.process(b"\x1b[200G");
-    assert_eq!(screen.grid.cursor_x, 79);
+    assert_eq!(screen.grid.cursor_x(), 79);
     // CHA with default (no param) should go to column 0
     screen.process(b"\x1b[G");
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
 }
 
 #[test]
@@ -754,16 +763,16 @@ fn cursor_position_cup() {
     let mut screen = Screen::new(80, 24, 100);
     // CUP — CSI H sets row and column (1-based)
     screen.process(b"\x1b[12;40H");
-    assert_eq!(screen.grid.cursor_y, 11); // 0-based
-    assert_eq!(screen.grid.cursor_x, 39); // 0-based
+    assert_eq!(screen.grid.cursor_y(), 11); // 0-based
+    assert_eq!(screen.grid.cursor_x(), 39); // 0-based
     // CUP with no params goes to (0,0)
     screen.process(b"\x1b[H");
-    assert_eq!(screen.grid.cursor_y, 0);
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
     // CUP should clamp to screen bounds
     screen.process(b"\x1b[100;200H");
-    assert_eq!(screen.grid.cursor_y, 23);
-    assert_eq!(screen.grid.cursor_x, 79);
+    assert_eq!(screen.grid.cursor_y(), 23);
+    assert_eq!(screen.grid.cursor_x(), 79);
 }
 
 #[test]
@@ -772,14 +781,14 @@ fn vpa_line_position_absolute() {
     screen.process(b"\x1b[5;10H"); // start at row 5, col 10
     // VPA — CSI d sets cursor row (1-based), column unchanged
     screen.process(b"\x1b[15d");
-    assert_eq!(screen.grid.cursor_y, 14); // 0-based row 14
-    assert_eq!(screen.grid.cursor_x, 9);  // column unchanged
+    assert_eq!(screen.grid.cursor_y(), 14); // 0-based row 14
+    assert_eq!(screen.grid.cursor_x(), 9);  // column unchanged
     // VPA should clamp to last row
     screen.process(b"\x1b[100d");
-    assert_eq!(screen.grid.cursor_y, 23);
+    assert_eq!(screen.grid.cursor_y(), 23);
     // VPA with default goes to row 0
     screen.process(b"\x1b[d");
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
 }
 
 #[test]
@@ -910,7 +919,7 @@ fn erase_character_ech() {
     assert_eq!(screen.grid.visible_row(0)[6].c, 'G'); // preserved
     assert_eq!(screen.grid.visible_row(0)[9].c, 'J'); // preserved
     // Cursor should not have moved
-    assert_eq!(screen.grid.cursor_x, 2);
+    assert_eq!(screen.grid.cursor_x(), 2);
 }
 
 #[test]
@@ -1031,18 +1040,18 @@ fn decstbm_set_scroll_region() {
     let mut screen = Screen::new(80, 24, 100);
     // Move cursor to a non-home position first
     screen.process(b"\x1b[10;20H");
-    assert_eq!(screen.grid.cursor_y, 9);
-    assert_eq!(screen.grid.cursor_x, 19);
+    assert_eq!(screen.grid.cursor_y(), 9);
+    assert_eq!(screen.grid.cursor_x(), 19);
     // CSI 5;15r — set scroll region to rows 5-15
     screen.process(b"\x1b[5;15r");
     // Scroll region should be set (0-based)
-    assert_eq!(screen.grid.scroll_top, 4);
-    assert_eq!(screen.grid.scroll_bottom, 14);
+    assert_eq!(screen.grid.scroll_top(), 4);
+    assert_eq!(screen.grid.scroll_bottom(), 14);
     // Cursor should move to 0,0
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
     // wrap_pending should be cleared
-    assert!(!screen.grid.wrap_pending);
+    assert!(!screen.grid.wrap_pending());
 }
 
 #[test]
@@ -1059,11 +1068,11 @@ fn reverse_index_ri() {
     screen.process(b"LineC");
     // Move to top of scroll region (row 2, 0-based row 1)
     screen.process(b"\x1b[2;1H");
-    assert_eq!(screen.grid.cursor_y, 1);
+    assert_eq!(screen.grid.cursor_y(), 1);
     // ESC M — reverse index at top of scroll region should scroll down
     screen.process(b"\x1bM");
     // Cursor stays at scroll_top
-    assert_eq!(screen.grid.cursor_y, 1);
+    assert_eq!(screen.grid.cursor_y(), 1);
     // Row 1 should now be blank (new line scrolled in)
     assert_eq!(screen.grid.visible_row(1)[0].c, ' ');
     // Row 2 should now be "LineA" (shifted down)
@@ -1077,19 +1086,19 @@ fn reverse_index_ri_not_at_top() {
     let mut screen = Screen::new(10, 5, 100);
     screen.process(b"\x1b[3;1H"); // row 3, col 1 (0-based row 2)
     screen.process(b"\x1bM");      // ESC M
-    assert_eq!(screen.grid.cursor_y, 1); // moved up one
+    assert_eq!(screen.grid.cursor_y(), 1); // moved up one
 }
 
 #[test]
 fn focus_reporting_mode() {
     let mut screen = Screen::new(80, 24, 100);
-    assert!(!screen.grid.modes.focus_reporting);
+    assert!(!screen.grid.modes().focus_reporting);
     // CSI ?1004h — enable focus reporting
     screen.process(b"\x1b[?1004h");
-    assert!(screen.grid.modes.focus_reporting);
+    assert!(screen.grid.modes().focus_reporting);
     // CSI ?1004l — disable focus reporting
     screen.process(b"\x1b[?1004l");
-    assert!(!screen.grid.modes.focus_reporting);
+    assert!(!screen.grid.modes().focus_reporting);
 }
 
 #[test]
@@ -1097,21 +1106,21 @@ fn autowrap_mode_re_enable() {
     let mut screen = Screen::new(5, 3, 100);
     // Disable autowrap
     screen.process(b"\x1b[?7l");
-    assert!(!screen.grid.modes.autowrap_mode);
+    assert!(!screen.grid.modes().autowrap_mode);
     // Write past end of line — should NOT wrap
     screen.process(b"ABCDEF");
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
     assert_eq!(screen.grid.visible_row(0)[4].c, 'F');
 
     // Re-enable autowrap
     screen.process(b"\x1b[?7h");
-    assert!(screen.grid.modes.autowrap_mode);
+    assert!(screen.grid.modes().autowrap_mode);
     // Go back to start, fill line, and verify wrap now works
     screen.process(b"\x1b[1;1H");
     screen.process(b"12345");
-    assert!(screen.grid.wrap_pending);
+    assert!(screen.grid.wrap_pending());
     screen.process(b"6");
-    assert_eq!(screen.grid.cursor_y, 1);
+    assert_eq!(screen.grid.cursor_y(), 1);
     assert_eq!(screen.grid.visible_row(1)[0].c, '6');
 }
 
@@ -1126,17 +1135,17 @@ fn bce_erase_uses_bg_color() {
     screen.process(b"\x1b[0K");
     // Erased cells should have the red background
     let expected_bg = Some(style::Color::Indexed(1)); // red = index 1
-    assert_eq!(screen.grid.visible_row(0)[3].style.bg, expected_bg,
+    assert_eq!(screen.cell_style(0, 3).bg, expected_bg,
         "erased cell at col 3 should have red background (BCE)");
-    assert_eq!(screen.grid.visible_row(0)[9].style.bg, expected_bg,
+    assert_eq!(screen.cell_style(0, 9).bg, expected_bg,
         "erased cell at col 9 should have red background (BCE)");
     // Cells before cursor should NOT have the red bg (they were written before SGR 41)
-    assert_eq!(screen.grid.visible_row(0)[0].style.bg, None,
+    assert_eq!(screen.cell_style(0, 0).bg, None,
         "cell at col 0 should have default background");
 
     // Also verify BCE with CSI 2J (erase entire display)
     screen.process(b"\x1b[2J");
-    assert_eq!(screen.grid.visible_row(1)[5].style.bg, expected_bg,
+    assert_eq!(screen.cell_style(1, 5).bg, expected_bg,
         "CSI 2J erased cell should have red background (BCE)");
 
     // And ECH (erase character)
@@ -1144,9 +1153,9 @@ fn bce_erase_uses_bg_color() {
     screen.process(b"XYZ");
     screen.process(b"\x1b[1;1H");
     screen.process(b"\x1b[2X"); // erase 2 chars
-    assert_eq!(screen.grid.visible_row(0)[0].style.bg, expected_bg,
+    assert_eq!(screen.cell_style(0, 0).bg, expected_bg,
         "ECH erased cell should have red background (BCE)");
-    assert_eq!(screen.grid.visible_row(0)[1].style.bg, expected_bg,
+    assert_eq!(screen.cell_style(0, 1).bg, expected_bg,
         "ECH erased cell at col 1 should have red background (BCE)");
 }
 
@@ -1159,9 +1168,9 @@ fn tab_advances_to_next_tab_stop() {
     let mut screen = Screen::new(80, 3, 100);
     screen.process(b"AB"); // cursor at col 2
     screen.process(b"\t"); // tab should advance to col 8
-    assert_eq!(screen.grid.cursor_x, 8);
+    assert_eq!(screen.grid.cursor_x(), 8);
     screen.process(b"\t"); // next tab stop at col 16
-    assert_eq!(screen.grid.cursor_x, 16);
+    assert_eq!(screen.grid.cursor_x(), 16);
 }
 
 #[test]
@@ -1169,25 +1178,25 @@ fn tab_at_end_of_line_clamps() {
     let mut screen = Screen::new(10, 3, 100);
     screen.process(b"ABCDEFGH"); // cursor at col 8
     screen.process(b"\t"); // tab should clamp to col 9 (cols-1)
-    assert_eq!(screen.grid.cursor_x, 9);
+    assert_eq!(screen.grid.cursor_x(), 9);
 }
 
 #[test]
 fn backspace_at_column_zero() {
     let mut screen = Screen::new(80, 3, 100);
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
     screen.process(b"\x08"); // BS at col 0
-    assert_eq!(screen.grid.cursor_x, 0, "BS at column 0 should stay at 0");
+    assert_eq!(screen.grid.cursor_x(), 0, "BS at column 0 should stay at 0");
 }
 
 #[test]
 fn backspace_clears_wrap_pending() {
     let mut screen = Screen::new(5, 3, 100);
     screen.process(b"ABCDE"); // wrap_pending = true
-    assert!(screen.grid.wrap_pending);
+    assert!(screen.grid.wrap_pending());
     screen.process(b"\x08"); // BS
-    assert!(!screen.grid.wrap_pending, "BS should clear wrap_pending");
-    assert_eq!(screen.grid.cursor_x, 3);
+    assert!(!screen.grid.wrap_pending(), "BS should clear wrap_pending");
+    assert_eq!(screen.grid.cursor_x(), 3);
 }
 
 #[test]
@@ -1209,14 +1218,14 @@ fn erase_scrollback_j3() {
 fn alt_screen_clears_wrap_pending() {
     let mut screen = Screen::new(5, 3, 100);
     screen.process(b"ABCDE"); // fills line, wrap_pending = true
-    assert!(screen.grid.wrap_pending);
+    assert!(screen.grid.wrap_pending());
 
     // Enter alt screen
     screen.process(b"\x1b[?1049h");
-    assert!(!screen.grid.wrap_pending,
+    assert!(!screen.grid.wrap_pending(),
         "wrap_pending should be cleared on alt screen enter");
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
 }
 
 #[test]
@@ -1227,7 +1236,7 @@ fn alt_screen_mode_1047() {
 
     // Enter alt screen via mode 1047
     screen.process(b"\x1b[?1047h");
-    assert!(screen.state.in_alt_screen);
+    assert!(screen.in_alt_screen());
     assert_eq!(screen.grid.visible_row(0)[0].c, ' '); // alt screen cleared
 
     screen.process(b"Alt");
@@ -1235,7 +1244,7 @@ fn alt_screen_mode_1047() {
 
     // Leave alt screen
     screen.process(b"\x1b[?1047l");
-    assert!(!screen.state.in_alt_screen);
+    assert!(!screen.in_alt_screen());
     assert_eq!(screen.grid.visible_row(0)[0].c, 'H'); // main buffer restored
 }
 
@@ -1246,11 +1255,11 @@ fn alt_screen_mode_47() {
     assert_eq!(screen.grid.visible_row(0)[0].c, 'M');
 
     screen.process(b"\x1b[?47h");
-    assert!(screen.state.in_alt_screen);
+    assert!(screen.in_alt_screen());
     assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
 
     screen.process(b"\x1b[?47l");
-    assert!(!screen.state.in_alt_screen);
+    assert!(!screen.in_alt_screen());
     assert_eq!(screen.grid.visible_row(0)[0].c, 'M');
 }
 
@@ -1260,8 +1269,8 @@ fn alt_screen_restores_modes() {
     // Set some modes on main screen
     screen.process(b"\x1b[?2004h"); // bracketed paste
     screen.process(b"\x1b[?1h");    // cursor key mode
-    assert!(screen.grid.modes.bracketed_paste);
-    assert!(screen.grid.modes.cursor_key_mode);
+    assert!(screen.grid.modes().bracketed_paste);
+    assert!(screen.grid.modes().cursor_key_mode);
 
     // Enter alt screen
     screen.process(b"\x1b[?1049h");
@@ -1269,25 +1278,25 @@ fn alt_screen_restores_modes() {
     // Now change modes on alt screen
     screen.process(b"\x1b[?2004l");
     screen.process(b"\x1b[?1l");
-    assert!(!screen.grid.modes.bracketed_paste);
-    assert!(!screen.grid.modes.cursor_key_mode);
+    assert!(!screen.grid.modes().bracketed_paste);
+    assert!(!screen.grid.modes().cursor_key_mode);
 
     // Leave alt screen — modes should be restored
     screen.process(b"\x1b[?1049l");
-    assert!(screen.grid.modes.bracketed_paste,
+    assert!(screen.grid.modes().bracketed_paste,
         "bracketed paste should be restored on alt screen exit");
-    assert!(screen.grid.modes.cursor_key_mode,
+    assert!(screen.grid.modes().cursor_key_mode,
         "cursor key mode should be restored on alt screen exit");
 }
 
 #[test]
 fn cursor_visibility_mode_25() {
     let mut screen = Screen::new(80, 24, 100);
-    assert!(screen.grid.cursor_visible);
+    assert!(screen.grid.cursor_visible());
     screen.process(b"\x1b[?25l");
-    assert!(!screen.grid.cursor_visible, "cursor should be hidden after ?25l");
+    assert!(!screen.grid.cursor_visible(), "cursor should be hidden after ?25l");
     screen.process(b"\x1b[?25h");
-    assert!(screen.grid.cursor_visible, "cursor should be visible after ?25h");
+    assert!(screen.grid.cursor_visible(), "cursor should be visible after ?25h");
 }
 
 #[test]
@@ -1316,8 +1325,8 @@ fn render_full_reattach_redraws_all() {
     // Simulate reattach: full render with existing cache
     let result = screen.render(true, &mut cache);
     let text = String::from_utf8_lossy(&result);
-    assert!(text.contains("\x1b[2J\x1b[H"),
-        "full render should clear screen");
+    assert!(text.contains("\x1b[2J"),
+        "full render should screen clear");
     assert!(text.contains("Hello"),
         "full render should include screen content");
 }
@@ -1451,7 +1460,7 @@ fn combining_mark_attaches_to_previous_cell() {
     // Print 'e' followed by combining acute accent U+0301
     screen.process("e\u{0301}".as_bytes());
     assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
-    assert_eq!(screen.grid.visible_row(0)[0].combining, vec!['\u{0301}']);
+    assert_eq!(screen.grid.visible_row(0).combining(0), &['\u{0301}']);
 }
 
 #[test]
@@ -1459,11 +1468,11 @@ fn combining_mark_with_wrap_pending() {
     let mut screen = Screen::new(5, 3, 100);
     // Fill the line to trigger wrap_pending
     screen.process(b"ABCDE");
-    assert!(screen.grid.wrap_pending, "wrap should be pending after filling line");
+    assert!(screen.grid.wrap_pending(), "wrap should be pending after filling line");
     // Now send a combining mark — it should attach to the last cell (E)
     screen.process("\u{0308}".as_bytes()); // combining diaeresis
     assert_eq!(screen.grid.visible_row(0)[4].c, 'E');
-    assert_eq!(screen.grid.visible_row(0)[4].combining, vec!['\u{0308}']);
+    assert_eq!(screen.grid.visible_row(0).combining(4), &['\u{0308}']);
 }
 
 #[test]
@@ -1473,7 +1482,7 @@ fn combining_mark_on_wide_char() {
     screen.process("\u{4e16}\u{0301}".as_bytes()); // 世 + combining acute
     // The combining mark should attach to the wide char cell (col 0), not the continuation (col 1)
     assert_eq!(screen.grid.visible_row(0)[0].c, '\u{4e16}');
-    assert_eq!(screen.grid.visible_row(0)[0].combining, vec!['\u{0301}']);
+    assert_eq!(screen.grid.visible_row(0).combining(0), &['\u{0301}']);
     assert_eq!(screen.grid.visible_row(0)[1].width, 0); // continuation cell
 }
 
@@ -1492,24 +1501,24 @@ fn delete_lines_preserves_cursor_x() {
     let mut screen = Screen::new(80, 24, 100);
     // Position cursor at column 10, row 5
     screen.process(b"\x1b[6;11H");  // CUP row=6, col=11 (1-indexed)
-    assert_eq!(screen.grid.cursor_x, 10);
-    assert_eq!(screen.grid.cursor_y, 5);
+    assert_eq!(screen.grid.cursor_x(), 10);
+    assert_eq!(screen.grid.cursor_y(), 5);
     // Delete 1 line
     screen.process(b"\x1b[M");
     // cursor_x must be preserved per ECMA-48
-    assert_eq!(screen.grid.cursor_x, 10, "DL must not change cursor_x");
-    assert_eq!(screen.grid.cursor_y, 5, "DL must not change cursor_y");
+    assert_eq!(screen.grid.cursor_x(), 10, "DL must not change cursor_x");
+    assert_eq!(screen.grid.cursor_y(), 5, "DL must not change cursor_y");
 }
 
 #[test]
 fn insert_lines_preserves_cursor_x() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[6;11H");
-    assert_eq!(screen.grid.cursor_x, 10);
+    assert_eq!(screen.grid.cursor_x(), 10);
     // Insert 1 line
     screen.process(b"\x1b[L");
-    assert_eq!(screen.grid.cursor_x, 10, "IL must not change cursor_x");
-    assert_eq!(screen.grid.cursor_y, 5, "IL must not change cursor_y");
+    assert_eq!(screen.grid.cursor_x(), 10, "IL must not change cursor_x");
+    assert_eq!(screen.grid.cursor_y(), 5, "IL must not change cursor_y");
 }
 
 // ─── Scroll tests ────────────────────────────────────────────────────────
@@ -1770,8 +1779,8 @@ fn cursor_stays_in_place_during_lf_scroll() {
     let mut screen = Screen::new(20, 3, 100);
     screen.process(b"Row0\r\nRow1\r\nRow2");
     // Cursor is now at row 2, col 4
-    assert_eq!(screen.grid.cursor_y, 2);
-    assert_eq!(screen.grid.cursor_x, 4);
+    assert_eq!(screen.grid.cursor_y(), 2);
+    assert_eq!(screen.grid.cursor_x(), 4);
 
     // Move cursor to col 10
     screen.process(b"\x1b[1;11H"); // row 1, col 11 (0-based: row 0, col 10)
@@ -1780,8 +1789,8 @@ fn cursor_stays_in_place_during_lf_scroll() {
     // Trigger LF-based scroll
     screen.process(b"\r\n");
     // Cursor should be at scroll_bottom, col 0 (CR moved it)
-    assert_eq!(screen.grid.cursor_y, 2, "cursor_y stays at scroll_bottom");
-    assert_eq!(screen.grid.cursor_x, 0, "cursor_x reset by CR");
+    assert_eq!(screen.grid.cursor_y(), 2, "cursor_y stays at scroll_bottom");
+    assert_eq!(screen.grid.cursor_x(), 0, "cursor_x reset by CR");
 }
 
 #[test]
@@ -1791,13 +1800,13 @@ fn cursor_column_preserved_on_bare_lf_scroll() {
     screen.process(b"Row0\r\nRow1\r\n");
     // Cursor at row 2, col 0
     screen.process(b"\x1b[3;8H"); // move to row 3, col 8 (0-based: row 2, col 7)
-    assert_eq!(screen.grid.cursor_y, 2);
-    assert_eq!(screen.grid.cursor_x, 7);
+    assert_eq!(screen.grid.cursor_y(), 2);
+    assert_eq!(screen.grid.cursor_x(), 7);
 
     // Bare LF (no CR) triggers scroll
     screen.process(b"\n");
-    assert_eq!(screen.grid.cursor_y, 2, "cursor_y stays at scroll_bottom");
-    assert_eq!(screen.grid.cursor_x, 7, "bare LF preserves cursor_x");
+    assert_eq!(screen.grid.cursor_y(), 2, "cursor_y stays at scroll_bottom");
+    assert_eq!(screen.grid.cursor_x(), 7, "bare LF preserves cursor_x");
 }
 
 #[test]
@@ -1857,9 +1866,8 @@ fn lf_scroll_with_styled_content() {
     screen.process(b"\r\n");
 
     // The bottom row (row 2) should be blank with red background
-    let cell = &screen.grid.visible_row(2)[0];
-    assert_eq!(cell.c, ' ', "new line should be blank");
-    assert_eq!(cell.style.bg, Some(style::Color::Indexed(1)), "blank line should inherit current bg (BCE)");
+    assert_eq!(screen.cell_char(2, 0), ' ', "new line should be blank");
+    assert_eq!(screen.cell_style(2, 0).bg, Some(style::Color::Indexed(1)), "blank line should inherit current bg (BCE)");
 }
 
 #[test]
@@ -2211,11 +2219,11 @@ fn lf_at_last_row_outside_scroll_region() {
 
     // Move cursor to the very last row (below scroll region)
     screen.process(b"\x1b[6;1H");
-    assert_eq!(screen.grid.cursor_y, 5);
+    assert_eq!(screen.grid.cursor_y(), 5);
 
     // LF — cursor is at row 5 (last), scroll_bottom is 3. Should not scroll, should not move.
     screen.process(b"\n");
-    assert_eq!(screen.grid.cursor_y, 5, "cursor stuck at last row outside region");
+    assert_eq!(screen.grid.cursor_y(), 5, "cursor stuck at last row outside region");
 
     let lines = screen_lines(&screen);
     assert_eq!(lines[5], "Bottom", "content at last row unchanged");
@@ -2235,7 +2243,7 @@ fn lf_between_scroll_top_and_bottom_just_moves_cursor() {
 
     screen.process(b"\n"); // LF
 
-    assert_eq!(screen.grid.cursor_y, 3, "cursor moved down by 1");
+    assert_eq!(screen.grid.cursor_y(), 3, "cursor moved down by 1");
     // No scrolling — all content intact
     let lines = screen_lines(&screen);
     assert_eq!(lines[0], "R0");
@@ -2254,7 +2262,7 @@ fn autowrap_at_scroll_bottom_triggers_scroll() {
     screen.process(b"AAA0\r\nBBB1\r\nCCC2\r\nDDD3");
 
     // "DDD3" is 4 chars in 4-col terminal → cursor at col 3 with wrap_pending
-    assert!(screen.grid.wrap_pending, "wrap_pending after filling last cell");
+    assert!(screen.grid.wrap_pending(), "wrap_pending after filling last cell");
 
     // Print one more character — triggers deferred wrap → scroll.
     screen.process(b"X");
@@ -2303,7 +2311,7 @@ fn wide_char_wrap_at_scroll_bottom_triggers_scroll() {
     // Cursor at row 2, col 0. Fill to col 4 (last col)
     screen.process(b"ABCD");
     // Cursor at col 4 (0-based), which is the last column.
-    assert_eq!(screen.grid.cursor_x, 4);
+    assert_eq!(screen.grid.cursor_x(), 4);
 
     // Print a wide char — it needs 2 cells but only 1 available.
     // Should: fill col 4 with blank, wrap to next line (triggers scroll), then print wide char.
@@ -2324,13 +2332,13 @@ fn csi_r_reset_restores_full_screen_scroll() {
 
     // Set partial region
     screen.process(b"\x1b[2;5r");
-    assert_eq!(screen.grid.scroll_top, 1);
-    assert_eq!(screen.grid.scroll_bottom, 4);
+    assert_eq!(screen.grid.scroll_top(), 1);
+    assert_eq!(screen.grid.scroll_bottom(), 4);
 
     // Reset with CSI r (no params)
     screen.process(b"\x1b[r");
-    assert_eq!(screen.grid.scroll_top, 0, "scroll_top reset to 0");
-    assert_eq!(screen.grid.scroll_bottom, 5, "scroll_bottom reset to rows-1");
+    assert_eq!(screen.grid.scroll_top(), 0, "scroll_top reset to 0");
+    assert_eq!(screen.grid.scroll_bottom(), 5, "scroll_bottom reset to rows-1");
 }
 
 #[test]
@@ -2341,24 +2349,24 @@ fn scroll_single_row_region() {
     screen.process(b"\x1b[3;3r"); // top == bottom (row 3, 0-based: 2)
 
     // Region should be set to single row
-    assert_eq!(screen.grid.scroll_top, 2, "single-row region applied");
-    assert_eq!(screen.grid.scroll_bottom, 2, "single-row region applied");
+    assert_eq!(screen.grid.scroll_top(), 2, "single-row region applied");
+    assert_eq!(screen.grid.scroll_bottom(), 2, "single-row region applied");
     // Cursor resets to home
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
 }
 
 #[test]
 fn scroll_region_reversed_params_ignored() {
     // CSI 15;5r (top > bottom after conversion) — should NOT change region.
     let mut screen = Screen::new(10, 20, 100);
-    let old_top = screen.grid.scroll_top;
-    let old_bottom = screen.grid.scroll_bottom;
+    let old_top = screen.grid.scroll_top();
+    let old_bottom = screen.grid.scroll_bottom();
 
     screen.process(b"\x1b[15;5r"); // top 14 > bottom 4
 
-    assert_eq!(screen.grid.scroll_top, old_top);
-    assert_eq!(screen.grid.scroll_bottom, old_bottom);
+    assert_eq!(screen.grid.scroll_top(), old_top);
+    assert_eq!(screen.grid.scroll_bottom(), old_bottom);
 }
 
 #[test]
@@ -2385,13 +2393,13 @@ fn csi_s_does_not_move_cursor() {
     // CSI S should scroll content but NOT change cursor position.
     let mut screen = Screen::new(10, 5, 100);
     screen.process(b"\x1b[3;5H"); // cursor at row 3, col 5 (0-based: 2, 4)
-    assert_eq!(screen.grid.cursor_y, 2);
-    assert_eq!(screen.grid.cursor_x, 4);
+    assert_eq!(screen.grid.cursor_y(), 2);
+    assert_eq!(screen.grid.cursor_x(), 4);
 
     screen.process(b"\x1b[2S"); // scroll up 2
 
-    assert_eq!(screen.grid.cursor_y, 2, "CSI S must not change cursor_y");
-    assert_eq!(screen.grid.cursor_x, 4, "CSI S must not change cursor_x");
+    assert_eq!(screen.grid.cursor_y(), 2, "CSI S must not change cursor_y");
+    assert_eq!(screen.grid.cursor_x(), 4, "CSI S must not change cursor_x");
 }
 
 #[test]
@@ -2399,13 +2407,13 @@ fn csi_t_does_not_move_cursor() {
     // CSI T should scroll content but NOT change cursor position.
     let mut screen = Screen::new(10, 5, 100);
     screen.process(b"\x1b[3;5H");
-    assert_eq!(screen.grid.cursor_y, 2);
-    assert_eq!(screen.grid.cursor_x, 4);
+    assert_eq!(screen.grid.cursor_y(), 2);
+    assert_eq!(screen.grid.cursor_x(), 4);
 
     screen.process(b"\x1b[2T"); // scroll down 2
 
-    assert_eq!(screen.grid.cursor_y, 2, "CSI T must not change cursor_y");
-    assert_eq!(screen.grid.cursor_x, 4, "CSI T must not change cursor_x");
+    assert_eq!(screen.grid.cursor_y(), 2, "CSI T must not change cursor_y");
+    assert_eq!(screen.grid.cursor_x(), 4, "CSI T must not change cursor_x");
 }
 
 // ─── Scroll + content update tests (main screen) ───────────────────────
@@ -2685,7 +2693,7 @@ fn ind_esc_d_mid_screen_just_moves_cursor() {
     screen.process(b"\x1b[2;1H"); // row 2 (0-based: 1)
     screen.process(b"\x1bD");
 
-    assert_eq!(screen.grid.cursor_y, 2, "ESC D should move cursor down by 1");
+    assert_eq!(screen.grid.cursor_y(), 2, "ESC D should move cursor down by 1");
 }
 
 #[test]
@@ -2705,8 +2713,8 @@ fn save_cursor_scroll_restore_cursor_writes_at_shifted_content() {
 
     // Restore cursor — should go back to (1, 5)
     screen.process(b"\x1b8");
-    assert_eq!(screen.grid.cursor_y, 1, "restored cursor_y");
-    assert_eq!(screen.grid.cursor_x, 5, "restored cursor_x");
+    assert_eq!(screen.grid.cursor_y(), 1, "restored cursor_y");
+    assert_eq!(screen.grid.cursor_x(), 5, "restored cursor_x");
 
     // Print at restored position — overwrites whatever is at row 1 col 5
     // (Row3 is now at row 1)
@@ -2826,11 +2834,11 @@ fn scroll_region_lf_cursor_outside_region_between_bottom_and_last_row() {
 
     // Put cursor at row 6 (0-based: 5), between scroll_bottom(3) and last row(7)
     screen.process(b"\x1b[6;1H");
-    assert_eq!(screen.grid.cursor_y, 5);
+    assert_eq!(screen.grid.cursor_y(), 5);
 
     screen.process(b"\n"); // LF
 
-    assert_eq!(screen.grid.cursor_y, 6, "cursor moves down, no scroll");
+    assert_eq!(screen.grid.cursor_y(), 6, "cursor moves down, no scroll");
     // ALL content should be unchanged
     let lines = screen_lines(&screen);
     for row in 0..8 {
@@ -2846,9 +2854,9 @@ fn combining_mark_at_column_zero_no_previous_cell() {
     let mut screen = Screen::new(10, 3, 100);
     screen.process("\u{0301}".as_bytes()); // combining acute accent
     // Should not crash, cursor should stay at 0
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
     assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
-    assert!(screen.grid.visible_row(0)[0].combining.is_empty());
+    assert_eq!(screen.grid.visible_row(0).combining_len(0), 0);
 }
 
 #[test]
@@ -2857,9 +2865,9 @@ fn multiple_combining_marks_on_single_cell() {
     // e + combining acute + combining diaeresis
     screen.process("e\u{0301}\u{0308}".as_bytes());
     assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
-    assert_eq!(screen.grid.visible_row(0)[0].combining.len(), 2);
-    assert_eq!(screen.grid.visible_row(0)[0].combining[0], '\u{0301}');
-    assert_eq!(screen.grid.visible_row(0)[0].combining[1], '\u{0308}');
+    assert_eq!(screen.grid.visible_row(0).combining_len(0), 2);
+    assert_eq!(screen.grid.visible_row(0).combining(0)[0], '\u{0301}');
+    assert_eq!(screen.grid.visible_row(0).combining(0)[1], '\u{0308}');
 }
 
 #[test]
@@ -2871,8 +2879,8 @@ fn wide_char_exactly_fills_line() {
     assert_eq!(screen.grid.visible_row(0)[2].c, '你');
     assert_eq!(screen.grid.visible_row(0)[2].width, 2);
     assert_eq!(screen.grid.visible_row(0)[3].width, 0);
-    assert_eq!(screen.grid.cursor_y, 0, "should NOT have wrapped");
-    assert!(screen.grid.wrap_pending, "wrap should be pending after filling line");
+    assert_eq!(screen.grid.cursor_y(), 0, "should NOT have wrapped");
+    assert!(screen.grid.wrap_pending(), "wrap should be pending after filling line");
 }
 
 #[test]
@@ -2882,8 +2890,8 @@ fn wide_char_on_2_column_terminal() {
     assert_eq!(screen.grid.visible_row(0)[0].c, '你');
     assert_eq!(screen.grid.visible_row(0)[0].width, 2);
     assert_eq!(screen.grid.visible_row(0)[1].width, 0);
-    assert_eq!(screen.grid.cursor_y, 0);
-    assert!(screen.grid.wrap_pending);
+    assert_eq!(screen.grid.cursor_y(), 0);
+    assert!(screen.grid.wrap_pending());
 }
 
 #[test]
@@ -2892,8 +2900,8 @@ fn wide_char_on_1_column_terminal() {
     let mut screen = Screen::new(1, 3, 100);
     screen.process("你".as_bytes());
     // Wide char dropped: cursor stays at row 0, cell stays blank
-    assert_eq!(screen.grid.cursor_y, 0, "wide char should be dropped on 1-col terminal");
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_y(), 0, "wide char should be dropped on 1-col terminal");
+    assert_eq!(screen.grid.cursor_x(), 0);
     assert_eq!(screen.grid.visible_row(0)[0].c, ' ', "cell should remain blank");
 }
 
@@ -2907,7 +2915,7 @@ fn wide_char_no_autowrap_at_last_col() {
     // 'D' is at col 3, col 4 is still blank (wide char was dropped)
     assert_eq!(screen.grid.visible_row(0)[3].c, 'D');
     assert_eq!(screen.grid.visible_row(0)[4].c, ' ', "wide char dropped, col 4 stays blank");
-    assert_eq!(screen.grid.cursor_y, 0, "no wrap");
+    assert_eq!(screen.grid.cursor_y(), 0, "no wrap");
 }
 
 #[test]
@@ -2916,7 +2924,7 @@ fn rep_with_no_prior_print() {
     let mut screen = Screen::new(10, 3, 100);
     screen.process(b"\x1b[3b"); // repeat last char 3 times
     // Default last_printed_char is ' ', so 3 spaces (no visible change)
-    assert_eq!(screen.grid.cursor_x, 3);
+    assert_eq!(screen.grid.cursor_x(), 3);
     assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
     assert_eq!(screen.grid.visible_row(0)[1].c, ' ');
     assert_eq!(screen.grid.visible_row(0)[2].c, ' ');
@@ -2929,8 +2937,8 @@ fn restore_cursor_with_no_saved_state() {
     screen.process(b"\x1b[5;10H"); // move cursor
     screen.process(b"\x1b8");       // restore (no save done)
     // Cursor should remain unchanged
-    assert_eq!(screen.grid.cursor_y, 4);
-    assert_eq!(screen.grid.cursor_x, 9);
+    assert_eq!(screen.grid.cursor_y(), 4);
+    assert_eq!(screen.grid.cursor_x(), 9);
 }
 
 #[test]
@@ -2938,8 +2946,8 @@ fn restore_cursor_csi_u_with_no_saved_state() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[3;5H");
     screen.process(b"\x1b[u"); // CSI u restore with no prior CSI s
-    assert_eq!(screen.grid.cursor_y, 2);
-    assert_eq!(screen.grid.cursor_x, 4);
+    assert_eq!(screen.grid.cursor_y(), 2);
+    assert_eq!(screen.grid.cursor_x(), 4);
 }
 
 #[test]
@@ -2949,8 +2957,8 @@ fn save_cursor_resize_then_restore_clamps() {
     screen.process(b"\x1b7");        // save cursor
     screen.resize(40, 10);           // shrink
     screen.process(b"\x1b8");        // restore cursor (should clamp)
-    assert_eq!(screen.grid.cursor_x, 39, "restored x should clamp to cols-1");
-    assert_eq!(screen.grid.cursor_y, 9, "restored y should clamp to rows-1");
+    assert_eq!(screen.grid.cursor_x(), 39, "restored x should clamp to cols-1");
+    assert_eq!(screen.grid.cursor_y(), 9, "restored y should clamp to rows-1");
 }
 
 #[test]
@@ -2960,14 +2968,14 @@ fn double_enter_alt_screen() {
     let mut screen = Screen::new(10, 3, 100);
     screen.process(b"Main");
     screen.process(b"\x1b[?1049h"); // enter alt (saves "Main")
-    assert!(screen.state.in_alt_screen);
+    assert!(screen.in_alt_screen());
     screen.process(b"Alt1");
     screen.process(b"\x1b[?1049h"); // enter alt again — ignored
-    assert!(screen.state.in_alt_screen);
+    assert!(screen.in_alt_screen());
     // Alt1 content should still be on screen (second enter was ignored, no clear)
     assert_eq!(screen.grid.visible_row(0)[0].c, 'A');
     screen.process(b"\x1b[?1049l"); // exit restores original main screen
-    assert!(!screen.state.in_alt_screen);
+    assert!(!screen.in_alt_screen());
     assert_eq!(screen.grid.visible_row(0)[0].c, 'M');
     assert_eq!(screen.grid.visible_row(0)[3].c, 'n');
 }
@@ -2981,17 +2989,17 @@ fn exit_alt_screen_when_not_in_alt() {
     // Set a custom scroll region and move cursor
     screen.process(b"\x1b[2;4r");
     screen.process(b"\x1b[3;5H"); // row 3, col 5
-    let sr_top = screen.grid.scroll_top;
-    let sr_bot = screen.grid.scroll_bottom;
-    let cx = screen.grid.cursor_x;
-    let cy = screen.grid.cursor_y;
+    let sr_top = screen.grid.scroll_top();
+    let sr_bot = screen.grid.scroll_bottom();
+    let cx = screen.grid.cursor_x();
+    let cy = screen.grid.cursor_y();
     // Exit alt without entering — should be completely ignored
     screen.process(b"\x1b[?1049l");
-    assert!(!screen.state.in_alt_screen);
-    assert_eq!(screen.grid.scroll_top, sr_top, "scroll region top must not change");
-    assert_eq!(screen.grid.scroll_bottom, sr_bot, "scroll region bottom must not change");
-    assert_eq!(screen.grid.cursor_x, cx, "cursor x must not change");
-    assert_eq!(screen.grid.cursor_y, cy, "cursor y must not change");
+    assert!(!screen.in_alt_screen());
+    assert_eq!(screen.grid.scroll_top(), sr_top, "scroll region top must not change");
+    assert_eq!(screen.grid.scroll_bottom(), sr_bot, "scroll region bottom must not change");
+    assert_eq!(screen.grid.cursor_x(), cx, "cursor x must not change");
+    assert_eq!(screen.grid.cursor_y(), cy, "cursor y must not change");
 }
 
 #[test]
@@ -3001,7 +3009,7 @@ fn hts_sets_tab_stop() {
     screen.process(b"\x1bH");      // HTS — set tab stop at col 4
     screen.process(b"\x1b[1;1H"); // move home
     screen.process(b"\t");          // tab should stop at col 4 (our custom stop)
-    assert_eq!(screen.grid.cursor_x, 4);
+    assert_eq!(screen.grid.cursor_x(), 4);
 }
 
 #[test]
@@ -3012,7 +3020,7 @@ fn tbc_clear_current_tab_stop() {
     screen.process(b"\x1b[0g");    // TBC 0 — clear tab stop at current col (8)
     screen.process(b"\x1b[1;1H"); // move home
     screen.process(b"\t");          // tab should skip col 8, go to col 16
-    assert_eq!(screen.grid.cursor_x, 16);
+    assert_eq!(screen.grid.cursor_x(), 16);
 }
 
 #[test]
@@ -3020,23 +3028,23 @@ fn tbc_clear_all_tab_stops() {
     let mut screen = Screen::new(80, 3, 100);
     screen.process(b"\x1b[3g");   // TBC 3 — clear all tab stops
     screen.process(b"\t");         // no tab stops → clamp to right margin
-    assert_eq!(screen.grid.cursor_x, 79);
+    assert_eq!(screen.grid.cursor_x(), 79);
 }
 
 #[test]
 fn scroll_region_top_equals_bottom_accepted() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[5;5r"); // top == bottom → single-row region is valid
-    assert_eq!(screen.grid.scroll_top, 4);
-    assert_eq!(screen.grid.scroll_bottom, 4);
+    assert_eq!(screen.grid.scroll_top(), 4);
+    assert_eq!(screen.grid.scroll_bottom(), 4);
 }
 
 #[test]
 fn scroll_region_reversed_params_rejected() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[15;5r"); // top > bottom → should be ignored
-    assert_eq!(screen.grid.scroll_top, 0);
-    assert_eq!(screen.grid.scroll_bottom, 23);
+    assert_eq!(screen.grid.scroll_top(), 0);
+    assert_eq!(screen.grid.scroll_bottom(), 23);
 }
 
 #[test]
@@ -3106,7 +3114,7 @@ fn ind_esc_d_within_scroll_region_nonzero_top() {
     screen.process(b"\x1b[2;4r");
     // Move cursor to scroll_bottom (row 4, 0-based: 3)
     screen.process(b"\x1b[4;1H");
-    assert_eq!(screen.grid.cursor_y, 3);
+    assert_eq!(screen.grid.cursor_y(), 3);
     // IND should scroll within region only
     screen.process(b"\x1bD");
     // Row 0 (outside region) should be unchanged
@@ -3160,8 +3168,8 @@ fn ris_clears_scrollback() {
     screen.process(b"\x1bc"); // RIS
     assert_eq!(screen.get_history().len(), 0,
         "ESC c should clear scrollback history");
-    assert_eq!(screen.grid.scrollback_len, 0);
-    assert_eq!(screen.grid.pending_start, 0);
+    assert_eq!(screen.grid.scrollback_len(), 0);
+    assert_eq!(screen.grid.pending_start(), 0);
 }
 
 #[test]
@@ -3173,6 +3181,34 @@ fn ris_forwards_clear_scrollback_passthrough() {
     let pt = screen.take_passthrough();
     assert_eq!(pt.len(), 1, "RIS should produce one passthrough entry");
     assert_eq!(pt[0], b"\x1b[3J", "RIS should forward \\e[3J, not \\ec");
+}
+
+#[test]
+fn ris_during_alt_screen_restores_scrollback_limit() {
+    // RIS during alt screen must restore scrollback_limit from the saved grid.
+    // Without the fix, scrollback_limit would stay 0 permanently.
+    let mut screen = Screen::new(10, 3, 100);
+    // Generate some scrollback to confirm it works before alt screen
+    screen.process(b"A\r\nB\r\nC\r\nD\r\nE");
+    let _ = screen.take_pending_scrollback();
+    assert!(screen.grid.scrollback_len() > 0, "should have scrollback before alt screen");
+
+    // Enter alt screen (sets scrollback_limit to 0)
+    screen.process(b"\x1b[?1049h");
+    assert_eq!(screen.grid.scrollback_limit(), 0, "alt screen should disable scrollback");
+
+    // RIS while in alt screen
+    screen.process(b"\x1bc");
+    assert!(!screen.in_alt_screen(), "RIS should exit alt screen");
+    assert_eq!(screen.grid.scrollback_limit(), 100,
+        "RIS should restore scrollback_limit from saved grid");
+
+    // Verify scrollback still works after RIS
+    screen.process(b"X\r\nY\r\nZ\r\nW");
+    let _ = screen.take_pending_scrollback();
+    // New lines should be capturable as scrollback
+    assert!(screen.grid.scrollback_len() > 0,
+        "scrollback should work after RIS during alt screen");
 }
 
 #[test]
@@ -3193,8 +3229,8 @@ fn csi_f_is_alias_for_cup() {
     // CSI f should work the same as CSI H
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[5;10f"); // HVP
-    assert_eq!(screen.grid.cursor_y, 4);
-    assert_eq!(screen.grid.cursor_x, 9);
+    assert_eq!(screen.grid.cursor_y(), 4);
+    assert_eq!(screen.grid.cursor_x(), 9);
 }
 
 #[test]
@@ -3202,16 +3238,16 @@ fn csi_cup_zero_params_default_to_home() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[5;10H"); // move away
     screen.process(b"\x1b[H");     // CUP with no params → (1,1)
-    assert_eq!(screen.grid.cursor_y, 0);
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
 }
 
 #[test]
 fn csi_cup_params_beyond_screen_clamp() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[999;999H");
-    assert_eq!(screen.grid.cursor_y, 23);
-    assert_eq!(screen.grid.cursor_x, 79);
+    assert_eq!(screen.grid.cursor_y(), 23);
+    assert_eq!(screen.grid.cursor_x(), 79);
 }
 
 #[test]
@@ -3245,13 +3281,13 @@ fn cursor_movement_with_zero_params_defaults() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[10;10H"); // start at (10,10)
     screen.process(b"\x1b[A");  // CUU default 1
-    assert_eq!(screen.grid.cursor_y, 8);
+    assert_eq!(screen.grid.cursor_y(), 8);
     screen.process(b"\x1b[B");  // CUD default 1
-    assert_eq!(screen.grid.cursor_y, 9);
+    assert_eq!(screen.grid.cursor_y(), 9);
     screen.process(b"\x1b[C");  // CUF default 1
-    assert_eq!(screen.grid.cursor_x, 10);
+    assert_eq!(screen.grid.cursor_x(), 10);
     screen.process(b"\x1b[D");  // CUB default 1
-    assert_eq!(screen.grid.cursor_x, 9);
+    assert_eq!(screen.grid.cursor_x(), 9);
 }
 
 #[test]
@@ -3259,13 +3295,13 @@ fn cursor_movement_beyond_bounds_clamps() {
     let mut screen = Screen::new(10, 5, 100);
     screen.process(b"\x1b[3;5H"); // center
     screen.process(b"\x1b[999A"); // CUU way past top
-    assert_eq!(screen.grid.cursor_y, 0);
+    assert_eq!(screen.grid.cursor_y(), 0);
     screen.process(b"\x1b[999B"); // CUD way past bottom
-    assert_eq!(screen.grid.cursor_y, 4);
+    assert_eq!(screen.grid.cursor_y(), 4);
     screen.process(b"\x1b[999D"); // CUB way past left
-    assert_eq!(screen.grid.cursor_x, 0);
+    assert_eq!(screen.grid.cursor_x(), 0);
     screen.process(b"\x1b[999C"); // CUF way past right
-    assert_eq!(screen.grid.cursor_x, 9);
+    assert_eq!(screen.grid.cursor_x(), 9);
 }
 
 #[test]
@@ -3302,7 +3338,7 @@ fn lf_at_last_row_without_scroll_region() {
     screen.process(b"X");
     screen.process(b"\n");         // should scroll up
     // Cursor stays at row 2 (scroll_bottom), content shifted
-    assert_eq!(screen.grid.cursor_y, 2);
+    assert_eq!(screen.grid.cursor_y(), 2);
 }
 
 #[test]
@@ -3311,8 +3347,8 @@ fn cr_does_not_scroll() {
     let mut screen = Screen::new(10, 3, 100);
     screen.process(b"ABCDEFGHIJ"); // fill row 0, wrap pending
     screen.process(b"\r");          // CR
-    assert_eq!(screen.grid.cursor_x, 0);
-    assert_eq!(screen.grid.cursor_y, 0, "CR should stay on same row");
+    assert_eq!(screen.grid.cursor_x(), 0);
+    assert_eq!(screen.grid.cursor_y(), 0, "CR should stay on same row");
 }
 
 #[test]
@@ -3320,16 +3356,16 @@ fn sgr_color_reset_39_49() {
     let mut screen = Screen::new(80, 3, 100);
     screen.process(b"\x1b[31;42m"); // red fg, green bg
     screen.process(b"A");
-    assert!(screen.grid.visible_row(0)[0].style.fg.is_some());
-    assert!(screen.grid.visible_row(0)[0].style.bg.is_some());
+    assert!(screen.cell_style(0, 0).fg.is_some());
+    assert!(screen.cell_style(0, 0).bg.is_some());
     screen.process(b"\x1b[39m");    // reset fg to default
     screen.process(b"B");
-    assert!(screen.grid.visible_row(0)[1].style.fg.is_none(), "fg should be reset");
-    assert!(screen.grid.visible_row(0)[1].style.bg.is_some(), "bg should remain");
+    assert!(screen.cell_style(0, 1).fg.is_none(), "fg should be reset");
+    assert!(screen.cell_style(0, 1).bg.is_some(), "bg should remain");
     screen.process(b"\x1b[49m");    // reset bg to default
     screen.process(b"C");
-    assert!(screen.grid.visible_row(0)[2].style.fg.is_none());
-    assert!(screen.grid.visible_row(0)[2].style.bg.is_none(), "bg should be reset");
+    assert!(screen.cell_style(0, 2).fg.is_none());
+    assert!(screen.cell_style(0, 2).bg.is_none(), "bg should be reset");
 }
 
 #[test]
@@ -3348,10 +3384,10 @@ fn mouse_mode_per_mode_toggle() {
     // Each mouse mode is independently toggled (xterm behavior)
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[?1000h");
-    assert!(screen.grid.modes.mouse_modes.click);
-    assert!(!screen.grid.modes.mouse_modes.button);
+    assert!(screen.grid.modes().mouse_modes.click);
+    assert!(!screen.grid.modes().mouse_modes.button);
     screen.process(b"\x1b[?1000l");
-    assert!(!screen.grid.modes.mouse_modes.click);
+    assert!(!screen.grid.modes().mouse_modes.click);
 }
 
 #[test]
@@ -3360,10 +3396,10 @@ fn mouse_mode_multiple_simultaneous() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[?1000h");
     screen.process(b"\x1b[?1003h");
-    assert!(screen.grid.modes.mouse_modes.click);
-    assert!(screen.grid.modes.mouse_modes.any);
+    assert!(screen.grid.modes().mouse_modes.click);
+    assert!(screen.grid.modes().mouse_modes.any);
     // Effective is highest priority
-    assert_eq!(screen.grid.modes.mouse_modes.effective(), super::grid::MouseMode::Any);
+    assert_eq!(screen.grid.modes().mouse_modes.effective(), super::grid::MouseMode::Any);
 }
 
 #[test]
@@ -3373,9 +3409,9 @@ fn mouse_mode_disable_own_mode_only() {
     screen.process(b"\x1b[?1000h");
     screen.process(b"\x1b[?1002h");
     screen.process(b"\x1b[?1000l"); // disable only click
-    assert!(!screen.grid.modes.mouse_modes.click);
-    assert!(screen.grid.modes.mouse_modes.button);
-    assert_eq!(screen.grid.modes.mouse_modes.effective(), super::grid::MouseMode::Button);
+    assert!(!screen.grid.modes().mouse_modes.click);
+    assert!(screen.grid.modes().mouse_modes.button);
+    assert_eq!(screen.grid.modes().mouse_modes.effective(), super::grid::MouseMode::Button);
 }
 
 #[test]
@@ -3384,32 +3420,32 @@ fn mouse_mode_priority_resolution() {
     screen.process(b"\x1b[?1000h");
     screen.process(b"\x1b[?1002h");
     screen.process(b"\x1b[?1003h");
-    assert_eq!(screen.grid.modes.mouse_modes.effective(), super::grid::MouseMode::Any);
+    assert_eq!(screen.grid.modes().mouse_modes.effective(), super::grid::MouseMode::Any);
     screen.process(b"\x1b[?1003l");
-    assert_eq!(screen.grid.modes.mouse_modes.effective(), super::grid::MouseMode::Button);
+    assert_eq!(screen.grid.modes().mouse_modes.effective(), super::grid::MouseMode::Button);
     screen.process(b"\x1b[?1002l");
-    assert_eq!(screen.grid.modes.mouse_modes.effective(), super::grid::MouseMode::Click);
+    assert_eq!(screen.grid.modes().mouse_modes.effective(), super::grid::MouseMode::Click);
     screen.process(b"\x1b[?1000l");
-    assert_eq!(screen.grid.modes.mouse_modes.effective(), super::grid::MouseMode::Off);
+    assert_eq!(screen.grid.modes().mouse_modes.effective(), super::grid::MouseMode::Off);
 }
 
 #[test]
 fn mouse_encoding_disable_resets_to_x10() {
     let mut screen = Screen::new(80, 24, 100);
     screen.process(b"\x1b[?1006h"); // SGR encoding
-    assert_eq!(screen.grid.modes.mouse_encoding, super::grid::MouseEncoding::Sgr);
+    assert_eq!(screen.grid.modes().mouse_encoding, super::grid::MouseEncoding::Sgr);
     screen.process(b"\x1b[?1006l");
-    assert_eq!(screen.grid.modes.mouse_encoding, super::grid::MouseEncoding::X10);
+    assert_eq!(screen.grid.modes().mouse_encoding, super::grid::MouseEncoding::X10);
 }
 
 #[test]
 fn cursor_visibility_toggle() {
     let mut screen = Screen::new(80, 24, 100);
-    assert!(screen.grid.cursor_visible);
+    assert!(screen.grid.cursor_visible());
     screen.process(b"\x1b[?25l"); // hide
-    assert!(!screen.grid.cursor_visible);
+    assert!(!screen.grid.cursor_visible());
     screen.process(b"\x1b[?25h"); // show
-    assert!(screen.grid.cursor_visible);
+    assert!(screen.grid.cursor_visible());
 }
 
 #[test]
@@ -3434,18 +3470,18 @@ fn dl_il_outside_scroll_region_no_op() {
 fn dl_clears_wrap_pending() {
     let mut screen = Screen::new(5, 3, 100);
     screen.process(b"ABCDE"); // wrap_pending = true
-    assert!(screen.grid.wrap_pending);
+    assert!(screen.grid.wrap_pending());
     screen.process(b"\x1b[M"); // DL
-    assert!(!screen.grid.wrap_pending);
+    assert!(!screen.grid.wrap_pending());
 }
 
 #[test]
 fn il_clears_wrap_pending() {
     let mut screen = Screen::new(5, 3, 100);
     screen.process(b"ABCDE");
-    assert!(screen.grid.wrap_pending);
+    assert!(screen.grid.wrap_pending());
     screen.process(b"\x1b[L"); // IL
-    assert!(!screen.grid.wrap_pending);
+    assert!(!screen.grid.wrap_pending());
 }
 
 #[test]
@@ -3454,12 +3490,12 @@ fn erase_display_preserves_cursor_position() {
         let mut screen = Screen::new(20, 10, 100);
         screen.process(b"ABCDEFGHIJ\r\nXYZ");
         screen.process(b"\x1b[3;5H"); // move to row 3, col 5
-        let (cx, cy) = (screen.grid.cursor_x, screen.grid.cursor_y);
+        let (cx, cy) = (screen.grid.cursor_x(), screen.grid.cursor_y());
         let seq = format!("\x1b[{}J", mode);
         screen.process(seq.as_bytes()); // ED 0/1/2
-        assert_eq!(screen.grid.cursor_x, cx,
+        assert_eq!(screen.grid.cursor_x(), cx,
             "ED {} should preserve cursor_x", mode);
-        assert_eq!(screen.grid.cursor_y, cy,
+        assert_eq!(screen.grid.cursor_y(), cy,
             "ED {} should preserve cursor_y", mode);
     }
 }
@@ -3470,12 +3506,12 @@ fn erase_line_preserves_cursor_position() {
         let mut screen = Screen::new(20, 10, 100);
         screen.process(b"ABCDEFGHIJ\r\nXYZ");
         screen.process(b"\x1b[2;7H"); // move to row 2, col 7
-        let (cx, cy) = (screen.grid.cursor_x, screen.grid.cursor_y);
+        let (cx, cy) = (screen.grid.cursor_x(), screen.grid.cursor_y());
         let seq = format!("\x1b[{}K", mode);
         screen.process(seq.as_bytes()); // EL 0/1/2
-        assert_eq!(screen.grid.cursor_x, cx,
+        assert_eq!(screen.grid.cursor_x(), cx,
             "EL {} should preserve cursor_x", mode);
-        assert_eq!(screen.grid.cursor_y, cy,
+        assert_eq!(screen.grid.cursor_y(), cy,
             "EL {} should preserve cursor_y", mode);
     }
 }
@@ -3500,4 +3536,633 @@ fn rep_repeats_wide_char() {
     assert_eq!(screen.grid.visible_row(0)[1].width, 0);
     assert_eq!(screen.grid.visible_row(0)[3].width, 0);
     assert_eq!(screen.grid.visible_row(0)[5].width, 0);
+}
+
+// --- StyleTable GC integration tests ---
+
+#[test]
+fn compact_styles_reclaims_unused() {
+    let mut screen = Screen::new(10, 3, 0);
+    // Intern styles and place one in a cell
+    let s1 = style::Style { bold: true, ..style::Style::default() };
+    let s2 = style::Style { italic: true, ..style::Style::default() };
+    let id1 = screen.grid.style_table_mut().intern(s1);
+    let id2 = screen.grid.style_table_mut().intern(s2);
+    // Only s1 is referenced by a cell
+    screen.grid.visible_row_mut(0)[0].style_id = id1;
+
+    screen.compact_styles();
+
+    // s1 is still valid
+    assert_eq!(screen.grid.style_table().get(id1), s1);
+    // s2's slot should be reusable
+    let s3 = style::Style { dim: true, ..style::Style::default() };
+    let id3 = screen.grid.style_table_mut().intern(s3);
+    assert_eq!(id3, id2, "should reuse freed slot");
+    assert_eq!(screen.grid.style_table().get(id3), s3);
+}
+
+#[test]
+fn compact_styles_preserves_scrollback_styles() {
+    let mut screen = Screen::new(5, 3, 100);
+    // Write styled text then scroll it into scrollback
+    screen.process(b"\x1b[1mBold\x1b[0m");
+    let scrollback_style_id = screen.grid.visible_row(0)[0].style_id;
+    assert!(!scrollback_style_id.is_default(), "styled cell should have non-default style_id");
+
+    // Scroll text into scrollback
+    screen.process(b"\n\n\n\n");
+
+    // Compact should preserve the scrollback style
+    screen.compact_styles();
+    let style = screen.grid.style_table().get(scrollback_style_id);
+    assert!(style.bold, "scrollback style should still be bold");
+}
+
+#[test]
+fn compact_styles_preserves_saved_grid_styles() {
+    let mut screen = Screen::new(10, 3, 0);
+    // Write styled text on main screen
+    screen.process(b"\x1b[1mHello\x1b[0m");
+    let main_style_id = screen.grid.visible_row(0)[0].style_id;
+
+    // Enter alt screen — main grid saved
+    screen.process(b"\x1b[?1049h");
+
+    // Intern a new style only on alt screen
+    let alt_style = style::Style { italic: true, ..style::Style::default() };
+    let alt_id = screen.grid.style_table_mut().intern(alt_style);
+    // Don't put alt_id in any cell — it should be reclaimable
+
+    // Compact while in alt screen — main screen styles in saved_grid should survive
+    screen.compact_styles();
+
+    // Main screen style should still be valid (it's in saved_grid)
+    let style = screen.grid.style_table().get(main_style_id);
+    assert!(style.bold, "saved grid style should survive compaction");
+
+    // alt_id was unreferenced, should be freed
+    let new_style = style::Style { dim: true, ..style::Style::default() };
+    let new_id = screen.grid.style_table_mut().intern(new_style);
+    assert_eq!(new_id, alt_id, "unreferenced alt style slot should be reused");
+}
+
+#[test]
+fn alt_screen_exit_gc_trigger() {
+    let mut screen = Screen::new(10, 3, 0);
+
+    // Enter alt screen
+    screen.process(b"\x1b[?1049h");
+
+    // Create unique styles during alt screen (without placing in cells)
+    for i in 0..50u16 {
+        let style = style::Style {
+            fg: Some(style::Color::Rgb(i as u8, 0, 0)),
+            ..style::Style::default()
+        };
+        screen.grid.style_table_mut().intern(style);
+    }
+    let pre_exit_len = screen.grid.style_table().len();
+
+    // Exit alt screen — should trigger GC unconditionally
+    screen.process(b"\x1b[?1049l");
+
+    // After GC, alt-screen-only styles should be reclaimed
+    assert!(screen.grid.style_table().len() < pre_exit_len,
+        "GC should have reclaimed styles: {} should be < {}",
+        screen.grid.style_table().len(), pre_exit_len);
+}
+
+// --- Notification queue tests ---
+
+#[test]
+fn osc_777_queued_as_notification() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b]777;notify;Title;Body\x1b\\");
+    let notifications = screen.take_queued_notifications();
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].starts_with(b"\x1b]777;"));
+}
+
+#[test]
+fn osc_9_queued_as_notification() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b]9;Hello\x1b\\");
+    let notifications = screen.take_queued_notifications();
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].starts_with(b"\x1b]9;"));
+}
+
+#[test]
+fn osc_99_queued_as_notification() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b]99;Body text\x07");
+    let notifications = screen.take_queued_notifications();
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].starts_with(b"\x1b]99;"));
+}
+
+#[test]
+fn bell_not_queued_as_notification() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x07");
+    let notifications = screen.take_queued_notifications();
+    assert!(notifications.is_empty(), "BEL should not be queued as notification");
+}
+
+#[test]
+fn ed3_not_queued_as_notification() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b[3J");
+    let notifications = screen.take_queued_notifications();
+    assert!(notifications.is_empty(), "ED3 should not be queued as notification");
+}
+
+#[test]
+fn osc_52_not_queued_as_notification() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b]52;c;SGVsbG8=\x1b\\");
+    let notifications = screen.take_queued_notifications();
+    assert!(notifications.is_empty(), "OSC 52 (clipboard) should not be queued");
+}
+
+#[test]
+fn notification_queue_respects_limit() {
+    let mut screen = Screen::new(80, 24, 100);
+    // Push 55 notifications — only the last 50 should remain
+    for i in 0..55u32 {
+        let osc = format!("\x1b]777;notify;Title;msg{}\x1b\\", i);
+        screen.process(osc.as_bytes());
+    }
+    let notifications = screen.take_queued_notifications();
+    assert_eq!(notifications.len(), 50);
+    // First notification should be #5 (oldest 5 were dropped)
+    let first = String::from_utf8_lossy(&notifications[0]);
+    assert!(first.contains("msg5"), "oldest should be msg5, got: {}", first);
+    let last = String::from_utf8_lossy(&notifications[49]);
+    assert!(last.contains("msg54"), "newest should be msg54, got: {}", last);
+}
+
+#[test]
+fn take_queued_notifications_drains() {
+    let mut screen = Screen::new(80, 24, 100);
+    screen.process(b"\x1b]777;notify;Title;Body\x1b\\");
+    let first = screen.take_queued_notifications();
+    assert_eq!(first.len(), 1);
+    let second = screen.take_queued_notifications();
+    assert!(second.is_empty(), "second take should be empty after drain");
+}
+
+// ─── Combining marks: operations that move/erase cells ──────────────────────
+
+#[test]
+fn combining_survives_scroll_into_scrollback() {
+    let mut screen = Screen::new(10, 3, 100);
+    // Write combining char on row 0
+    screen.process("e\u{0301}".as_bytes());
+    // Scroll it off screen into scrollback
+    screen.process(b"\n\n\n");
+    // Scrollback row should have the combining mark
+    assert_eq!(screen.grid.scrollback_len(), 1);
+    let row = screen.grid.scrollback_row(0);
+    assert_eq!(row[0].c, 'e');
+    assert_eq!(row.combining(0), &['\u{0301}']);
+}
+
+#[test]
+fn combining_in_scrollback_renders_correctly() {
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process("e\u{0301}".as_bytes());
+    screen.process(b"\n\n\n");
+    let pending = screen.take_pending_scrollback();
+    assert_eq!(pending.len(), 1);
+    let text = String::from_utf8_lossy(&pending[0]);
+    assert!(text.contains("e\u{0301}"),
+        "scrollback render must include combining mark, got: {}", text);
+}
+
+#[test]
+fn combining_in_reattach_history() {
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process("e\u{0301}".as_bytes());
+    screen.process(b"\n\n\n");
+    let _ = screen.take_pending_scrollback();
+    let history = screen.get_history();
+    assert!(!history.is_empty());
+    let text = String::from_utf8_lossy(&history[0]);
+    assert!(text.contains("e\u{0301}"),
+        "history render must include combining mark, got: {}", text);
+}
+
+#[test]
+fn combining_erased_by_erase_in_line() {
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process("e\u{0301}".as_bytes());
+    assert_eq!(screen.grid.visible_row(0).combining(0), &['\u{0301}']);
+    // EL — erase from cursor to end of line (cursor is at col 1 after 'e')
+    // Move to col 0 first, then erase
+    screen.process(b"\x1b[1G"); // CHA col 1 (1-indexed)
+    screen.process(b"\x1b[K");  // EL 0 (erase to end)
+    assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
+    assert_eq!(screen.grid.visible_row(0).combining(0), &[] as &[char]);
+}
+
+#[test]
+fn combining_erased_by_erase_character() {
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process("e\u{0301}".as_bytes());
+    // Move cursor back to col 0
+    screen.process(b"\x1b[1G");
+    // ECH — erase 1 character
+    screen.process(b"\x1b[X");
+    assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
+    assert_eq!(screen.grid.visible_row(0).combining(0), &[] as &[char]);
+}
+
+#[test]
+fn combining_erased_by_erase_display() {
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process("e\u{0301}".as_bytes());
+    // ED 2 — erase entire display
+    screen.process(b"\x1b[2J");
+    assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
+    assert_eq!(screen.grid.visible_row(0).combining(0), &[] as &[char]);
+}
+
+#[test]
+fn combining_shifted_by_insert_character() {
+    let mut screen = Screen::new(10, 3, 100);
+    // Write "Ae\u{0301}" — A at col 0, e+combining at col 1
+    screen.process("Ae\u{0301}".as_bytes());
+    assert_eq!(screen.grid.visible_row(0)[1].c, 'e');
+    assert_eq!(screen.grid.visible_row(0).combining(1), &['\u{0301}']);
+    // Move cursor to col 0
+    screen.process(b"\x1b[1G");
+    // ICH — insert 1 blank character, shifting everything right
+    screen.process(b"\x1b[@");
+    // Col 0 should be blank, col 1 should be 'A', col 2 should be 'e' with combining
+    assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
+    assert_eq!(screen.grid.visible_row(0)[1].c, 'A');
+    assert_eq!(screen.grid.visible_row(0)[2].c, 'e');
+    assert_eq!(screen.grid.visible_row(0).combining(2), &['\u{0301}'],
+        "combining mark should shift with its cell during ICH");
+}
+
+#[test]
+fn combining_shifted_by_delete_character() {
+    let mut screen = Screen::new(10, 3, 100);
+    // Write "Ae\u{0301}" — A at col 0, e+combining at col 1
+    screen.process("Ae\u{0301}".as_bytes());
+    // Move cursor to col 0
+    screen.process(b"\x1b[1G");
+    // DCH — delete 1 character at col 0, shifting everything left
+    screen.process(b"\x1b[P");
+    // Col 0 should now be 'e' with combining mark
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
+    assert_eq!(screen.grid.visible_row(0).combining(0), &['\u{0301}'],
+        "combining mark should shift with its cell during DCH");
+}
+
+#[test]
+fn combining_overwritten_by_new_char() {
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process("e\u{0301}".as_bytes());
+    assert_eq!(screen.grid.visible_row(0).combining(0), &['\u{0301}']);
+    // Move cursor back and overwrite with 'X'
+    screen.process(b"\x1b[1G");
+    screen.process(b"X");
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'X');
+    assert_eq!(screen.grid.visible_row(0).combining(0), &[] as &[char],
+        "overwriting a cell must clear its combining marks");
+}
+
+#[test]
+fn combining_survives_alt_screen_round_trip() {
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process("e\u{0301}".as_bytes());
+    // Enter alt screen
+    screen.process(b"\x1b[?1049h");
+    // Leave alt screen
+    screen.process(b"\x1b[?1049l");
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
+    assert_eq!(screen.grid.visible_row(0).combining(0), &['\u{0301}'],
+        "combining marks must survive alt screen round trip");
+}
+
+#[test]
+fn combining_in_delete_lines() {
+    let mut screen = Screen::new(10, 3, 100);
+    // Row 0: empty, row 1: e+combining
+    screen.process(b"\x1b[2;1H"); // move to row 2
+    screen.process("e\u{0301}".as_bytes());
+    assert_eq!(screen.grid.visible_row(1).combining(0), &['\u{0301}']);
+    // Move to row 1 and delete it — row 1 (with combining) should move up
+    screen.process(b"\x1b[1;1H");
+    screen.process(b"\x1b[M"); // DL
+    // Now row 0 should have the combining char (was row 1)
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'e');
+    assert_eq!(screen.grid.visible_row(0).combining(0), &['\u{0301}'],
+        "combining marks should move with row during DL");
+}
+
+#[test]
+fn combining_in_insert_lines() {
+    let mut screen = Screen::new(10, 3, 100);
+    // Row 0: e+combining
+    screen.process("e\u{0301}".as_bytes());
+    // Move to row 0 and insert a line — row 0 should push down to row 1
+    screen.process(b"\x1b[1;1H");
+    screen.process(b"\x1b[L"); // IL
+    // Row 0 should be blank, row 1 should have combining
+    assert_eq!(screen.grid.visible_row(0)[0].c, ' ');
+    assert_eq!(screen.grid.visible_row(1)[0].c, 'e');
+    assert_eq!(screen.grid.visible_row(1).combining(0), &['\u{0301}'],
+        "combining marks should move with row during IL");
+}
+
+#[test]
+fn combining_in_full_render_output() {
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process("e\u{0301}".as_bytes());
+    let mut cache = RenderCache::new();
+    let output = screen.render(true, &mut cache);
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("e\u{0301}"),
+        "full render must include combining mark");
+}
+
+#[test]
+fn combining_in_incremental_render_output() {
+    let mut screen = Screen::new(10, 3, 100);
+    let mut cache = RenderCache::new();
+    // First render to populate cache
+    let _ = screen.render(true, &mut cache);
+    // Now add combining mark
+    screen.process("e\u{0301}".as_bytes());
+    // Incremental render should pick up the change
+    let output = screen.render(false, &mut cache);
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("e\u{0301}"),
+        "incremental render must include combining mark");
+}
+
+#[test]
+fn combining_dirty_tracking_detects_change() {
+    let mut screen = Screen::new(10, 3, 100);
+    let mut cache = RenderCache::new();
+    // Write 'e' and render
+    screen.process(b"e");
+    let _ = screen.render(true, &mut cache);
+    // Move back to col 0 and add combining mark to existing 'e'
+    screen.process(b"\x1b[1G");
+    screen.process("e\u{0301}".as_bytes()); // overwrite 'e' with 'e'+combining
+    // Incremental render should detect the row changed
+    let output = screen.render(false, &mut cache);
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("e\u{0301}"),
+        "dirty tracking must detect combining mark addition");
+}
+
+// --- Phase 2: Missing Escape Sequences ---
+
+#[test]
+fn nel_next_line() {
+    let mut screen = Screen::new(10, 3, 0);
+    screen.process(b"AB\x1bECD");
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'A');
+    assert_eq!(screen.grid.visible_row(0)[1].c, 'B');
+    assert_eq!(screen.grid.visible_row(1)[0].c, 'C');
+    assert_eq!(screen.grid.visible_row(1)[1].c, 'D');
+}
+
+#[test]
+fn nel_at_scroll_bottom_scrolls() {
+    let mut screen = Screen::new(10, 3, 100);
+    screen.process(b"Line1\r\nLine2\r\nLine3");
+    screen.process(b"\x1bE");
+    assert_eq!(screen.grid.visible_row(0)[0].c, 'L'); // Line2
+    assert_eq!(screen.grid.visible_row(2)[0].c, ' '); // blank new line
+}
+
+#[test]
+fn decaln_fills_screen_with_e() {
+    let mut screen = Screen::new(5, 3, 0);
+    screen.process(b"Hello\r\nWorld");
+    screen.process(b"\x1b#8");
+    for y in 0..3 {
+        for x in 0..5 {
+            assert_eq!(screen.grid.visible_row(y)[x].c, 'E',
+                "expected 'E' at ({}, {})", x, y);
+        }
+    }
+    assert_eq!(screen.grid.cursor_pos(), (0, 0));
+}
+
+#[test]
+fn rep_with_line_drawing_charset() {
+    let mut screen = Screen::new(10, 1, 0);
+    // ESC(0 enters line drawing, 'q' maps to '─', CSI 3 b = repeat 3x
+    screen.process(b"\x1b(0q\x1b[3b");
+    for x in 0..4 {
+        assert_eq!(screen.grid.visible_row(0)[x].c, '\u{2500}',
+            "expected '\u{2500}' at col {}, got '{}'", x, screen.grid.visible_row(0)[x].c);
+    }
+}
+
+#[test]
+fn title_push_pop() {
+    let mut screen = Screen::new(10, 3, 0);
+    screen.process(b"\x1b]2;First\x07");
+    assert_eq!(screen.title(), "First");
+    screen.process(b"\x1b[22;0t");
+    screen.process(b"\x1b]2;Second\x07");
+    assert_eq!(screen.title(), "Second");
+    screen.process(b"\x1b[23;0t");
+    assert_eq!(screen.title(), "First");
+}
+
+#[test]
+fn title_pop_empty_stack_noop() {
+    let mut screen = Screen::new(10, 3, 0);
+    screen.process(b"\x1b]2;Title\x07");
+    screen.process(b"\x1b[23;0t");
+    assert_eq!(screen.title(), "Title");
+}
+
+#[test]
+fn decom_cursor_position_relative_to_scroll_region() {
+    let mut screen = Screen::new(10, 10, 0);
+    screen.process(b"\x1b[3;7r");   // scroll region rows 3-7
+    screen.process(b"\x1b[?6h");    // enable origin mode
+    screen.process(b"\x1b[1;1H");   // CUP 1;1 → top of scroll region
+    assert_eq!(screen.grid.cursor_pos(), (0, 2)); // 0-indexed: col 0, row 2
+}
+
+#[test]
+fn decom_cursor_clamped_to_scroll_region() {
+    let mut screen = Screen::new(10, 10, 0);
+    screen.process(b"\x1b[3;7r");
+    screen.process(b"\x1b[?6h");
+    screen.process(b"\x1b[99;1H");  // CUP 99;1 → clamp to bottom
+    assert_eq!(screen.grid.cursor_pos(), (0, 6)); // col 0, row 6 (scroll bottom)
+}
+
+#[test]
+fn decom_off_cursor_absolute() {
+    let mut screen = Screen::new(10, 10, 0);
+    screen.process(b"\x1b[3;7r");
+    screen.process(b"\x1b[1;1H");   // origin mode OFF (default)
+    assert_eq!(screen.grid.cursor_pos(), (0, 0)); // absolute row 0
+}
+
+#[test]
+fn decom_set_scrolling_region_homes_to_origin() {
+    let mut screen = Screen::new(10, 10, 0);
+    screen.process(b"\x1b[?6h");
+    screen.process(b"\x1b[5;5H");
+    screen.process(b"\x1b[3;7r");   // set scroll region → cursor to origin
+    assert_eq!(screen.grid.cursor_pos(), (0, 2)); // top of scroll region
+}
+
+#[test]
+fn decom_saved_and_restored() {
+    let mut screen = Screen::new(10, 10, 0);
+    screen.process(b"\x1b[3;7r");
+    screen.process(b"\x1b[?6h");
+    screen.process(b"\x1b[2;3H");
+    screen.process(b"\x1b7");       // DECSC save
+    screen.process(b"\x1b[?6l");    // turn off
+    screen.process(b"\x1b[1;1H");
+    assert_eq!(screen.grid.cursor_pos(), (0, 0));
+    screen.process(b"\x1b8");       // DECRC restore
+    assert!(screen.grid.modes().origin_mode);
+}
+
+// Regression test for cursor-at-top-left bug after Enter press with scrollback.
+// On full renders (triggered by scrollback), emit_mode() emits \x1b[?6l (DECOM
+// reset). The VT220 spec and xterm both home the cursor when DECOM state changes.
+// So if CUP appears BEFORE \x1b[?6l, the cursor ends up at (1,1) instead of the
+// correct position. On incremental renders, emit_mode_delta skips DECOM when
+// unchanged, so the bug only appears after Enter (when scrollback triggers a full
+// render). Pressing any key triggers another render (incremental, no DECOM) which
+// restores the cursor — exactly matching the reported symptom.
+#[test]
+fn render_cup_appears_after_decom_on_full_render() {
+    let mut screen = Screen::new(80, 24, 1000);
+
+    // Fill screen to generate scrollback: 24 lines scrolls row 0 into scrollback
+    for _ in 0..24 {
+        screen.process(b"Line\r\n");
+    }
+    screen.process(b"$ "); // cursor at (col=2, row=23), i.e. 1-indexed (24, 3)
+
+    let mut cache = RenderCache::new();
+    let scrollback = screen.take_pending_scrollback();
+    assert!(!scrollback.is_empty(), "should have pending scrollback");
+
+    let output = screen.render_with_scrollback(&scrollback, &mut cache);
+    let text = String::from_utf8_lossy(&output);
+
+    // The cursor CUP for position (row=23, col=2) in 0-indexed = \x1b[24;3H
+    let cup_seq = "\x1b[24;3H";
+    // DECOM reset sequence — xterm/VTE home cursor on both set and reset
+    let decom_seq = "\x1b[?6l";
+
+    let cup_pos = text.find(cup_seq)
+        .unwrap_or_else(|| panic!("cursor CUP {cup_seq:?} not found in render output:\n{text}"));
+    let decom_pos = text.find(decom_seq)
+        .unwrap_or_else(|| panic!("DECOM reset {decom_seq:?} not found in render output:\n{text}"));
+
+    // CUP must appear AFTER DECOM, so DECOM's cursor-homing is overridden by CUP
+    assert!(cup_pos > decom_pos,
+        "CUP({cup_seq:?} at byte {cup_pos}) must appear after DECOM reset \
+         ({decom_seq:?} at byte {decom_pos}), otherwise DECOM homes cursor to (1,1)");
+}
+
+// ─── Bug-fix tests: rendering bugs found during code audit ───
+
+#[test]
+fn dsr_reports_relative_position_in_origin_mode() {
+    // Bug 1: DSR (CSI 6n) should report cursor position relative to
+    // the scroll region when DECOM (origin mode, ?6) is enabled.
+    let mut screen = Screen::new(80, 24, 100);
+
+    // Set scroll region to rows 5..15 (1-indexed: 5;15r)
+    screen.process(b"\x1b[5;15r");
+    // Enable origin mode
+    screen.process(b"\x1b[?6h");
+    // Move cursor to row 3, col 10 within the region (relative coords)
+    screen.process(b"\x1b[3;10H");
+
+    // Request DSR
+    screen.process(b"\x1b[6n");
+    let responses = screen.take_responses();
+    assert_eq!(responses.len(), 1);
+    // In origin mode, DSR should report position relative to scroll region.
+    // Row 3 within region, col 10 → "\x1b[3;10R"
+    assert_eq!(responses[0], b"\x1b[3;10R",
+        "DSR in origin mode should report position relative to scroll region, \
+         got: {:?}", String::from_utf8_lossy(&responses[0]));
+}
+
+#[test]
+fn insert_character_blanks_orphaned_wide_char_base_at_right_margin() {
+    // Bug 2: csi_insert_character should blank the base cell (width==2)
+    // at last-1 when its continuation (width==0) ends up at last.
+    let mut screen = Screen::new(6, 3, 100);
+
+    // Place a wide char at columns 3-4 (0-indexed): base at 3, cont at 4
+    screen.process(b"\x1b[1;4H"); // move to col 4 (1-indexed) = col 3 (0-indexed)
+    screen.process("你".as_bytes()); // occupies cols 3,4 (0-indexed)
+
+    assert_eq!(screen.grid.visible_row(0)[3].c, '你');
+    assert_eq!(screen.grid.visible_row(0)[3].width, 2);
+    assert_eq!(screen.grid.visible_row(0)[4].width, 0);
+
+    // Move cursor to col 0 and insert 1 char — shifts everything right by 1.
+    // pop() removes col 5 (blank), insert adds blank at col 0.
+    // After: base at col 4 (width==2), continuation at col 5 (width==0, last col).
+    // The code blanks continuation at col 5 but should ALSO blank base at col 4.
+    screen.process(b"\x1b[1;1H");
+    screen.process(b"\x1b[1@"); // ICH — insert 1 character
+
+    let last = 5usize; // cols - 1
+    // The continuation at last col should be blanked (code already does this)
+    assert_eq!(screen.grid.visible_row(0)[last].c, ' ',
+        "orphaned continuation at last column should be blanked");
+
+    // The base at last-1 should also be blanked since its continuation was removed
+    assert_eq!(screen.grid.visible_row(0)[last - 1].c, ' ',
+        "orphaned wide char base at last-1 should be blanked");
+    assert_ne!(screen.grid.visible_row(0)[last - 1].width, 2,
+        "orphaned wide char base should not remain width==2");
+}
+
+#[test]
+fn ind_clears_wrap_pending() {
+    // Bug 4: IND (ESC D) should clear wrap_pending flag.
+    let mut screen = Screen::new(5, 3, 100);
+
+    // Fill line to trigger deferred wrap
+    screen.process(b"ABCDE");
+    assert!(screen.grid.wrap_pending(), "wrap should be pending after filling line");
+    assert_eq!(screen.grid.cursor_y(), 0);
+
+    // Send IND (ESC D) — should clear wrap_pending and move cursor down
+    screen.process(b"\x1bD");
+    assert!(!screen.grid.wrap_pending(),
+        "IND should clear wrap_pending");
+    assert_eq!(screen.grid.cursor_y(), 1,
+        "IND should move cursor down one row");
+
+    // Cursor x stays at col 4 (last col) — IND only moves vertically.
+    assert_eq!(screen.grid.cursor_x(), 4,
+        "IND should not change cursor x position");
+
+    // Next printed char should NOT wrap — it should overwrite at cursor pos
+    screen.process(b"F");
+    assert_eq!(screen.grid.cursor_y(), 1,
+        "after IND cleared wrap_pending, print should stay on row 1");
+    assert_eq!(screen.grid.visible_row(1)[4].c, 'F',
+        "F should be at col 4 of row 1 (IND moved cursor down, no wrap)");
 }

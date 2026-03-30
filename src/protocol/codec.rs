@@ -100,8 +100,12 @@ pub async fn read_one_message<T: DeserializeOwned>(
 ///
 /// Handles read buffering, overflow protection, and frame decoding.
 /// Eliminates duplicated read-decode-drain loops across client and server code.
+///
+/// Uses an offset to avoid O(n) `drain()` on every decoded frame. Consumed
+/// bytes are compacted once per `fill_from()` call instead.
 pub struct FrameReader {
     read_buf: Vec<u8>,
+    offset: usize,
     tmp_buf: Vec<u8>,
 }
 
@@ -110,6 +114,7 @@ impl FrameReader {
     pub fn new() -> Self {
         Self {
             read_buf: Vec::new(),
+            offset: 0,
             tmp_buf: vec![0u8; READ_BUF_SIZE],
         }
     }
@@ -118,22 +123,37 @@ impl FrameReader {
     pub fn with_leftover(leftover: Vec<u8>) -> Self {
         Self {
             read_buf: leftover,
+            offset: 0,
             tmp_buf: vec![0u8; READ_BUF_SIZE],
         }
     }
 
     /// Read from the async reader into internal buffer.
     /// Returns `Ok(true)` if data was read, `Ok(false)` on EOF.
+    ///
+    /// Before reading, compacts the buffer by draining already-consumed bytes
+    /// (tracked by `self.offset`). This amortises compaction to once per
+    /// `fill_from` call instead of once per decoded frame.
     pub async fn fill_from<R: AsyncReadExt + Unpin>(
         &mut self,
         reader: &mut R,
     ) -> Result<bool, ProtocolError> {
+        // Compact: drain consumed bytes before reading new data.
+        if self.offset > 0 {
+            self.read_buf.drain(..self.offset);
+            self.offset = 0;
+        }
         let n = reader.read(&mut self.tmp_buf).await?;
         if n == 0 {
             return Ok(false);
         }
         self.read_buf.extend_from_slice(&self.tmp_buf[..n]);
-        if self.read_buf.len() > MAX_FRAME_SIZE + 4 {
+        // Overflow check: the buffer should never exceed one max-size frame
+        // plus its header while no complete frames remain undrained.
+        // We check *after* the caller has had a chance to call decode_next()
+        // in the read loop, but guard against runaway accumulation from a
+        // single oversized incomplete frame.
+        if self.read_buf.len() > MAX_FRAME_SIZE * 2 + 8 {
             return Err(ProtocolError::FrameTooLarge {
                 size: self.read_buf.len(),
                 max: MAX_FRAME_SIZE,
@@ -144,11 +164,14 @@ impl FrameReader {
 
     /// Decode and remove the next complete message from the buffer.
     /// Returns `Ok(None)` if no complete frame is available yet.
+    ///
+    /// Instead of `drain(..consumed)` per frame (O(n)), increments the offset.
+    /// The buffer is compacted lazily in `fill_from()`.
     pub fn decode_next<T: DeserializeOwned>(&mut self) -> Result<Option<T>, ProtocolError> {
-        match decode_frame(&self.read_buf)? {
+        match decode_frame(&self.read_buf[self.offset..])? {
             Some((data, consumed)) => {
                 let msg: T = decode(data)?;
-                self.read_buf.drain(..consumed);
+                self.offset += consumed;
                 Ok(Some(msg))
             }
             None => Ok(None),
@@ -157,7 +180,7 @@ impl FrameReader {
 
     /// Consume the reader and return any unprocessed bytes.
     pub fn into_leftover(self) -> Vec<u8> {
-        self.read_buf
+        self.read_buf[self.offset..].to_vec()
     }
 }
 
@@ -436,7 +459,6 @@ mod tests {
     #[test]
     fn encode_all_server_msg_variants() {
         let messages: Vec<ServerMsg> = vec![
-            ServerMsg::ScrollbackLine(vec![0x41]),
             ServerMsg::ScreenUpdate(vec![0x1b, 0x5b, 0x48]),
             ServerMsg::History(vec![vec![0x41], vec![0x42]]),
             ServerMsg::SessionList(vec![SessionInfo {

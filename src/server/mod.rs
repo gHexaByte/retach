@@ -3,6 +3,8 @@
 pub mod socket;
 pub mod client_handler;
 pub mod session_bridge;
+mod session_setup;
+mod session_relay;
 
 use crate::session::SessionManager;
 use std::sync::Arc;
@@ -12,7 +14,24 @@ use tracing::{info, warn};
 
 pub use socket::socket_path;
 
-/// Interval between dead session cleanup sweeps.
+/// Drop a value on a blocking thread with a timeout. Used for Session drops
+/// which call blocking kill()+wait() on child processes. The 5s timeout
+/// prevents hangs when grandchild processes keep the PTY alive after kill.
+pub(super) async fn drop_blocking_with_timeout<T: Send + 'static>(value: T, label: &str) {
+    let label = label.to_string();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || drop(value)),
+    ).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(join_err)) => warn!(%label, error = %join_err, "drop task panicked"),
+        Err(_) => warn!(%label, "timed out dropping value on blocking thread"),
+    }
+}
+
+/// Interval between dead session cleanup sweeps. 30s balances responsiveness
+/// (dead sessions freed within half a minute) against lock contention overhead.
 const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Start the daemon server: bind the Unix socket, spawn the cleanup task, and accept clients.
@@ -27,6 +46,13 @@ pub async fn run_server() -> anyhow::Result<()> {
     // Only remove socket if it's stale (no server is listening).
     // This prevents a second server from yanking the socket out from under
     // an already-running server.
+    //
+    // TOCTOU note: there is a small race window between remove_file() and
+    // bind() below where another process could create a socket at the same
+    // path. This is acceptable because:
+    //   1. retach is a single-user tool — concurrent server starts are rare
+    //   2. If a race occurs, bind() fails with EADDRINUSE and the user retries
+    //   3. Using O_EXCL or flock() would add complexity for a near-zero-probability scenario
     if path.exists() {
         match tokio::net::UnixStream::connect(&path).await {
             Ok(_) => {
@@ -34,7 +60,9 @@ pub async fn run_server() -> anyhow::Result<()> {
             }
             Err(_) => {
                 // Stale socket — safe to remove
-                let _ = std::fs::remove_file(&path);
+                if let Err(e) = std::fs::remove_file(&path) {
+                    warn!(path = ?path, error = %e, "failed to remove stale socket");
+                }
             }
         }
     }
@@ -49,7 +77,7 @@ pub async fn run_server() -> anyhow::Result<()> {
 
     // Dead session cleanup task — drops dead sessions outside the lock
     let cleanup_manager = manager.clone();
-    tokio::spawn(async move {
+    let cleanup_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         loop {
             interval.tick().await;
@@ -57,9 +85,8 @@ pub async fn run_server() -> anyhow::Result<()> {
                 let mut mgr = cleanup_manager.lock().await;
                 mgr.take_dead_sessions()
             };
-            // Drop dead sessions on spawn_blocking (their Drop calls blocking kill+wait)
             if !dead_sessions.is_empty() {
-                tokio::task::spawn_blocking(move || drop(dead_sessions));
+                drop_blocking_with_timeout(dead_sessions, "dead session cleanup").await;
             }
         }
     });
@@ -97,6 +124,10 @@ pub async fn run_server() -> anyhow::Result<()> {
         }
     }
 
+    // Cancel the cleanup task before draining sessions
+    cleanup_handle.abort();
+    let _ = cleanup_handle.await;
+
     // Explicitly drop all sessions on a blocking thread with a timeout,
     // so server shutdown doesn't hang if child processes are unresponsive.
     let all_sessions: Vec<crate::session::Session> = {
@@ -105,13 +136,7 @@ pub async fn run_server() -> anyhow::Result<()> {
     };
     if !all_sessions.is_empty() {
         info!(count = all_sessions.len(), "cleaning up sessions on shutdown");
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || drop(all_sessions)),
-        ).await;
-        if result.is_err() {
-            warn!("timed out waiting for sessions to clean up");
-        }
+        drop_blocking_with_timeout(all_sessions, "shutdown session cleanup").await;
     }
 
     Ok(())

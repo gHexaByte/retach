@@ -1,6 +1,6 @@
 use crate::pty::Pty;
-use crate::screen::Screen;
-use std::collections::HashMap;
+use retach::screen::{Screen, TerminalEmulator, TerminalSize};
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,37 +9,70 @@ use std::sync::{Arc, Mutex};
 pub const DEFAULT_COLS: u16 = 80;
 pub const DEFAULT_ROWS: u16 = 24;
 
-const MAX_SESSION_NAME_LEN: usize = 128;
-const PTY_READ_BUF_SIZE: usize = 4096;
+/// RAII guard that clears `has_client` flag when dropped, unless evicted.
+///
+/// When a new client evicts the current one, it sends `false` on the eviction
+/// channel. The guard checks this on Drop: if evicted, it skips clearing
+/// has_client (the new client already set it to true).
+pub struct ClientGuard {
+    has_client: Arc<AtomicBool>,
+    evict_rx: tokio::sync::watch::Receiver<bool>,
+}
 
-/// Check if a PTY child process is still alive.
-/// Uses `try_lock()` to avoid blocking Tokio workers when called from async tasks.
-pub fn is_child_alive(child: &Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>) -> bool {
-    match child.try_lock() {
-        Ok(mut c) => c.try_wait().ok().flatten().is_none(),
-        Err(std::sync::TryLockError::WouldBlock) => true, // assume alive if contended
-        Err(std::sync::TryLockError::Poisoned(e)) => {
-            tracing::warn!(error = %e, "child mutex poisoned in is_alive");
-            false
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        // evict_rx initial value is `true` (not evicted).
+        // Eviction sends `false`.
+        if *self.evict_rx.borrow() {
+            self.has_client.store(false, Ordering::Release);
         }
     }
 }
 
+/// Session names are displayed in CLI output and stored as filesystem-friendly identifiers.
+/// 128 bytes is generous for human-readable names while preventing abuse.
+const MAX_SESSION_NAME_LEN: usize = 128;
+
+/// PTY read buffer size. 4 KiB matches the typical pipe buffer granularity on
+/// Linux/macOS and balances syscall overhead against latency.
+const PTY_READ_BUF_SIZE: usize = 4096;
+
+/// Maximum queued DA/DSR responses when pty_writer is contended. 64 is far
+/// beyond normal usage (typically 1-2 responses in flight). Overflow means a
+/// deadlock-like condition where the client holds pty_writer indefinitely.
+const MAX_DEFERRED: usize = 64;
+
+/// Shared screen handle.
+pub type SharedScreen = Arc<Mutex<Screen>>;
+
+/// Shared handles for the client relay tasks.
+/// Created by `Session::connect()`.
+#[derive(Clone)]
+pub struct SessionHandles {
+    pub screen: SharedScreen,
+    pub pty_writer: crate::pty::SharedPtyWriter,
+    pub master: crate::pty::SharedMasterPty,
+    pub dims: Arc<Mutex<TerminalSize>>,
+    pub screen_notify: Arc<tokio::sync::Notify>,
+    pub reader_alive: Arc<AtomicBool>,
+    pub name: String,
+}
+
 /// A single terminal session backed by a PTY and a virtual screen.
 pub struct Session {
-    pub name: String,
-    pub pty: Pty,
-    pub screen: Arc<Mutex<Screen>>,
-    pub dims: Arc<Mutex<(u16, u16)>>,
+    pub(crate) name: String,
+    pub(crate) pty: Pty,
+    pub(crate) screen: SharedScreen,
+    pub(crate) dims: Arc<Mutex<TerminalSize>>,
     /// When a client is attached, holds the sender side of a watch channel.
     /// Sending `false` evicts the active client. Replaced on each new attach.
-    pub evict_tx: Option<tokio::sync::watch::Sender<bool>>,
+    evict_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Wakes the client relay when new PTY data has been processed.
-    pub screen_notify: Arc<tokio::sync::Notify>,
+    screen_notify: Arc<tokio::sync::Notify>,
     /// Whether a client is currently connected (used by reader to decide draining).
-    pub has_client: Arc<AtomicBool>,
+    has_client: Arc<AtomicBool>,
     /// Set to false when the persistent reader thread detects PTY EOF.
-    pub reader_alive: Arc<AtomicBool>,
+    reader_alive: Arc<AtomicBool>,
     /// Handle for the persistent PTY reader thread (joined on Drop).
     reader_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -49,14 +82,14 @@ impl Session {
     pub fn new(name: String, cols: u16, rows: u16, history: usize) -> anyhow::Result<Self> {
         let pty = Pty::spawn(cols, rows)?;
         let screen = Arc::new(Mutex::new(Screen::new(cols, rows, history)));
-        let dims = Arc::new(Mutex::new((cols, rows)));
+        let dims = Arc::new(Mutex::new(TerminalSize { cols, rows }));
         let screen_notify = Arc::new(tokio::sync::Notify::new());
         let has_client = Arc::new(AtomicBool::new(false));
         let reader_alive = Arc::new(AtomicBool::new(true));
 
         // Spawn the persistent PTY reader thread.
         let pty_reader = pty.clone_reader()?;
-        let pty_writer = pty.writer.clone();
+        let pty_writer = pty.writer_arc();
         let reader_handle = {
             let screen = screen.clone();
             let notify = screen_notify.clone();
@@ -79,15 +112,76 @@ impl Session {
         })
     }
 
-    /// Check if the session's child process is still alive.
+    /// Check if the session is still alive.
+    /// A session is dead if the reader thread exited (PTY EOF or panic)
+    /// or if the child process has terminated.
     pub fn is_alive(&self) -> bool {
-        is_child_alive(&self.pty.child_arc())
+        self.reader_alive.load(Ordering::Acquire) && self.pty.is_child_alive()
     }
 
     /// Get the child process PID (if available).
     /// Uses `try_lock()` to avoid blocking; returns `None` on contention or poison.
     pub fn child_pid(&self) -> Option<u32> {
         self.pty.child_arc().try_lock().ok().and_then(|c| c.process_id())
+    }
+
+    /// Mark a client as connected, evicting any previous client.
+    ///
+    /// Returns a `ClientGuard` (clears `has_client` on drop), shared handles
+    /// for the relay tasks, and an eviction watch receiver.
+    ///
+    /// **Must be called under the SessionManager lock** to prevent races.
+    pub fn connect(&mut self) -> (ClientGuard, SessionHandles, tokio::sync::watch::Receiver<bool>) {
+        // Set has_client BEFORE evicting old client, so the persistent reader
+        // doesn't discard data intended for the new client.
+        self.has_client.store(true, Ordering::Release);
+
+        // Evict previous client if any
+        if let Some(old_tx) = self.evict_tx.take() {
+            tracing::debug!(session = %self.name, "evicting previous client");
+            if old_tx.send(false).is_err() {
+                tracing::debug!(session = %self.name, "evict channel: previous client already disconnected");
+            }
+        }
+
+        // Create new eviction channel for this client
+        let (evict_tx, evict_rx) = tokio::sync::watch::channel(true);
+        self.evict_tx = Some(evict_tx);
+
+        let guard = ClientGuard {
+            has_client: self.has_client.clone(),
+            evict_rx: evict_rx.clone(),
+        };
+
+        let handles = SessionHandles {
+            screen: self.screen.clone(),
+            pty_writer: self.pty.writer_arc(),
+            master: self.pty.master_arc(),
+            dims: self.dims.clone(),
+            screen_notify: self.screen_notify.clone(),
+            reader_alive: self.reader_alive.clone(),
+            name: self.name.clone(),
+        };
+
+        (guard, handles, evict_rx)
+    }
+
+    /// Disconnect the current client (used by KillSession).
+    /// Drops evict_tx so the connected client sees RecvError.
+    pub fn disconnect(&mut self) {
+        drop(self.evict_tx.take());
+    }
+
+    /// Test accessor: whether a client is connected.
+    #[cfg(test)]
+    pub(crate) fn has_client(&self) -> bool {
+        self.has_client.load(Ordering::Acquire)
+    }
+
+    /// Test accessor: whether the reader thread is alive.
+    #[cfg(test)]
+    pub(crate) fn reader_alive(&self) -> bool {
+        self.reader_alive.load(Ordering::Acquire)
     }
 }
 
@@ -103,6 +197,7 @@ fn persistent_reader_loop(
     reader_alive: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; PTY_READ_BUF_SIZE];
+    let mut deferred_responses: VecDeque<Vec<u8>> = VecDeque::new();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
@@ -110,11 +205,11 @@ fn persistent_reader_loop(
                 break;
             }
             Ok(n) => {
-                let responses = {
+                let mut responses = {
                     let mut scr = match screen.lock() {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::warn!(error = %e, "screen mutex poisoned in reader loop");
+                            tracing::error!(error = %e, "screen mutex poisoned in reader loop, terminating");
                             break;
                         }
                     };
@@ -129,16 +224,41 @@ fn persistent_reader_loop(
                     responses
                 };
 
+                // Prepend any deferred responses from previous iterations.
+                if !deferred_responses.is_empty() {
+                    let mut all: Vec<Vec<u8>> = deferred_responses.drain(..).collect();
+                    all.append(&mut responses);
+                    responses = all;
+                }
+
                 // Write PTY responses (DA, DSR replies) outside the screen lock.
+                // Use try_lock to avoid deadlock: client_to_pty may hold
+                // pty_writer during a blocking write_all while waiting for the
+                // child to read — if the child is waiting for this DA response,
+                // a blocking lock() here would deadlock.
                 if !responses.is_empty() {
-                    if let Ok(mut w) = pty_writer.lock() {
-                        for response in &responses {
-                            if let Err(e) = w.write_all(response) {
-                                tracing::warn!(error = %e, "failed to write response to PTY in reader loop");
-                                break;
+                    match pty_writer.try_lock() {
+                        Ok(mut w) => {
+                            for response in &responses {
+                                if let Err(e) = w.write_all(response) {
+                                    tracing::warn!(error = %e, "failed to write response to PTY in reader loop");
+                                    break;
+                                }
+                            }
+                            if let Err(e) = w.flush() {
+                                tracing::warn!(error = %e, "failed to flush PTY writer in reader loop");
                             }
                         }
-                        let _ = w.flush();
+                        Err(_) => {
+                            tracing::debug!("pty_writer contended, deferring {} DA/DSR response(s)", responses.len());
+                            for resp in responses {
+                                if deferred_responses.len() >= MAX_DEFERRED {
+                                    tracing::warn!(queue_len = MAX_DEFERRED, "deferred DA/DSR response queue full, dropping oldest response");
+                                    deferred_responses.pop_front();
+                                }
+                                deferred_responses.push_back(resp);
+                            }
+                        }
                     }
                 }
 
@@ -156,19 +276,38 @@ fn persistent_reader_loop(
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Use lock() (blocking) — callers must ensure Session is dropped on
-        // spawn_blocking or outside the Tokio runtime to avoid blocking workers.
-        if let Ok(mut child) = self.pty.child_arc().lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+        // Use try_lock() to avoid blocking the async runtime if the child lock
+        // is contended. In practice it's never contended during drop because
+        // the persistent reader has already exited (or will exit after kill).
+        match self.pty.child_arc().try_lock() {
+            Ok(mut child) => {
+                if let Err(e) = child.kill() {
+                    tracing::debug!(error = %e, session = %self.name, "child already exited before kill");
+                }
+                if let Err(e) = child.wait() {
+                    tracing::debug!(error = %e, session = %self.name, "child already reaped before wait");
+                }
+            }
+            Err(_) => {
+                tracing::warn!(session = %self.name, "child mutex contended during drop, skipping kill/wait — detaching reader thread");
+                // Can't kill the child, so the PTY reader thread will block on read
+                // forever. Detach it (take + drop the JoinHandle) instead of joining,
+                // and skip eviction since the session is being abandoned.
+                self.reader_handle.take();
+                return;
+            }
         }
         // Evict any connected client
         if let Some(tx) = self.evict_tx.take() {
-            let _ = tx.send(false);
+            if tx.send(false).is_err() {
+                tracing::debug!(session = %self.name, "evict channel: client already disconnected during drop");
+            }
         }
         // Wait for the reader thread to exit (it will see EOF after child kill).
         if let Some(handle) = self.reader_handle.take() {
-            let _ = handle.join();
+            if handle.join().is_err() {
+                tracing::warn!(session = %self.name, "PTY reader thread panicked during join");
+            }
         }
     }
 }
@@ -218,21 +357,29 @@ impl SessionManager {
     /// Returns (session, is_new).
     pub fn get_or_create(&mut self, name: &str, cols: u16, rows: u16, history: usize) -> anyhow::Result<(&mut Session, bool)> {
         validate_session_name(name)?;
-        let is_new = if !self.sessions.contains_key(name) {
-            let c = if cols > 0 { cols } else { DEFAULT_COLS };
-            let r = if rows > 0 { rows } else { DEFAULT_ROWS };
-            tracing::debug!(session = %name, cols = c, rows = r, "creating new session");
-            self.create(name.to_string(), c, r, history)?;
-            true
-        } else {
-            tracing::debug!(session = %name, "reattaching to existing session");
-            false
-        };
-        Ok((self.sessions.get_mut(name).expect("session was just created"), is_new))
+        use std::collections::hash_map::Entry;
+        match self.sessions.entry(name.to_string()) {
+            Entry::Occupied(e) => {
+                tracing::debug!(session = %name, "reattaching to existing session");
+                Ok((e.into_mut(), false))
+            }
+            Entry::Vacant(e) => {
+                let c = if cols > 0 { cols } else { DEFAULT_COLS };
+                let r = if rows > 0 { rows } else { DEFAULT_ROWS };
+                tracing::debug!(session = %name, cols = c, rows = r, "creating new session");
+                let session = Session::new(name.to_string(), c, r, history)?;
+                Ok((e.insert(session), true))
+            }
+        }
     }
 
-    /// Get an existing session by name.
-    pub fn get(&mut self, name: &str) -> Option<&mut Session> {
+    /// Get an existing session by name (read-only).
+    pub fn get(&self, name: &str) -> Option<&Session> {
+        self.sessions.get(name)
+    }
+
+    /// Get an existing session by name (mutable).
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Session> {
         self.sessions.get_mut(name)
     }
 
@@ -244,18 +391,18 @@ impl SessionManager {
     /// Return metadata for all active sessions.
     pub fn list(&self) -> Vec<crate::protocol::SessionInfo> {
         self.sessions.values().map(|s| {
-            let (cols, rows) = match s.dims.lock() {
+            let dims = match s.dims.lock() {
                 Ok(d) => *d,
                 Err(e) => {
                     tracing::warn!(session = %s.name, error = %e, "dims mutex poisoned in list");
-                    (DEFAULT_COLS, DEFAULT_ROWS)
+                    TerminalSize { cols: DEFAULT_COLS, rows: DEFAULT_ROWS }
                 }
             };
             crate::protocol::SessionInfo {
                 name: s.name.clone(),
                 pid: s.child_pid().unwrap_or(0),
-                cols,
-                rows,
+                cols: dims.cols,
+                rows: dims.rows,
             }
         }).collect()
     }
@@ -270,7 +417,9 @@ impl SessionManager {
         let dead: Vec<String> = self.sessions.iter()
             .filter(|(_, s)| !s.is_alive())
             .map(|(name, s)| {
-                let status = s.pty.child_arc().lock().ok()
+                // Use try_lock to avoid blocking a Tokio worker thread
+                // (this is called from an async cleanup task).
+                let status = s.pty.child_arc().try_lock().ok()
                     .and_then(|mut c| c.try_wait().ok().flatten());
                 tracing::info!(
                     session = %name,
@@ -291,15 +440,16 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     /// Helper: collect visible grid rows as trimmed strings.
-    fn screen_lines(screen: &crate::screen::Screen) -> Vec<String> {
-        screen.grid.visible_rows().map(|row| {
+    fn screen_lines(screen: &retach::screen::Screen) -> Vec<String> {
+        use retach::screen::TerminalEmulator;
+        screen.visible_rows().map(|row| {
             let s: String = row.iter().map(|c| c.c).collect();
             s.trim_end().to_string()
         }).collect()
     }
 
     /// Helper: collect scrollback history as plain text (ANSI stripped).
-    fn history_texts(screen: &crate::screen::Screen) -> Vec<String> {
+    fn history_texts(screen: &retach::screen::Screen) -> Vec<String> {
         screen.get_history().iter().map(|b| {
             let s = String::from_utf8_lossy(b);
             let mut out = String::new();
@@ -318,9 +468,9 @@ mod tests {
 
     /// Poll the screen until a predicate is satisfied or timeout expires.
     fn wait_for_screen(
-        screen: &Arc<Mutex<crate::screen::Screen>>,
+        screen: &Arc<Mutex<retach::screen::Screen>>,
         timeout: std::time::Duration,
-        pred: impl Fn(&crate::screen::Screen) -> bool,
+        pred: impl Fn(&retach::screen::Screen) -> bool,
     ) -> bool {
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
@@ -342,13 +492,14 @@ mod tests {
         let session = Session::new("test-persistent".into(), 80, 24, 1000).unwrap();
 
         // No client connected — persistent reader is running with has_client=false.
-        assert!(!session.has_client.load(Ordering::Acquire));
-        assert!(session.reader_alive.load(Ordering::Acquire));
+        assert!(!session.has_client());
+        assert!(session.reader_alive());
 
         // Write a command that produces output after a short delay.
         // Use a unique marker so we can find it unambiguously.
         {
-            let mut w = session.pty.writer.lock().unwrap();
+            let writer = session.pty.writer_arc();
+            let mut w = writer.lock().unwrap();
             w.write_all(b"sleep 1 && echo PERSISTENT_READER_OK\n").unwrap();
             w.flush().unwrap();
         }
@@ -363,7 +514,7 @@ mod tests {
         assert!(found, "persistent reader should capture PTY output even with no client connected");
 
         // Reader should still be alive (shell is still running).
-        assert!(session.reader_alive.load(Ordering::Acquire));
+        assert!(session.reader_alive());
     }
 
     /// After the child process exits, a reconnecting client sees the final
@@ -374,14 +525,15 @@ mod tests {
 
         // Tell the shell to print a marker and exit.
         {
-            let mut w = session.pty.writer.lock().unwrap();
+            let writer = session.pty.writer_arc();
+            let mut w = writer.lock().unwrap();
             w.write_all(b"echo GOODBYE && exit\n").unwrap();
             w.flush().unwrap();
         }
 
         // Wait for reader_alive to become false (child exited, PTY EOF).
         let exited = wait_for_screen(&session.screen, std::time::Duration::from_secs(5), |_| {
-            !session.reader_alive.load(Ordering::Acquire)
+            !session.reader_alive()
         });
         assert!(exited, "reader_alive should become false after child exits");
 
@@ -391,6 +543,11 @@ mod tests {
         let hist = history_texts(&scr);
         let found = lines.iter().chain(hist.iter()).any(|l| l.contains("GOODBYE"));
         assert!(found, "final output should be captured before reader exits");
+    }
+
+    #[test]
+    fn deferred_responses_bounded() {
+        assert!(MAX_DEFERRED > 0 && MAX_DEFERRED <= 128);
     }
 
     #[test]
@@ -436,9 +593,9 @@ mod tests {
         let mut mgr = SessionManager::new();
         let (session, is_new) = mgr.get_or_create("test", 0, 0, 1000).unwrap();
         // Should clamp to 80x24 defaults
-        let (cols, rows) = *session.dims.lock().unwrap();
-        assert_eq!(cols, 80);
-        assert_eq!(rows, 24);
+        let dims = *session.dims.lock().unwrap();
+        assert_eq!(dims.cols, 80);
+        assert_eq!(dims.rows, 24);
         assert!(is_new);
     }
 
@@ -484,7 +641,7 @@ mod tests {
 
         // Kill the doomed session's child process
         {
-            let session = mgr.get("doomed").unwrap();
+            let session = mgr.get_mut("doomed").unwrap();
             let child_arc = session.pty.child_arc();
             let mut child = child_arc.lock().unwrap();
             child.kill().ok();
@@ -513,5 +670,33 @@ mod tests {
         let dead = mgr.take_dead_sessions();
         assert!(dead.is_empty(), "no sessions should be dead: {:?}", dead.iter().map(|s| &s.name).collect::<Vec<_>>());
         assert_eq!(mgr.list().len(), 2);
+    }
+
+    #[test]
+    fn client_guard_clears_has_client_on_drop() {
+        let has_client = Arc::new(AtomicBool::new(true));
+        let (_evict_tx, evict_rx) = tokio::sync::watch::channel(true);
+        {
+            let _guard = ClientGuard {
+                has_client: has_client.clone(),
+                evict_rx,
+            };
+            assert!(has_client.load(Ordering::Acquire));
+        }
+        assert!(!has_client.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn client_guard_skips_clear_when_evicted() {
+        let has_client = Arc::new(AtomicBool::new(true));
+        let (evict_tx, evict_rx) = tokio::sync::watch::channel(true);
+        {
+            let _guard = ClientGuard {
+                has_client: has_client.clone(),
+                evict_rx,
+            };
+            let _ = evict_tx.send(false);
+        }
+        assert!(has_client.load(Ordering::Acquire));
     }
 }

@@ -5,58 +5,11 @@
 //! - Pending scrollback drain semantics (reattach simulation)
 //! - Resize interactions with scrollback (expand/shrink/roundtrip)
 //! - Resize between reattach cycles
-//! - Protocol round-trip: History + ScreenUpdate encode/decode
-//! - End-to-end: Screen → history + render → protocol → client stdout contract
+//! - End-to-end: Screen -> history + render -> client stdout contract
 
 use super::*;
-use crate::protocol::{self, ServerMsg};
+use super::test_helpers::*;
 use render::RenderCache;
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-/// Collect visible grid rows as trimmed strings.
-fn screen_lines(screen: &Screen) -> Vec<String> {
-    screen
-        .grid
-        .visible_rows()
-        .map(|row| {
-            let s: String = row.iter().map(|c| c.c).collect();
-            s.trim_end().to_string()
-        })
-        .collect()
-}
-
-/// Collect scrollback history as trimmed strings (rendered ANSI stripped to text).
-fn history_texts(screen: &Screen) -> Vec<String> {
-    screen
-        .get_history()
-        .iter()
-        .map(|b| strip_ansi(b))
-        .collect()
-}
-
-/// Strip ANSI escape sequences, returning only printable text.
-fn strip_ansi(bytes: &[u8]) -> String {
-    let s = String::from_utf8_lossy(bytes);
-    let mut out = String::new();
-    let mut in_esc = false;
-    for ch in s.chars() {
-        if in_esc {
-            if ch.is_ascii_alphabetic() || ch == 'm' {
-                in_esc = false;
-            }
-            continue;
-        }
-        if ch == '\x1b' {
-            in_esc = true;
-            continue;
-        }
-        if ch >= ' ' {
-            out.push(ch);
-        }
-    }
-    out.trim_end().to_string()
-}
 
 /// Collect all content (scrollback + visible) as ordered text lines.
 fn all_content(screen: &Screen) -> Vec<String> {
@@ -89,11 +42,11 @@ fn simulate_reattach(screen: &Screen) -> (Vec<Vec<u8>>, Vec<u8>) {
     if !hist.is_empty() {
         // Position cursor at bottom row
         render_data.extend_from_slice(b"\x1b[");
-        style::write_u16(&mut render_data, screen.grid.rows);
+        style::write_u16(&mut render_data, screen.grid.rows());
         render_data.extend_from_slice(b";1H");
         // Flush newlines
         render_data.extend(
-            std::iter::repeat_n(b'\n', screen.grid.rows.saturating_sub(1) as usize),
+            std::iter::repeat_n(b'\n', screen.grid.rows().saturating_sub(1) as usize),
         );
     }
     let mut cache = RenderCache::new();
@@ -423,114 +376,7 @@ fn resize_expand_between_reattach_restores_scrollback() {
     );
 }
 
-// ─── Section 2: Protocol round-trip tests ───────────────────────────────────
-
-#[test]
-fn history_message_round_trip() {
-    let lines = vec![
-        b"line one".to_vec(),
-        b"line two with \x1b[1mbold\x1b[0m".to_vec(),
-        b"line three".to_vec(),
-    ];
-    let msg = ServerMsg::History(lines.clone());
-    let encoded = protocol::encode(&msg).unwrap();
-
-    let (data, consumed) = protocol::codec::decode_frame(&encoded).unwrap().unwrap();
-    assert_eq!(consumed, encoded.len());
-
-    let decoded: ServerMsg = protocol::codec::decode(data).unwrap();
-    match decoded {
-        ServerMsg::History(decoded_lines) => {
-            assert_eq!(decoded_lines.len(), 3);
-            assert_eq!(decoded_lines[0], b"line one");
-            assert_eq!(decoded_lines[2], b"line three");
-        }
-        other => panic!("expected History, got {:?}", other),
-    }
-}
-
-#[test]
-fn screen_update_message_round_trip() {
-    let update_data = b"\x1b[?2026h\x1b[?25l\x1b[2J\x1b[HHello\x1b[?2026l".to_vec();
-    let msg = ServerMsg::ScreenUpdate(update_data.clone());
-    let encoded = protocol::encode(&msg).unwrap();
-
-    let (data, _) = protocol::codec::decode_frame(&encoded).unwrap().unwrap();
-    let decoded: ServerMsg = protocol::codec::decode(data).unwrap();
-    match decoded {
-        ServerMsg::ScreenUpdate(decoded_data) => {
-            assert_eq!(decoded_data, update_data);
-        }
-        other => panic!("expected ScreenUpdate, got {:?}", other),
-    }
-}
-
-#[test]
-fn history_chunking_round_trip() {
-    // Simulate the chunking logic from send_initial_state
-    let mut all_lines = Vec::new();
-    for i in 0..500 {
-        all_lines.push(format!("history line {:04}", i).into_bytes());
-    }
-
-    let size_limit = protocol::codec::MAX_FRAME_SIZE / 2;
-    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::new();
-    let mut chunk = Vec::new();
-    let mut chunk_size = 0;
-
-    for line in &all_lines {
-        let line_size = line.len() + 16;
-        if chunk_size + line_size > size_limit && !chunk.is_empty() {
-            chunks.push(std::mem::take(&mut chunk));
-            chunk_size = 0;
-        }
-        chunk_size += line_size;
-        chunk.push(line.clone());
-    }
-    if !chunk.is_empty() {
-        chunks.push(chunk);
-    }
-
-    // Encode all chunks, then decode and reassemble
-    let mut reassembled = Vec::new();
-    for chunk_lines in &chunks {
-        let msg = ServerMsg::History(chunk_lines.clone());
-        let encoded = protocol::encode(&msg).unwrap();
-        let (data, _) = protocol::codec::decode_frame(&encoded).unwrap().unwrap();
-        let decoded: ServerMsg = protocol::codec::decode(data).unwrap();
-        match decoded {
-            ServerMsg::History(lines) => reassembled.extend(lines),
-            other => panic!("expected History, got {:?}", other),
-        }
-    }
-
-    assert_eq!(reassembled.len(), all_lines.len());
-    for (i, line) in reassembled.iter().enumerate() {
-        assert_eq!(
-            line, &all_lines[i],
-            "line {} mismatch after chunked round-trip",
-            i
-        );
-    }
-}
-
-#[test]
-fn scrollback_line_message_round_trip() {
-    let line = b"\x1b[1mcolored output\x1b[0m".to_vec();
-    let msg = ServerMsg::ScrollbackLine(line.clone());
-    let encoded = protocol::encode(&msg).unwrap();
-
-    let (data, _) = protocol::codec::decode_frame(&encoded).unwrap().unwrap();
-    let decoded: ServerMsg = protocol::codec::decode(data).unwrap();
-    match decoded {
-        ServerMsg::ScrollbackLine(decoded_line) => {
-            assert_eq!(decoded_line, line);
-        }
-        other => panic!("expected ScrollbackLine, got {:?}", other),
-    }
-}
-
-// ─── Section 3: End-to-end reattach simulation ──────────────────────────────
+// ─── Section 2: End-to-end reattach simulation ──────────────────────────────
 
 #[test]
 fn e2e_reattach_history_then_screen() {
@@ -554,7 +400,7 @@ fn e2e_reattach_history_then_screen() {
 
     let stdout_text = String::from_utf8_lossy(&stdout);
 
-    // History lines should appear before the screen clear
+    // History lines should appear before screen clear
     let pos_l01 = stdout_text.find("L01").expect("L01 should be in output");
     let pos_l05 = stdout_text.find("L05").expect("L05 should be in output");
     let pos_clear = stdout_text.find("\x1b[2J").expect("screen clear should be in output");
@@ -568,7 +414,7 @@ fn e2e_reattach_history_then_screen() {
         "history should appear before screen clear"
     );
 
-    // Screen content should appear after the clear
+    // Screen content should appear after screen clear
     let after_clear = &stdout_text[pos_clear..];
     assert!(
         after_clear.contains("L06"),
@@ -637,73 +483,6 @@ fn e2e_reattach_with_styled_history() {
 }
 
 #[test]
-fn e2e_reattach_protocol_encode_decode_sequence() {
-    let mut screen = Screen::new(10, 3, 100);
-    write_labeled_lines(&mut screen, 6);
-    let _ = screen.take_pending_scrollback();
-
-    let (hist, screen_update) = simulate_reattach(&screen);
-
-    // Encode the full message sequence as the server would
-    let mut wire = Vec::new();
-    wire.extend(
-        protocol::encode(&ServerMsg::Connected {
-            name: "test".into(),
-            new_session: false,
-        })
-        .unwrap(),
-    );
-    if !hist.is_empty() {
-        wire.extend(protocol::encode(&ServerMsg::History(hist)).unwrap());
-    }
-    wire.extend(protocol::encode(&ServerMsg::ScreenUpdate(screen_update)).unwrap());
-
-    // Decode the sequence as the client would
-    let mut offset = 0;
-    let mut messages = Vec::new();
-    while offset < wire.len() {
-        let (data, consumed) = protocol::codec::decode_frame(&wire[offset..])
-            .unwrap()
-            .expect("should decode complete frame");
-        let msg: ServerMsg = protocol::codec::decode(data).unwrap();
-        messages.push(msg);
-        offset += consumed;
-    }
-
-    // Verify message order: Connected → History → ScreenUpdate
-    assert!(matches!(messages[0], ServerMsg::Connected { .. }));
-    assert!(matches!(messages[1], ServerMsg::History(_)));
-    assert!(matches!(messages[2], ServerMsg::ScreenUpdate(_)));
-
-    // Simulate client stdout
-    let mut stdout = Vec::new();
-    for msg in &messages {
-        match msg {
-            ServerMsg::History(lines) => {
-                for line in lines {
-                    stdout.extend_from_slice(line);
-                    stdout.extend_from_slice(b"\r\n");
-                }
-            }
-            ServerMsg::ScreenUpdate(data) => {
-                stdout.extend_from_slice(data);
-            }
-            _ => {}
-        }
-    }
-
-    let text = String::from_utf8_lossy(&stdout);
-    // History lines present
-    assert!(text.contains("L01"), "L01 should be in output");
-    assert!(text.contains("L03"), "L03 should be in output");
-    // Screen content present after clear
-    let clear_pos = text.find("\x1b[2J").expect("screen clear");
-    let after_clear = &text[clear_pos..];
-    assert!(after_clear.contains("L04"), "L04 should be on screen");
-    assert!(after_clear.contains("L06"), "L06 should be on screen");
-}
-
-#[test]
 fn e2e_resize_between_reattach_cycles() {
     // Simulate: create session → produce output → detach → resize → reattach
     let mut screen = Screen::new(10, 5, 100);
@@ -740,7 +519,7 @@ fn e2e_resize_between_reattach_cycles() {
         hist2.len()
     );
 
-    // Verify no duplication between history and screen content after clear
+    // Verify no duplication between history and screen content after screen clear
     let clear_pos2 = text2.find("\x1b[2J").expect("screen clear in second reattach");
     let history_portion = &text2[..clear_pos2];
     let screen_portion = &text2[clear_pos2..];
@@ -813,14 +592,14 @@ fn e2e_scrollback_during_session_then_reattach() {
 
     // Scrollback lines should appear before screen clear
     assert!(atomic_text.contains("L01"), "scrollback should contain L01");
-    let clear_pos = atomic_text
+    let pos_clear = atomic_text
         .find("\x1b[2J")
         .expect("atomic update should have screen clear");
     let l01_pos = atomic_text
         .find("L01")
         .expect("L01 should be in output");
     assert!(
-        l01_pos < clear_pos,
+        l01_pos < pos_clear,
         "scrollback content should precede screen clear"
     );
 

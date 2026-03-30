@@ -24,7 +24,7 @@ pub enum Command {
     Open {
         /// Session name
         name: String,
-        /// Scrollback history size (used when creating)
+        /// Scrollback history size, 0 to disable (used when creating)
         #[arg(long, default_value_t = DEFAULT_HISTORY, value_parser = parse_history)]
         history: usize,
     },
@@ -32,7 +32,7 @@ pub enum Command {
     New {
         /// Session name (auto-generated if omitted)
         name: Option<String>,
-        /// Scrollback history size
+        /// Scrollback history size (0 to disable)
         #[arg(long, default_value_t = DEFAULT_HISTORY, value_parser = parse_history)]
         history: usize,
     },
